@@ -1615,7 +1615,7 @@ struct markdown_printer : public printer {
             return "threads";
         }
         if (field == "n_threads_batch") {
-            return "threads_batch";
+            return "th_batch";
         }
         if (field == "no_kv_offload") {
             return "nkvo";
