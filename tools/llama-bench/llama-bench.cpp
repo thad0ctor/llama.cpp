@@ -2100,7 +2100,7 @@ int main(int argc, char ** argv) {
 
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
-            
+
             // Store separate timings
             if (t.n_prompt > 0) {
                 t.samples_prompt_ns.push_back(t_prompt_ns);
