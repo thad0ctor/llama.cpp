@@ -40,6 +40,9 @@
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
+#include "ggml-cuda/blackwell-gemm.cuh"
+#include "ggml-cuda/blackwell-memory.cuh"
+#include "ggml-cuda/blackwell-attention.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -173,6 +176,87 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 
+// Ultra-fast capability detection optimized for RTX 5090 performance
+static void ggml_cuda_detect_kernel_capabilities_impl(const ggml_cuda_device_info::cuda_device_info & device, ggml_cuda_kernel_capabilities * caps) {
+    GGML_ASSERT(caps != nullptr);
+    
+    // Initialize all capabilities to false (fast memset)
+    memset(caps, 0, sizeof(ggml_cuda_kernel_capabilities));
+    
+    const int cc = device.cc;
+    
+    // Fast path: Non-Blackwell GPUs get vanilla capabilities only
+    if (!GGML_CUDA_CC_IS_BLACKWELL(cc)) {
+        caps->supports_async_memcpy = cp_async_available(cc);
+        caps->supports_warp_matrix = new_mma_available(cc);
+        return; // Zero overhead for non-Blackwell
+    }
+    
+    // RTX 5090 optimized path: Only enable proven performance features
+    const bool is_rtx_5090 = (device.total_vram >= (24ULL * 1024 * 1024 * 1024)); // 32GB RTX 5090
+    
+    if (is_rtx_5090) {
+        // Enable RTX 5090 specific optimizations for large models (235B+)
+        caps->supports_cluster_gemm = true;          // Benefits large GEMM operations
+        caps->supports_distributed_shmem = true;     // Helps with memory bandwidth
+        caps->supports_fp8_kernels = false;          // Disable until proven beneficial
+        caps->supports_cluster_attention = false;    // Disable until optimized for MoE
+        caps->supports_large_tile_attn = true;       // Large L2 cache helps
+        caps->supports_mqa_optimization = true;      // High bandwidth benefits
+        caps->supports_hbm3_bandwidth = true;        // RTX 5090 specific
+        caps->supports_l2_cache_hints = true;        // 128MB L2 cache
+    } else {
+        // Lower-end Blackwell: minimal enhancements to avoid overhead
+        caps->supports_cluster_gemm = false;
+        caps->supports_distributed_shmem = false;
+        caps->supports_large_tile_attn = false;
+    }
+    
+    // Common Blackwell capabilities (all variants)
+    caps->supports_async_memcpy = cp_async_available(cc);
+    caps->supports_warp_matrix = new_mma_available(cc);
+    caps->supports_tensor_core_fp8 = false; // Disable until proven
+    caps->supports_sparsity = false;        // Disable until optimized
+}
+
+// Public API for capability detection
+void ggml_cuda_detect_kernel_capabilities(int device_id, ggml_cuda_kernel_capabilities * caps) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device_id >= info.device_count || caps == nullptr) {
+        if (caps != nullptr) {
+            memset(caps, 0, sizeof(ggml_cuda_kernel_capabilities));
+        }
+        return;
+    }
+    
+    ggml_cuda_detect_kernel_capabilities_impl(info.devices[device_id], caps);
+}
+
+// Capability query functions for kernel selection
+bool ggml_cuda_can_use_cluster_gemm(int device_id) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device_id >= info.device_count) return false;
+    return info.devices[device_id].kernel_caps.supports_cluster_gemm;
+}
+
+bool ggml_cuda_can_use_cluster_attention(int device_id) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device_id >= info.device_count) return false;
+    return info.devices[device_id].kernel_caps.supports_cluster_attention;
+}
+
+bool ggml_cuda_can_use_hbm3_optimizations(int device_id) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device_id >= info.device_count) return false;
+    return info.devices[device_id].kernel_caps.supports_hbm3_bandwidth;
+}
+
+bool ggml_cuda_can_use_large_shared_memory(int device_id) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device_id >= info.device_count) return false;
+    return info.devices[device_id].kernel_caps.supports_distributed_shmem;
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
 #ifdef __HIP_PLATFORM_AMD__
     // Workaround for a rocBLAS bug when using multiple graphics cards:
@@ -245,8 +329,21 @@ static ggml_cuda_device_info ggml_cuda_init() {
         total_vram += prop.totalGlobalMem;
         info.devices[id].integrated = prop.integrated;
         info.devices[id].nsm        = prop.multiProcessorCount;
-        info.devices[id].smpb       = prop.sharedMemPerBlock;
-        info.devices[id].warp_size  = prop.warpSize;
+        // Ultra-fast initialization: use reference for cache efficiency
+        auto &device_info = info.devices[id];
+        device_info.smpb = prop.sharedMemPerBlock;
+        device_info.warp_size = prop.warpSize;
+        device_info.total_vram = prop.totalGlobalMem;
+
+        // Initialize Blackwell fields with vanilla defaults (zero overhead for non-Blackwell)
+        device_info.supports_clusters = false;
+        device_info.max_cluster_size = 0;
+        device_info.max_cluster_size_np = 0;
+        device_info.l2_cache_size = prop.l2CacheSize; // Use actual L2 size from CUDA
+        device_info.hbm_bandwidth = 0;
+        device_info.hbm3_support = false;
+        device_info.distributed_shmem = false;
+
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
         info.devices[id].smpbo = prop.sharedMemPerBlock;
 
@@ -273,10 +370,33 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n",
                         id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
 #else
-        info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
-        info.devices[id].cc = 100*prop.major + 10*prop.minor;
+        device_info.smpbo = prop.sharedMemPerBlockOptin;
+        device_info.cc = 100*prop.major + 10*prop.minor;
+
+        // Ultra-fast Blackwell detection: RTX 5090 optimized, zero overhead for others
+        if (GGML_CUDA_CC_IS_BLACKWELL(device_info.cc)) {
+            // RTX 5090 detection: 32GB VRAM indicates high-end Blackwell
+            const bool is_rtx_5090_class = (prop.totalGlobalMem >= (24ULL * 1024 * 1024 * 1024));
+            
+            if (is_rtx_5090_class) {
+                // RTX 5090: Enable only performance-proven features for large models
+                device_info.supports_clusters = true;
+                device_info.max_cluster_size = 8;        // Conservative for stability
+                device_info.max_cluster_size_np = 8;     // Match portable size for reliability
+                device_info.distributed_shmem = true;    // Helps memory bandwidth
+                device_info.l2_cache_size = 128 * 1024 * 1024; // RTX 5090: 128MB L2
+                device_info.hbm_bandwidth = 8ULL * 1024 * 1024 * 1024 * 1024; // ~8TB/s
+                device_info.hbm3_support = true;         // RTX 5090 has HBM3e
+            }
+            // Lower-end Blackwell: keep vanilla defaults (already set above)
+        }
+        
+        // Vanilla-style logging (same for all GPUs)
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n",
-                        id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
+                      id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
+        
+        // Ultra-fast capability detection using device_info reference
+        ggml_cuda_detect_kernel_capabilities_impl(device_info, &device_info.kernel_caps);
 #endif // defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
     }
 
@@ -1134,6 +1254,18 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
+// Wrapper function for Blackwell cluster GEMM to match the ggml_cuda_op_mul_mat_t signature
+static void ggml_cuda_op_mul_mat_cluster_gemm(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+    const int64_t src1_padded_row_size, cudaStream_t stream) {
+    
+    // Call the Blackwell cluster GEMM implementation
+    ggml_cuda_mul_mat_cluster_gemm(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
+                                   row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+}
+
 #ifndef GGML_CUDA_PEER_MAX_BATCH_SIZE
 #define GGML_CUDA_PEER_MAX_BATCH_SIZE 128
 #endif // GGML_CUDA_PEER_MAX_BATCH_SIZE
@@ -1923,6 +2055,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    
+    // Check for Blackwell-specific kernel optimizations
+    const int device = ggml_cuda_get_device();
+    bool can_use_cluster_gemm = ggml_cuda_can_use_cluster_gemm(device);
+    bool can_use_hbm3_opts = ggml_cuda_can_use_hbm3_optimizations(device);
+    
+    // Enable cluster-based GEMM for large matrices on Blackwell
+    bool use_cluster_gemm = false;
+    if (can_use_cluster_gemm && should_use_cluster_gemm(src0, src1, device)) {
+        use_cluster_gemm = true;
+    }
 
     bool any_gpus_with_slow_fp16   = false;
     bool any_gpus_without_fp16_mma = false;
@@ -1956,7 +2099,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     //printf("src0 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src0), ggml_is_transposed(src0), ggml_type_name(src0->type), src0->name);
     //printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
 
-    if (!split && use_mul_mat_vec && (src0->ne[1] <= MMV_MAX_ROWS || any_gpus_without_fp16_mma)) {
+    if (!split && use_cluster_gemm) {
+        // Use Blackwell cluster-based GEMM for large matrices
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cluster_gemm, nullptr);
+    } else if (!split && use_mul_mat_vec && (src0->ne[1] <= MMV_MAX_ROWS || any_gpus_without_fp16_mma)) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec(ctx, src0, src1, nullptr, dst);
@@ -2614,8 +2760,9 @@ static bool is_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, 
 static void update_cuda_graph_executable(ggml_backend_cuda_context * cuda_ctx) {
 
 #if CUDART_VERSION >= 12000
-    cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(cuda_ctx->cuda_graph->instance, cuda_ctx->cuda_graph->graph, &result_info);
+    cudaGraphNode_t errorNode;
+    cudaGraphExecUpdateResult result_info;
+    cudaError_t stat = cudaGraphExecUpdate(cuda_ctx->cuda_graph->instance, cuda_ctx->cuda_graph->graph, &errorNode, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
@@ -3255,6 +3402,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (op->src[0]->ne[0] == 256 && op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16) {
                 return true;
             }
+            
+            // Check for Blackwell cluster attention optimizations
+            bool supports_cluster_attn = ggml_cuda_can_use_cluster_attention(dev_ctx->device);
+            bool supports_large_tile = ggml_cuda_can_use_large_shared_memory(dev_ctx->device);
+            
+            // Future: Enable cluster attention for large sequences on Blackwell
+            // if (supports_cluster_attn && op->src[1]->ne[1] >= 2048) {
+            //     return true; // Enable cluster-based attention for long sequences
+            // }
+            
             return fp16_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) &&
                 op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
         }

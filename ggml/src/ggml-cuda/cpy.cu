@@ -1,5 +1,6 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
+#include "blackwell-memory.cuh"
 #ifdef GGML_USE_MUSA
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA
@@ -600,13 +601,26 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 #endif
     if (src0->type == src1->type && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
+        
+        // Check if we can use Blackwell HBM3-optimized copy
+        const int device = ggml_cuda_get_device();
+        const bool can_use_hbm3 = ggml_cuda_can_use_hbm3_optimizations(device);
+        const size_t data_size = ggml_nbytes(src0);
+        const bool large_transfer = data_size >= (1024 * 1024); // 1MB threshold
+        
+        if (can_use_hbm3 && large_transfer && 
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
+            // Use Blackwell HBM3-optimized copy for large transfers
+            ggml_cuda_cpy_hbm3_optimized(ctx, src0, src1);
+        } else {
 #ifdef GGML_USE_MUSA
-        if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
-            CUDA_CHECK(mudnnMemcpyAsync(ctx, src1, src0));
-        } else
+            if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
+                CUDA_CHECK(mudnnMemcpyAsync(ctx, src1, src0));
+            } else
 #endif // GGML_USE_MUSA
-        {
-            CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
+            {
+                CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
+            }
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_f32_f32_cuda (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream, dest_ptrs_d, graph_cpynode_index);
