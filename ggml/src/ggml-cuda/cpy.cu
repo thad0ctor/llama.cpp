@@ -1,6 +1,6 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
-#include "blackwell-memory.cuh"
+// #include "blackwell-memory.cuh" // Temporarily disabled for Phase 3 core build
 #ifdef GGML_USE_MUSA
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA
@@ -607,7 +607,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         const bool can_use_hbm3 = ggml_cuda_can_use_hbm3_optimizations(device);
         const size_t data_size = ggml_nbytes(src0);
         const bool large_transfer = data_size >= (1024 * 1024); // 1MB threshold
-        
+
         if (can_use_hbm3 && large_transfer && 
             (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
             // Use Blackwell HBM3-optimized copy for large transfers

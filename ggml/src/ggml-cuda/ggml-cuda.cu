@@ -1263,7 +1263,7 @@ static void ggml_cuda_op_mul_mat_cluster_gemm(
     
     // Call the Blackwell cluster GEMM implementation
     ggml_cuda_mul_mat_cluster_gemm(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
-                                   row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+                                    row_low, row_high, src1_ncols, src1_padded_row_size, stream);
 }
 
 #ifndef GGML_CUDA_PEER_MAX_BATCH_SIZE

@@ -9,6 +9,7 @@
 #include "llama-kv-cache-unified.h"
 #include "llama-kv-cache-unified-iswa.h"
 #include "llama-kv-cache-recurrent.h"
+#include "llama-kv-cache-quantized.h"
 
 #include "ggml-cpp.h"
 
@@ -13621,10 +13622,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 LLAMA_LOG_DEBUG("%s: n_ctx = %u (padded)\n", __func__, cparams.n_ctx);
 
+                // Check for quantized KV cache enablement via environment variables
+                const char * use_quantized_kv = getenv("LLAMA_KV_CACHE_QUANTIZED");
+                const char * blackwell_phase3 = getenv("LLAMA_BLACKWELL_PHASE3");
+                bool enable_quantized = (use_quantized_kv && atoi(use_quantized_kv)) || 
+                                       (blackwell_phase3 && atoi(blackwell_phase3));
+                
+                // Force enable for large models (235B+) on CUDA
+                if (!enable_quantized && hparams.n_layer > 70 && cparams.offload_kqv) {
+                    size_t model_size_gb = hparams.n_layer * hparams.n_embd * hparams.n_embd / (1024 * 1024 * 1024 / 2);
+                    if (model_size_gb > 200) {
+                        enable_quantized = true;
+                        LLAMA_LOG_INFO("%s: Auto-enabling quantized KV cache for large model (%zu GB)\n", __func__, model_size_gb);
+                    }
+                }
+
                 if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                     GGML_ASSERT(hparams.is_swa_any());
 
-                    res = new llama_kv_cache_unified_iswa(
+                    auto * base_cache = new llama_kv_cache_unified_iswa(
                             *this,
                             params.type_k,
                             params.type_v,
@@ -13635,10 +13651,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             cparams.n_ubatch,
                             padding);
+                    
+                    if (enable_quantized) {
+                        // For SWA models, we cannot easily wrap with quantized cache due to dual cache structure
+                        LLAMA_LOG_WARN("%s: Quantized KV cache not yet supported with SWA models, using standard cache\n", __func__);
+                        res = base_cache;
+                    } else {
+                        res = base_cache;
+                    }
                 } else {
                     GGML_ASSERT(!hparams.is_swa_any());
 
-                    res = new llama_kv_cache_unified(
+                    auto base_cache = std::make_unique<llama_kv_cache_unified>(
                             *this,
                             nullptr,
                             params.type_k,
@@ -13650,6 +13674,48 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             padding,
                             hparams.n_swa,
                             hparams.swa_type);
+
+                    if (enable_quantized) {
+                        // Configure quantized KV cache parameters
+                        llama_kv_cache_quantized_params qparams;
+                        
+                        // Read configuration from environment variables
+                        const char * k_quant = getenv("LLAMA_KV_K_QUANT");
+                        const char * v_quant = getenv("LLAMA_KV_V_QUANT");
+                        const char * quality = getenv("LLAMA_KV_QUALITY");
+                        const char * max_ctx = getenv("LLAMA_KV_MAX_CONTEXT");
+                        
+                        if (k_quant) {
+                            if (strcmp(k_quant, "int4") == 0) qparams.k_quant_level = LLAMA_KV_QUANT_INT4;
+                            else if (strcmp(k_quant, "int8") == 0) qparams.k_quant_level = LLAMA_KV_QUANT_INT8;
+                        }
+                        
+                        if (v_quant) {
+                            if (strcmp(v_quant, "int4") == 0) qparams.v_quant_level = LLAMA_KV_QUANT_INT4;
+                            else if (strcmp(v_quant, "int8") == 0) qparams.v_quant_level = LLAMA_KV_QUANT_INT8;
+                        }
+                        
+                        if (quality) {
+                            if (strcmp(quality, "fast") == 0) qparams.quality = LLAMA_KV_QUANT_QUALITY_FAST;
+                            else if (strcmp(quality, "high") == 0) qparams.quality = LLAMA_KV_QUANT_QUALITY_HIGH;
+                        }
+                        
+                        if (max_ctx) {
+                            qparams.max_context_length = std::max(32000u, (uint32_t)atoi(max_ctx));
+                        }
+                        
+                        LLAMA_LOG_INFO("%s: Using quantized KV cache with K=%s, V=%s, quality=%s\n", __func__,
+                            qparams.k_quant_level == LLAMA_KV_QUANT_INT8 ? "INT8" : 
+                            qparams.k_quant_level == LLAMA_KV_QUANT_INT4 ? "INT4" : "NONE",
+                            qparams.v_quant_level == LLAMA_KV_QUANT_INT8 ? "INT8" : 
+                            qparams.v_quant_level == LLAMA_KV_QUANT_INT4 ? "INT4" : "NONE",
+                            qparams.quality == LLAMA_KV_QUANT_QUALITY_FAST ? "FAST" :
+                            qparams.quality == LLAMA_KV_QUANT_QUALITY_HIGH ? "HIGH" : "BALANCED");
+                        
+                        res = new llama_kv_cache_quantized(std::move(base_cache), qparams);
+                    } else {
+                        res = base_cache.release();
+                    }
                 }
             }
     }
