@@ -6,6 +6,10 @@
 // Phase 3: Large matrix multiplication optimization for 235B+ models
 // Target: RTX 5090 with cluster support and distributed shared memory
 
+// Capability detection functions (currently return false for safety)
+bool ggml_cuda_can_use_cluster_gemm(int device_id);
+bool ggml_cuda_can_use_hbm3_optimizations(int device_id);
+
 // High-level interface for Blackwell GEMM optimization
 void ggml_cuda_mul_mat_cluster_gemm(
     ggml_backend_cuda_context & ctx,

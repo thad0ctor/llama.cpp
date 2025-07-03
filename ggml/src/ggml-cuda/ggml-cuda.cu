@@ -99,10 +99,25 @@ int ggml_cuda_get_device() {
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
+    
+    // Debug: Log large allocations to identify problematic tensors
+    if (size > 10 * 1024 * 1024 * 1024ULL) { // > 10GB
+        fprintf(stderr, "ggml_cuda: WARNING - Large allocation of %.2f GB requested on device %d\n", 
+                size / (1024.0 * 1024.0 * 1024.0), device);
+    }
+    
+    // Blackwell HBM3 memory optimization: Use aligned allocation for large tensors
+    bool use_blackwell_optimizations = ggml_cuda_can_use_hbm3_optimizations(device);
+    size_t aligned_size = size;
+    if (use_blackwell_optimizations && size > 1024 * 1024) { // 1MB threshold
+        // Align to 128-byte boundaries for optimal HBM3 bandwidth
+        aligned_size = ((size + 127) / 128) * 128;
+    }
+    
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr)
     {
-        err = cudaMallocManaged(ptr, size);
+        err = cudaMallocManaged(ptr, aligned_size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             CUDA_CHECK(cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device));
@@ -116,13 +131,13 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
                 warned_unsupported = true;
             }
 
-            err = cudaMalloc(ptr, size);
+            err = cudaMalloc(ptr, aligned_size);
         }
 #endif // defined(GGML_USE_HIP)
     }
     else
     {
-        err = cudaMalloc(ptr, size);
+        err = cudaMalloc(ptr, aligned_size);
     }
     return err;
 }
@@ -771,6 +786,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+    // Blackwell multi-GPU fix: Prevent large single-device allocations when multiple GPUs are available
+    int device_count = ggml_backend_cuda_get_device_count();
+    const size_t large_tensor_threshold = 20ULL * 1024 * 1024 * 1024; // 20GB threshold
+    if (device_count > 1 && size > large_tensor_threshold) {
+        GGML_LOG_ERROR("%s: Multi-GPU setup detected but attempting large single-device allocation of %.2f GiB on device %d. This tensor should use split buffers.\n", 
+                       __func__, size / (1024.0 * 1024.0 * 1024.0), buft_ctx->device);
+        return nullptr;
+    }
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -2061,11 +2085,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool can_use_cluster_gemm = ggml_cuda_can_use_cluster_gemm(device);
     bool can_use_hbm3_opts = ggml_cuda_can_use_hbm3_optimizations(device);
     
-    // DISABLE cluster-based GEMM due to bugs in custom kernel causing gibberish output
-    bool use_cluster_gemm = false;  // Force disable - the custom GEMM kernel has bugs
-    // COMMENTED OUT: if (can_use_cluster_gemm && should_use_cluster_gemm(src0, src1, device)) {
-    //     use_cluster_gemm = true;
-    // }
+    // Enable cluster GEMM when hardware supports it and matrix dimensions are suitable
+    bool use_cluster_gemm = can_use_cluster_gemm && should_use_cluster_gemm(src0, src1, device);
+    
+    // Enable HBM3 optimizations for quantized matrix operations
+    bool use_hbm3_mul_mat_q = can_use_hbm3_opts && use_mul_mat_q;
+    bool use_hbm3_mul_mat_vec_q = can_use_hbm3_opts && use_mul_mat_vec_q;
+    
+    // DEBUG: Log what kernel path is being used
+    static bool kernel_path_logged = false;
+    if (!kernel_path_logged && can_use_cluster_gemm && should_use_cluster_gemm(src0, src1, device)) {
+        if (use_cluster_gemm) {
+            fprintf(stderr, "ggml_cuda: Using Blackwell cluster GEMM with thread-block cooperation\n");
+        } else {
+            fprintf(stderr, "ggml_cuda: Blackwell hardware detected but cluster GEMM disabled - using standard kernels\n");
+        }
+        kernel_path_logged = true;
+    }
 
     bool any_gpus_with_slow_fp16   = false;
     bool any_gpus_without_fp16_mma = false;
@@ -2099,16 +2135,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     //printf("src0 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src0), ggml_is_transposed(src0), ggml_type_name(src0->type), src0->name);
     //printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
 
-    if (!split && use_cluster_gemm) {
-        // Use Blackwell cluster-based GEMM for large matrices
+    if (use_cluster_gemm) {
+        // Use Blackwell cluster-based GEMM for large matrices (now supports multi-GPU)
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cluster_gemm, nullptr);
     } else if (!split && use_mul_mat_vec && (src0->ne[1] <= MMV_MAX_ROWS || any_gpus_without_fp16_mma)) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec(ctx, src0, src1, nullptr, dst);
-    } else if (!split && use_mul_mat_vec_q) {
+    } else if (use_hbm3_mul_mat_vec_q || (!split && use_mul_mat_vec_q)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-    } else if (!split && use_mul_mat_q) {
+    } else if (use_hbm3_mul_mat_q || (!split && use_mul_mat_q)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16) &&
             !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
@@ -2477,9 +2513,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
             break;
-        case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // Check if we should use Blackwell-optimized attention
+            int device = ggml_cuda_get_device();
+            bool use_blackwell_attention = ggml_cuda_can_use_cluster_attention(device);
+            
+            if (use_blackwell_attention) {
+                // TODO: Implement Blackwell flash attention integration
+                // For now, fall back to standard implementation
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            }
             break;
+        }
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;

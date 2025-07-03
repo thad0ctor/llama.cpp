@@ -81,6 +81,11 @@ static __global__ void blackwell_flash_attn_kernel(
     half* shared_V = shared_K + DKQ * 256;
     float* shared_O = (float*)(shared_V + DV * 256);
     
+    // Initialize shared output buffer
+    if (tid < DV) {
+        shared_O[tid] = 0.0f;
+    }
+    
     // Blackwell-optimized memory access patterns
     // Use wider memory transactions for HBM3e bandwidth
     const int tokens_per_block = 64; // Optimized for Blackwell
@@ -140,7 +145,7 @@ static __global__ void blackwell_flash_attn_kernel(
 // Host function to launch Blackwell-optimized Flash Attention
 void launch_blackwell_l2_flash_attention(
     const void* Q, const void* K, const void* V,
-    void* O, void* L, void* M,
+    void* O, void* L, void* /* M */,
     int batch_size, int seq_len, int num_heads, int head_dim,
     float scale, ggml_type type, cudaStream_t stream) {
     
@@ -160,18 +165,32 @@ void launch_blackwell_l2_flash_attention(
     const bool use_clusters = (seq_len >= 4096 && batch_size >= 2);
     
     if (type == GGML_TYPE_F16 && head_dim == 128) {
-        // Simplified kernel call matching the exact signature
-        blackwell_flash_attn_kernel<128, 128, false><<<grid_size, block_size, smem_size, stream>>>(
-            (const char*)Q, (const char*)K, (const char*)V, nullptr,
-            (float*)O, (float2*)L, scale, 0.0f, 0.0f, 0.0f, 0, 0.0f,
-            head_dim, seq_len, num_heads, batch_size,  // ne00-ne03  
-            head_dim, seq_len, num_heads, batch_size,  // ne10-ne13
-            0, 0, // ne31, nb31
-            head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb01-nb03
-            head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb11-nb13  
-            head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb21-nb23
-            head_dim, seq_len, num_heads, batch_size  // ne0-ne3
-        );
+        // Use cluster optimization for large sequences
+        if (use_clusters) {
+            blackwell_flash_attn_kernel<128, 128, true><<<grid_size, block_size, smem_size, stream>>>(
+                (const char*)Q, (const char*)K, (const char*)V, nullptr,
+                (float*)O, (float2*)L, scale, 0.0f, 0.0f, 0.0f, 0, 0.0f,
+                head_dim, seq_len, num_heads, batch_size,  // ne00-ne03  
+                head_dim, seq_len, num_heads, batch_size,  // ne10-ne13
+                0, 0, // ne31, nb31
+                head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb01-nb03
+                head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb11-nb13  
+                head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb21-nb23
+                head_dim, seq_len, num_heads, batch_size  // ne0-ne3
+            );
+        } else {
+            blackwell_flash_attn_kernel<128, 128, false><<<grid_size, block_size, smem_size, stream>>>(
+                (const char*)Q, (const char*)K, (const char*)V, nullptr,
+                (float*)O, (float2*)L, scale, 0.0f, 0.0f, 0.0f, 0, 0.0f,
+                head_dim, seq_len, num_heads, batch_size,  // ne00-ne03  
+                head_dim, seq_len, num_heads, batch_size,  // ne10-ne13
+                0, 0, // ne31, nb31
+                head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb01-nb03
+                head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb11-nb13  
+                head_dim, seq_len * head_dim, num_heads * seq_len * head_dim, // nb21-nb23
+                head_dim, seq_len, num_heads, batch_size  // ne0-ne3
+            );
+        }
     }
     // Add other head dimensions as needed (64, 256, etc.)
     

@@ -757,9 +757,10 @@ uint32_t llama_kv_cache_unified::get_n_kv() const {
 
 ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv) const {
     // CRITICAL: Check if this object has been corrupted
-    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
-    LLAMA_LOG_DEBUG("%s: validating object integrity - hparams.n_layer=%u, layers.size()=%zu\n", 
-        __func__, hparams.n_layer, layers.size());
+    // Debug messages removed for performance
+    // LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    // LLAMA_LOG_DEBUG("%s: validating object integrity - hparams.n_layer=%u, layers.size()=%zu\n", 
+    //     __func__, hparams.n_layer, layers.size());
     
     // Check for obvious corruption
     if (hparams.n_layer == 0 || hparams.n_layer > 10000) {
@@ -797,7 +798,8 @@ ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint
 }
 
 ggml_tensor * llama_kv_cache_unified::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv) const {
-    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    // Debug message removed for performance
+    // LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
     
     auto it = map_layer_ids.find(il);
     if (it == map_layer_ids.end()) {
@@ -836,7 +838,8 @@ ggml_tensor * llama_kv_cache_unified::get_v(ggml_context * ctx, int32_t il, uint
 }
 
 ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t head_cur) const {
-    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    // Debug message removed for performance
+    // LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
     
     // MoE models (like qwen3moe) often have issues with layer mapping due to expert routing
     // Check if this is a MoE model and implement direct layer access bypass
@@ -914,7 +917,8 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
 }
 
 ggml_tensor * llama_kv_cache_unified::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t head_cur) const {
-    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    // Debug message removed for performance
+    // LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
     
     // Note: MoE v_bypass removed - rely only on cache-level prevention
     
