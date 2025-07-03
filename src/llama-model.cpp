@@ -13625,17 +13625,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // Check for quantized KV cache enablement via environment variables
                 const char * use_quantized_kv = getenv("LLAMA_KV_CACHE_QUANTIZED");
                 const char * blackwell_phase3 = getenv("LLAMA_BLACKWELL_PHASE3");
-                bool enable_quantized = (use_quantized_kv && atoi(use_quantized_kv)) || 
-                                       (blackwell_phase3 && atoi(blackwell_phase3));
+                const char * k_quant = getenv("LLAMA_KV_K_QUANT");
+                const char * v_quant = getenv("LLAMA_KV_V_QUANT");
                 
-                // Force enable for large models (235B+) on CUDA
+                // Enable if explicitly set via environment variables
+                // CRITICAL: Disable quantized cache for MoE models due to compatibility issues
+                bool is_moe_model = (hparams.n_expert > 0);
+                bool enable_quantized = !is_moe_model && (
+                                       (use_quantized_kv && atoi(use_quantized_kv)) || 
+                                       (blackwell_phase3 && atoi(blackwell_phase3)) ||
+                                       (k_quant && strlen(k_quant) > 0) ||
+                                       (v_quant && strlen(v_quant) > 0));
+                
+                // Force enable for large models (235B+) on CUDA, but only if not explicitly disabled
                 if (!enable_quantized && hparams.n_layer > 70 && cparams.offload_kqv) {
                     size_t model_size_gb = hparams.n_layer * hparams.n_embd * hparams.n_embd / (1024 * 1024 * 1024 / 2);
                     if (model_size_gb > 200) {
-                        enable_quantized = true;
-                        LLAMA_LOG_INFO("%s: Auto-enabling quantized KV cache for large model (%zu GB)\n", __func__, model_size_gb);
+                        // Check if user explicitly wants standard cache
+                        const char * disable_auto = getenv("LLAMA_KV_DISABLE_AUTO");
+                        if (!disable_auto || !atoi(disable_auto)) {
+                            enable_quantized = true;
+                            LLAMA_LOG_INFO("%s: Auto-enabling quantized KV cache for large model (%zu GB)\n", __func__, model_size_gb);
+                        }
                     }
                 }
+                
+                LLAMA_LOG_DEBUG("%s: enable_quantized=%s, n_layer=%u, model_size=%zu GB\n", 
+                    __func__, enable_quantized ? "true" : "false", hparams.n_layer, 
+                    hparams.n_layer * hparams.n_embd * hparams.n_embd / (1024 * 1024 * 1024 / 2));
 
                 if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                     GGML_ASSERT(hparams.is_swa_any());
@@ -13661,6 +13678,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 } else {
                     GGML_ASSERT(!hparams.is_swa_any());
+
+                    // Critical validation: Check hparams before creating cache
+                    LLAMA_LOG_DEBUG("%s: validating model hparams before cache creation\n", __func__);
+                    LLAMA_LOG_DEBUG("%s: hparams.n_layer=%u, hparams.n_embd=%u\n", __func__, hparams.n_layer, hparams.n_embd);
+                    
+                    if (hparams.n_layer == 0 || hparams.n_layer > 10000) {
+                        LLAMA_LOG_ERROR("%s: CRITICAL ERROR - corrupted hparams.n_layer: %u\n", __func__, hparams.n_layer);
+                        throw std::runtime_error("corrupted model hparams detected");
+                    }
+                    
+                    if (hparams.n_embd == 0 || hparams.n_embd > 100000) {
+                        LLAMA_LOG_ERROR("%s: CRITICAL ERROR - corrupted hparams.n_embd: %u\n", __func__, hparams.n_embd);
+                        throw std::runtime_error("corrupted model hparams detected");
+                    }
 
                     auto base_cache = std::make_unique<llama_kv_cache_unified>(
                             *this,
@@ -13704,6 +13735,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             qparams.max_context_length = std::max(32000u, (uint32_t)atoi(max_ctx));
                         }
                         
+                        // MoE compatibility check already handled at enable_quantized level
+                        
                         LLAMA_LOG_INFO("%s: Using quantized KV cache with K=%s, V=%s, quality=%s\n", __func__,
                             qparams.k_quant_level == LLAMA_KV_QUANT_INT8 ? "INT8" : 
                             qparams.k_quant_level == LLAMA_KV_QUANT_INT4 ? "INT4" : "NONE",
@@ -13712,7 +13745,30 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             qparams.quality == LLAMA_KV_QUANT_QUALITY_FAST ? "FAST" :
                             qparams.quality == LLAMA_KV_QUANT_QUALITY_HIGH ? "HIGH" : "BALANCED");
                         
-                        res = new llama_kv_cache_quantized(std::move(base_cache), qparams);
+                        try {
+                            // Validate base cache before wrapping
+                            if (!base_cache.get()) {
+                                LLAMA_LOG_ERROR("%s: base_cache is null, cannot create quantized cache\n", __func__);
+                                throw std::runtime_error("base cache is null");
+                            }
+                            
+                            // Test base cache functionality
+                            uint32_t test_size = base_cache->get_size();
+                            LLAMA_LOG_DEBUG("%s: base cache validation successful, size=%u\n", __func__, test_size);
+                            
+                            // Create quantized cache with raw pointer (no move semantics)
+                            res = new llama_kv_cache_quantized(base_cache.get(), qparams);
+                            // Release the unique_ptr since quantized cache now owns the pointer
+                            base_cache.release();
+                            
+                            LLAMA_LOG_INFO("%s: Quantized KV cache created successfully\n", __func__);
+                        } catch (const std::exception & e) {
+                            LLAMA_LOG_ERROR("%s: Failed to create quantized KV cache: %s\n", __func__, e.what());
+                            LLAMA_LOG_WARN("%s: Falling back to standard unified cache\n", __func__);
+                            
+                            // Fall back to standard cache
+                            res = base_cache.release();
+                        }
                     } else {
                         res = base_cache.release();
                     }

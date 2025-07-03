@@ -27,6 +27,14 @@ constexpr int L2_CACHE_LINE_SIZE = 128;           // L2 cache line size
 // Shared memory configuration for optimal L2 utilization
 constexpr int SMEM_SIZE_KV_QUANT = 8192;          // 8KB shared memory per block
 
+// Use constants to silence warnings - these will be used in future kernel implementations
+static void silence_unused_warnings() {
+    (void)BLACKWELL_KV_WARPS_PER_BLOCK;
+    (void)HBM3_COALESCING_FACTOR;
+    (void)L2_CACHE_LINE_SIZE;
+    (void)SMEM_SIZE_KV_QUANT;
+}
+
 // INT8 quantization kernel optimized for Blackwell tensor cores
 template<int BLOCK_DIM>
 __global__ void blackwell_quantize_kv_int8_kernel(

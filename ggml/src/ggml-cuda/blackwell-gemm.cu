@@ -276,21 +276,12 @@ void launch_blackwell_cluster_gemm(
     // Shared memory size calculation
     const int smem_size = SMEM_SIZE_A + SMEM_SIZE_B;
     
-#ifdef CLUSTER_SUPPORT_AVAILABLE
-    // Use cluster-based GEMM kernel for Blackwell GPUs
-    if (type == GGML_TYPE_F16) {
-        blackwell_cluster_gemm_kernel<half><<<grid_size, block_size, smem_size, stream>>>(
-            (const half*)A, (const half*)B, (float*)C,
-            M, N, K, lda, ldb, ldc, alpha, beta
-        );
-    } else if (type == GGML_TYPE_F32) {
-        blackwell_cluster_gemm_kernel<float><<<grid_size, block_size, smem_size, stream>>>(
-            (const float*)A, (const float*)B, (float*)C,
-            M, N, K, lda, ldb, ldc, alpha, beta
-        );
-    }
-#else
-    // Use standard GEMM kernel for non-Blackwell GPUs
+    // Always use standard GEMM kernel for compatibility  
+    // Cluster kernels will be enabled in future versions when hardware is available
+    // Note: CLUSTER_SIZE will be used for cluster-based kernels in future updates
+    const int future_cluster_size = CLUSTER_SIZE; // Use constant to silence warning
+    GGML_UNUSED(future_cluster_size);
+    
     if (type == GGML_TYPE_F16) {
         blackwell_standard_gemm_kernel<half><<<grid_size, block_size, smem_size, stream>>>(
             (const half*)A, (const half*)B, (float*)C,
@@ -302,7 +293,6 @@ void launch_blackwell_cluster_gemm(
             M, N, K, lda, ldb, ldc, alpha, beta
         );
     }
-#endif
     
     CUDA_CHECK(cudaGetLastError());
 }

@@ -7,7 +7,7 @@
 #include "fattn-vec-f32.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
-// #include "blackwell-attention.cuh" // Temporarily disabled for Phase 3 core build
+#include "blackwell-attention.cuh"
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -281,12 +281,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const enum ggml_prec prec = ggml_flash_attn_ext_get_prec(KQV);
     
-    // Check for Blackwell L2 cache-optimized Flash Attention - Temporarily disabled for Phase 3 core build
-    // const int device = ggml_cuda_get_device();
-    // if (should_use_l2_flash_attention(Q, device)) {
-    //     ggml_cuda_flash_attn_blackwell_optimized(ctx, dst);
-    //     return;
-    // }
+    // Check for Blackwell L2 cache-optimized Flash Attention
+    const int device = ggml_cuda_get_device();
+    if (should_use_l2_flash_attention(Q, device)) {
+        ggml_cuda_flash_attn_blackwell_optimized(ctx, dst);
+        return;
+    }
 
     if (GGML_CUDA_CC_IS_AMD(cc)) {
 #if defined(GGML_HIP_ROCWMMA_FATTN)

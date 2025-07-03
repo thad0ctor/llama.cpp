@@ -52,6 +52,14 @@ public:
 
     ~llama_kv_cache_unified() = default;
 
+    // Disable move semantics due to complex GGML object dependencies
+    llama_kv_cache_unified(llama_kv_cache_unified &&) = delete;
+    llama_kv_cache_unified & operator=(llama_kv_cache_unified &&) = delete;
+    
+    // Disable copy semantics as well
+    llama_kv_cache_unified(const llama_kv_cache_unified &) = delete;
+    llama_kv_cache_unified & operator=(const llama_kv_cache_unified &) = delete;
+
     //
     // llama_memory_i
     //
@@ -132,7 +140,7 @@ public:
 
 private:
     const llama_model & model;
-    const llama_hparams & hparams;
+    const llama_hparams hparams;
 
     struct kv_layer {
         // layer index in the model

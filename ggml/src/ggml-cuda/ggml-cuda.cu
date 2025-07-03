@@ -2061,11 +2061,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool can_use_cluster_gemm = ggml_cuda_can_use_cluster_gemm(device);
     bool can_use_hbm3_opts = ggml_cuda_can_use_hbm3_optimizations(device);
     
-    // Enable cluster-based GEMM for large matrices on Blackwell
-    bool use_cluster_gemm = false;
-    if (can_use_cluster_gemm && should_use_cluster_gemm(src0, src1, device)) {
-        use_cluster_gemm = true;
-    }
+    // DISABLE cluster-based GEMM due to bugs in custom kernel causing gibberish output
+    bool use_cluster_gemm = false;  // Force disable - the custom GEMM kernel has bugs
+    // COMMENTED OUT: if (can_use_cluster_gemm && should_use_cluster_gemm(src0, src1, device)) {
+    //     use_cluster_gemm = true;
+    // }
 
     bool any_gpus_with_slow_fp16   = false;
     bool any_gpus_without_fp16_mma = false;

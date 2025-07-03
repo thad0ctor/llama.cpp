@@ -1,6 +1,6 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
-// #include "blackwell-memory.cuh" // Temporarily disabled for Phase 3 core build
+#include "blackwell-memory.cuh"
 #ifdef GGML_USE_MUSA
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA

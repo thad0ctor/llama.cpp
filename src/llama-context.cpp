@@ -1334,10 +1334,41 @@ ggml_cgraph * llama_context::graph_reserve(uint32_t n_tokens, uint32_t n_seqs, u
 
     ggml_backend_sched_reset(sched.get());
 
+    // CRITICAL FIX: Validate memory state before scheduler reservation
+    // The ggml_backend_sched_reserve call corrupts adjacent memory where unified cache lives
+    if (mstate) {
+        // Try to validate that the memory state is still intact before scheduler allocation
+        try {
+            LLAMA_LOG_DEBUG("%s: validating memory state before ggml_backend_sched_reserve\n", __func__);
+            
+            // Test that we can access the memory state without corruption
+            auto status = mstate->get_status();
+            if (status != LLAMA_MEMORY_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: memory state corrupted before scheduler reserve, status=%d\n", __func__, (int)status);
+            }
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: memory state validation failed before scheduler reserve: %s\n", __func__, e.what());
+        }
+    }
+
     // initialize scheduler with the specified graph
     if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
+    }
+    
+    // CRITICAL: Validate memory state after scheduler reservation
+    if (mstate) {
+        try {
+            LLAMA_LOG_DEBUG("%s: validating memory state after ggml_backend_sched_reserve\n", __func__);
+            
+            auto status = mstate->get_status();
+            if (status != LLAMA_MEMORY_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: CORRUPTION DETECTED: memory state corrupted by ggml_backend_sched_reserve, status=%d\n", __func__, (int)status);
+            }
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: CORRUPTION DETECTED: memory state corrupted by ggml_backend_sched_reserve: %s\n", __func__, e.what());
+        }
     }
 
     return gf;

@@ -14,6 +14,9 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// Forward declaration for MoE quantization - temporarily disabled
+// class llama_kv_cache_moe_quantized;
+
 //
 // llama_kv_cache_quantized - Blackwell RTX 5090 Optimized KV Cache
 // 
@@ -77,10 +80,17 @@ class llama_kv_cache_quantized : public llama_memory_i {
 public:
     // Constructor - wraps existing unified cache with quantization
     llama_kv_cache_quantized(
-        std::unique_ptr<llama_kv_cache_unified> base_cache,
+        llama_kv_cache_unified * base_cache,
         const llama_kv_cache_quantized_params & params);
     
-    ~llama_kv_cache_quantized() = default;
+    // Properly manage base cache lifetime
+    ~llama_kv_cache_quantized();
+
+    // Disable move and copy semantics to prevent issues
+    llama_kv_cache_quantized(llama_kv_cache_quantized &&) = delete;
+    llama_kv_cache_quantized & operator=(llama_kv_cache_quantized &&) = delete;
+    llama_kv_cache_quantized(const llama_kv_cache_quantized &) = delete;
+    llama_kv_cache_quantized & operator=(const llama_kv_cache_quantized &) = delete;
 
     //
     // llama_memory_i interface (delegates to base cache with quantization)
@@ -144,11 +154,18 @@ public:
     memory_usage get_memory_usage() const;
 
     // Access the underlying base cache
-    llama_kv_cache_unified * get_base_cache() const { return base_cache.get(); }
+    llama_kv_cache_unified * get_base_cache() const { return base_cache; }
 
 private:
-    std::unique_ptr<llama_kv_cache_unified> base_cache;
+    llama_kv_cache_unified * base_cache;
     llama_kv_cache_quantized_params params;
+    
+    // MoE-specific quantized cache (used for MoE models) - temporarily disabled
+    // std::unique_ptr<llama_kv_cache_moe_quantized> moe_cache;
+    
+    // CRITICAL: Corruption detection and prevention
+    uint32_t base_cache_size_cached = 0;     // Cached size for validation
+    uintptr_t base_cache_address = 0;        // Cached address for validation
     
     // Quantization metadata per cache slot
     std::vector<std::vector<llama_kv_quant_metadata>> quant_metadata; // [layer][slot]
@@ -161,6 +178,9 @@ private:
     // Blackwell-specific optimization state
     bool blackwell_available = false;
     int cuda_device_id = -1;
+    
+    // Corruption detection method
+    void validate_base_cache_integrity() const;
     
     // Internal quantization functions
     bool should_quantize_slot(uint32_t layer_id, uint32_t slot_id) const;
@@ -180,11 +200,17 @@ private:
     // Quality monitoring
     float estimate_quality_impact(llama_kv_quant_level level) const;
     void update_quality_metrics(float quality_impact);
+    
+    // Dynamic metadata allocation helper
+    void ensure_metadata_for_layer(uint32_t layer_id);
 };
 
 // State wrapper for quantized cache
 class llama_kv_cache_quantized_state : public llama_memory_state_i {
 public:
+    // Constructor for error states
+    llama_kv_cache_quantized_state(llama_memory_status status);
+    
     llama_kv_cache_quantized_state(
         llama_kv_cache_quantized * qcache,
         llama_memory_state_ptr base_state);
@@ -204,6 +230,7 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
 private:
+    llama_memory_status status = LLAMA_MEMORY_STATUS_SUCCESS;
     llama_kv_cache_quantized * qcache;
     llama_memory_state_ptr base_state;
 };
