@@ -29,7 +29,18 @@ llama_kv_cache_unified::llama_kv_cache_unified(
                  uint32_t    n_swa,
            llama_swa_type    swa_type) :
     model(model), hparams(model.hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type)
+{
+    LLAMA_LOG_DEBUG("%s: constructor starting, n_layer=%u, filter=%p\n", __func__, hparams.n_layer, (void*)filter.target<bool(*)(int32_t)>());
+
+    // Add validation for critical parameters
+    if (hparams.n_layer == 0) {
+        LLAMA_LOG_ERROR("%s: ERROR - hparams.n_layer is 0, this will result in empty map_layer_ids\n", __func__);
+        throw std::runtime_error("KV cache constructor: model has 0 layers, cannot create KV cache");
+    }
+
+    LLAMA_LOG_DEBUG("%s: model validation - n_layer=%u, kv_size=%u, n_pad=%u\n", 
+        __func__, hparams.n_layer, kv_size, n_pad);
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -62,11 +73,15 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
     cells.resize(kv_size);
 
+    LLAMA_LOG_DEBUG("%s: starting layer loop, n_layer=%u\n", __func__, hparams.n_layer);
+    
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (filter && !filter(il)) {
-            LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, il);
+            LLAMA_LOG_DEBUG("%s: layer %3d: skipped by filter\n", __func__, il);
             continue;
         }
+
+        LLAMA_LOG_DEBUG("%s: processing layer %3d\n", __func__, il);
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
@@ -86,21 +101,42 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
+            LLAMA_LOG_ERROR("%s: ERROR - failed to create ggml context for layer %d, buft=%p\n", __func__, il, (void*)buft);
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
+
+        LLAMA_LOG_DEBUG("%s: layer %3d: creating tensors - type_k=%d, type_v=%d, n_embd_k_gqa=%u, n_embd_v_gqa=%u, kv_size=%u\n", 
+            __func__, il, (int)type_k, (int)type_v, n_embd_k_gqa, n_embd_v_gqa, kv_size);
 
         ggml_tensor * k;
         ggml_tensor * v;
 
         k = ggml_new_tensor_2d(ctx, type_k, n_embd_k_gqa, kv_size);
+        if (!k) {
+            LLAMA_LOG_ERROR("%s: ERROR - failed to create K tensor for layer %d\n", __func__, il);
+            throw std::runtime_error("failed to create K tensor for kv cache");
+        }
+
         v = ggml_new_tensor_2d(ctx, type_v, n_embd_v_gqa, kv_size);
+        if (!v) {
+            LLAMA_LOG_ERROR("%s: ERROR - failed to create V tensor for layer %d\n", __func__, il);
+            throw std::runtime_error("failed to create V tensor for kv cache");
+        }
 
         ggml_format_name(k, "cache_k_l%d", il);
         ggml_format_name(v, "cache_v_l%d", il);
 
+        LLAMA_LOG_DEBUG("%s: layer %3d: successfully created tensors, adding to map_layer_ids[%d] = %zu\n", 
+            __func__, il, il, layers.size());
+
         map_layer_ids[il] = layers.size();
         layers.push_back({ il, k, v });
+        
+        LLAMA_LOG_DEBUG("%s: layer %3d added to map_layer_ids[%d] = %zu\n", __func__, il, il, layers.size() - 1);
     }
+
+    LLAMA_LOG_DEBUG("%s: layer loop completed, map_layer_ids.size()=%zu, layers.size()=%zu\n", 
+        __func__, map_layer_ids.size(), layers.size());
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto it : ctx_map) {
@@ -130,6 +166,9 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+    
+    LLAMA_LOG_DEBUG("%s: constructor completed successfully, final map_layer_ids.size()=%zu\n", 
+        __func__, map_layer_ids.size());
 }
 
 void llama_kv_cache_unified::clear(bool data) {
@@ -717,7 +756,24 @@ uint32_t llama_kv_cache_unified::get_n_kv() const {
 }
 
 ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv) const {
-    const int32_t ikv = map_layer_ids.at(il);
+    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        LLAMA_LOG_ERROR("%s: CRITICAL ERROR - layer %d not found in map_layer_ids\n", __func__, il);
+        LLAMA_LOG_ERROR("%s: Debug info - map size: %zu, layers size: %zu, model n_layer: %u\n", 
+            __func__, map_layer_ids.size(), layers.size(), hparams.n_layer);
+        LLAMA_LOG_ERROR("%s: Available layers in map: ", __func__);
+        for (const auto & pair : map_layer_ids) {
+            LLAMA_LOG_ERROR("%d->%d ", pair.first, pair.second);
+        }
+        LLAMA_LOG_ERROR("\n");
+        LLAMA_LOG_ERROR("%s: This indicates the KV cache constructor failed to initialize properly\n", __func__);
+        LLAMA_LOG_ERROR("%s: Try enabling LLAMA_KV_CACHE_DEBUG=1 to see constructor details\n", __func__);
+        throw std::runtime_error("layer not found in KV cache - constructor may have failed");
+    }
+    
+    const int32_t ikv = it->second;
 
     auto * k = layers[ikv].k;
 
@@ -729,7 +785,24 @@ ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint
 }
 
 ggml_tensor * llama_kv_cache_unified::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv) const {
-    const int32_t ikv = map_layer_ids.at(il);
+    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        LLAMA_LOG_ERROR("%s: CRITICAL ERROR - layer %d not found in map_layer_ids\n", __func__, il);
+        LLAMA_LOG_ERROR("%s: Debug info - map size: %zu, layers size: %zu, model n_layer: %u\n", 
+            __func__, map_layer_ids.size(), layers.size(), hparams.n_layer);
+        LLAMA_LOG_ERROR("%s: Available layers in map: ", __func__);
+        for (const auto & pair : map_layer_ids) {
+            LLAMA_LOG_ERROR("%d->%d ", pair.first, pair.second);
+        }
+        LLAMA_LOG_ERROR("\n");
+        LLAMA_LOG_ERROR("%s: This indicates the KV cache constructor failed to initialize properly\n", __func__);
+        LLAMA_LOG_ERROR("%s: Try enabling LLAMA_KV_CACHE_DEBUG=1 to see constructor details\n", __func__);
+        throw std::runtime_error("layer not found in KV cache - constructor may have failed");
+    }
+    
+    const int32_t ikv = it->second;
 
     auto * v = layers[ikv].v;
 
@@ -751,7 +824,24 @@ ggml_tensor * llama_kv_cache_unified::get_v(ggml_context * ctx, int32_t il, uint
 }
 
 ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t head_cur) const {
-    const int32_t ikv = map_layer_ids.at(il);
+    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        LLAMA_LOG_ERROR("%s: CRITICAL ERROR - layer %d not found in map_layer_ids\n", __func__, il);
+        LLAMA_LOG_ERROR("%s: Debug info - map size: %zu, layers size: %zu, model n_layer: %u\n", 
+            __func__, map_layer_ids.size(), layers.size(), hparams.n_layer);
+        LLAMA_LOG_ERROR("%s: Available layers in map: ", __func__);
+        for (const auto & pair : map_layer_ids) {
+            LLAMA_LOG_ERROR("%d->%d ", pair.first, pair.second);
+        }
+        LLAMA_LOG_ERROR("\n");
+        LLAMA_LOG_ERROR("%s: This indicates the KV cache constructor failed to initialize properly\n", __func__);
+        LLAMA_LOG_ERROR("%s: Try enabling LLAMA_KV_CACHE_DEBUG=1 to see constructor details\n", __func__);
+        throw std::runtime_error("layer not found in KV cache - constructor may have failed");
+    }
+    
+    const int32_t ikv = it->second;
 
     auto * k = layers[ikv].k;
 
@@ -765,7 +855,24 @@ ggml_tensor * llama_kv_cache_unified::cpy_k(ggml_context * ctx, ggml_tensor * k_
 }
 
 ggml_tensor * llama_kv_cache_unified::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t head_cur) const {
-    const int32_t ikv = map_layer_ids.at(il);
+    LLAMA_LOG_DEBUG("%s: requesting layer %d, map_layer_ids.size()=%zu\n", __func__, il, map_layer_ids.size());
+    
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        LLAMA_LOG_ERROR("%s: CRITICAL ERROR - layer %d not found in map_layer_ids\n", __func__, il);
+        LLAMA_LOG_ERROR("%s: Debug info - map size: %zu, layers size: %zu, model n_layer: %u\n", 
+            __func__, map_layer_ids.size(), layers.size(), hparams.n_layer);
+        LLAMA_LOG_ERROR("%s: Available layers in map: ", __func__);
+        for (const auto & pair : map_layer_ids) {
+            LLAMA_LOG_ERROR("%d->%d ", pair.first, pair.second);
+        }
+        LLAMA_LOG_ERROR("\n");
+        LLAMA_LOG_ERROR("%s: This indicates the KV cache constructor failed to initialize properly\n", __func__);
+        LLAMA_LOG_ERROR("%s: Try enabling LLAMA_KV_CACHE_DEBUG=1 to see constructor details\n", __func__);
+        throw std::runtime_error("layer not found in KV cache - constructor may have failed");
+    }
+    
+    const int32_t ikv = it->second;
 
     auto * v = layers[ikv].v;
 
