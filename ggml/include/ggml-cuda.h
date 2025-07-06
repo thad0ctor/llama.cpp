@@ -42,6 +42,8 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 // Blackwell architecture capability detection
 GGML_BACKEND_API bool ggml_cuda_can_use_cluster_gemm(int device_id);
+GGML_BACKEND_API bool ggml_cuda_can_use_cluster_attention(int device_id);
+GGML_BACKEND_API bool ggml_cuda_can_use_large_shared_memory(int device_id);
 GGML_BACKEND_API bool ggml_cuda_can_use_hbm3_optimizations(int device_id);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);

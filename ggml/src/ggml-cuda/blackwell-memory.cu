@@ -56,21 +56,9 @@ __global__ void blackwell_hbm3_memcpy_kernel(
             // Note: Hardware prefetching on HBM3 handles this automatically
             // Software prefetching not needed in device code for modern GPUs
             
-            // Streaming load/store to bypass L2 cache for large transfers
-            VecType data;
-            asm("ld.global.cs.v4.f32 {%0,%1,%2,%3}, [%4];" 
-                : "=f"(reinterpret_cast<float*>(&data)[0]),
-                  "=f"(reinterpret_cast<float*>(&data)[1]),
-                  "=f"(reinterpret_cast<float*>(&data)[2]),
-                  "=f"(reinterpret_cast<float*>(&data)[3])
-                : "l"(&vec_src[src_idx]));
-            
-            asm("st.global.cs.v4.f32 [%4], {%0,%1,%2,%3};" 
-                :: "f"(reinterpret_cast<float*>(&data)[0]),
-                   "f"(reinterpret_cast<float*>(&data)[1]),
-                   "f"(reinterpret_cast<float*>(&data)[2]),
-                   "f"(reinterpret_cast<float*>(&data)[3]),
-                   "l"(&vec_dst[dst_idx]));
+            // Streaming load/store using safer CUDA intrinsics instead of inline assembly
+            VecType data = vec_src[src_idx];  // Let compiler optimize this
+            vec_dst[dst_idx] = data;
         }
     } else {
         // For smaller transfers, utilize L2 cache

@@ -100,10 +100,10 @@ __global__ void blackwell_optimized_gemm_kernel(
         
         __syncthreads();
         
-        // Compute partial GEMM with optimized thread mapping
+        // Compute partial GEMM with correct thread mapping
         const int threads_per_dim = 16;  // sqrt(256) = 16 threads per dimension
-        const int thread_row = (tid / threads_per_dim) * 8;  // Row position
-        const int thread_col = (tid % threads_per_dim) * 8;  // Col position
+        const int thread_row = (tid / threads_per_dim) * 8;  // Row position (0-120 in steps of 8)
+        const int thread_col = (tid % threads_per_dim) * 8;  // Col position (0-120 in steps of 8)
         
         #pragma unroll
         for (int k_idx = 0; k_idx < k_size; ++k_idx) {
@@ -124,9 +124,9 @@ __global__ void blackwell_optimized_gemm_kernel(
     }
     
     // Write results back to global memory with vectorized writes
-    const int threads_per_dim = 16;
-    const int thread_row = (tid / threads_per_dim) * 8;
-    const int thread_col = (tid % threads_per_dim) * 8;
+    const int threads_per_dim = 16;  // sqrt(256) = 16 threads per dimension
+    const int thread_row = (tid / threads_per_dim) * 8;  // Row position (0-120 in steps of 8)
+    const int thread_col = (tid % threads_per_dim) * 8;  // Col position (0-120 in steps of 8)
     
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -239,9 +239,9 @@ __global__ void blackwell_cluster_gemm_kernel(
         block.sync();
         
         // Compute with access to full cluster shared memory
-        const int threads_per_dim = 16;
-        const int thread_row = (tid / threads_per_dim) * 8;
-        const int thread_col = (tid % threads_per_dim) * 8;
+        const int threads_per_dim = 16;  // sqrt(256) = 16 threads per dimension
+        const int thread_row = (tid / threads_per_dim) * 8;  // Row position (0-120 in steps of 8)
+        const int thread_col = (tid % threads_per_dim) * 8;  // Col position (0-120 in steps of 8)
         
         #pragma unroll
         for (int k_idx = 0; k_idx < k_size; ++k_idx) {
@@ -378,8 +378,8 @@ __global__ void blackwell_standard_gemm_kernel(
     // Write results to global memory
     // FIXED: Correct thread-to-output mapping for 256 threads -> 16x16 grid
     const int threads_per_dim = 16;  // sqrt(256) = 16 threads per dimension
-    const int thread_row = (tid / threads_per_dim) * 8;  // Row position (0, 8, 16, ..., 120)
-    const int thread_col = (tid % threads_per_dim) * 8;  // Col position (0, 8, 16, ..., 120)
+    const int thread_row = (tid / threads_per_dim) * 8;  // Row position (0-120 in steps of 8)
+    const int thread_col = (tid % threads_per_dim) * 8;  // Col position (0-120 in steps of 8)
     
     #pragma unroll
     for (int i = 0; i < 8; ++i) {

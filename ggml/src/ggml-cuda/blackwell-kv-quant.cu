@@ -96,10 +96,10 @@ __global__ void blackwell_quantize_kv_int8_kernel(
         v_max = fmaxf(v_max, __shfl_down_sync(0xffffffff, v_max, offset));
     }
     
-    // Store scales in shared memory
+    // Store scales in shared memory with proper division by zero protection
     if (lid == 0) {
-        k_scales[wid] = k_max / 127.0f; // INT8 symmetric quantization
-        v_scales[wid] = v_max / 127.0f;
+        k_scales[wid] = (k_max > 1e-8f) ? (k_max / 127.0f) : 1e-8f; // INT8 symmetric quantization
+        v_scales[wid] = (v_max > 1e-8f) ? (v_max / 127.0f) : 1e-8f; // Use small epsilon instead of 1.0f
     }
     
     __syncthreads();
@@ -184,8 +184,8 @@ __global__ void blackwell_quantize_kv_int4_kernel(
     }
     
     if (lid == 0) {
-        k_scales[wid] = k_max / 7.0f; // INT4 symmetric quantization
-        v_scales[wid] = v_max / 7.0f;
+        k_scales[wid] = (k_max > 1e-8f) ? (k_max / 7.0f) : 1e-8f; // INT4 symmetric quantization
+        v_scales[wid] = (v_max > 1e-8f) ? (v_max / 7.0f) : 1e-8f; // Use small epsilon instead of 0
     }
     
     __syncthreads();
@@ -219,8 +219,11 @@ __global__ void blackwell_quantize_kv_int4_kernel(
         const uint8_t v_packed = ((v_quant & 0x0F) << 4) | (v_quant_next & 0x0F);
         
         const int dst_offset = (global_slot * n_embd + embd_idx) / 2;
-        k_dst[dst_offset] = k_packed;
-        v_dst[dst_offset] = v_packed;
+        // Add bounds checking for destination writes
+        if (dst_offset >= 0 && dst_offset < (cache_slots * n_embd / 2) && (embd_idx + 1) < n_embd) {
+            k_dst[dst_offset] = k_packed;
+            v_dst[dst_offset] = v_packed;
+        }
     }
     
     // Store scales

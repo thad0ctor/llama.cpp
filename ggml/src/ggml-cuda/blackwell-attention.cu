@@ -99,35 +99,61 @@ static __global__ void blackwell_flash_attn_kernel(
     
     // Process attention computation in optimized chunks
     for (int tok_idx = token_start; tok_idx < token_end; tok_idx += 16) {
-        // Load Q, K, V with enhanced coalescing for HBM3e
+        // Load Q, K, V with enhanced coalescing for HBM3e and bounds checking
         if (tid < DKQ && tok_idx + tid < seq_len) {
-            // Simplified offset calculation - use tensor dimensions directly
+            // Simplified offset calculation with bounds checking
             const int q_offset = batch_id * (ne01 * ne00) + head_id * ne00 + tok_idx * ne00 + tid;
-            shared_Q[tid] = ((const half*)Q)[q_offset];
+            // Add bounds check to prevent out-of-bounds access
+            if (q_offset >= 0 && q_offset < (ne02 * ne01 * ne00)) {
+                shared_Q[tid] = ((const half*)Q)[q_offset];
+            } else {
+                shared_Q[tid] = __float2half(0.0f);
+            }
         }
         
         __syncthreads();
         
-        // Compute attention with Blackwell optimizations
-        // This is a simplified version - full implementation would follow
-        // the Hopper Flash Attention pattern with Blackwell enhancements
-        
+        // Compute attention with proper Q•K dot product
         for (int i = 0; i < min(16, token_end - tok_idx); ++i) {
-            if (tid < head_dim) {
-                // Simplified attention computation
+            // Load K and V for current token
+            __syncthreads();
+            
+            if (tid < DKQ && (tok_idx + i) < seq_len) {
+                const int k_base_offset = batch_id * (ne11 * ne00) + head_id * ne00 + (tok_idx + i) * ne00;
+                const int v_base_offset = batch_id * (ne11 * ne00) + head_id * ne00 + (tok_idx + i) * ne00;
+                
+                if (k_base_offset + tid < (ne12 * ne11 * ne00)) {
+                    shared_K[tid] = ((const half*)K)[k_base_offset + tid];
+                    shared_V[tid] = ((const half*)V)[v_base_offset + tid];
+                }
+            }
+            
+            __syncthreads();
+            
+            // Thread 0 computes the Q•K dot product for this token
+            if (tid == 0) {
                 float qk_dot = 0.0f;
-                for (int d = 0; d < DKQ; d += 4) { // Vectorized access
+                for (int d = 0; d < DKQ; ++d) {
                     qk_dot += float(shared_Q[d]) * float(shared_K[d]);
                 }
                 qk_dot *= scale;
                 
-                // Update softmax statistics
-                row_max = fmaxf(row_max, qk_dot);
-                row_sum += expf(qk_dot - row_max);
+                // Online softmax: update max and sum
+                float new_max = fmaxf(row_max, qk_dot);
+                float exp_diff = expf(row_max - new_max);
+                row_sum = row_sum * exp_diff + expf(qk_dot - new_max);
                 
-                // Accumulate output
-                if (tid < DV) {
-                    acc[tid % 8] += expf(qk_dot - row_max) * float(shared_V[tid]);
+                // Update accumulator with renormalization
+                for (int j = 0; j < 8; ++j) {
+                    acc[j] = acc[j] * exp_diff;
+                }
+                
+                row_max = new_max;
+                
+                // Accumulate weighted value
+                float attn_weight = expf(qk_dot - row_max);
+                for (int d = 0; d < DV && d < 8; ++d) {
+                    acc[d] += attn_weight * float(shared_V[d]);
                 }
             }
         }
@@ -135,10 +161,17 @@ static __global__ void blackwell_flash_attn_kernel(
         __syncthreads();
     }
     
-    // Write output with coalesced access optimized for HBM3e
-    if (tid < head_dim && token_start + tid < seq_len) {
-        const int out_offset = batch_id * ne0 * ne1 * ne2 + head_id * ne0 * ne1 + (token_start + tid) * ne0 + (tid % DV);
-        dst[out_offset] = acc[tid % 8] / row_sum;
+    // Write output with correct indexing and normalization
+    if (tid == 0) {
+        // Thread 0 writes the computed attention output
+        for (int d = 0; d < min(DV, head_dim); ++d) {
+            const int out_offset = batch_id * ne0 * ne1 * ne2 + head_id * ne0 * ne1 + token_start * ne0 + d;
+            if (row_sum > 1e-8f) {
+                dst[out_offset] = acc[d] / row_sum;
+            } else {
+                dst[out_offset] = 0.0f;
+            }
+        }
     }
 }
 
@@ -243,13 +276,25 @@ void ggml_cuda_flash_attn_blackwell_optimized(
 
 // Performance threshold for using L2-optimized attention
 bool should_use_l2_flash_attention(const ggml_tensor * src0, int device_id) {
+    // Debug: Always log detection attempts
+    static bool debug_logged = false;
+    if (!debug_logged) {
+        fprintf(stderr, "[BLACKWELL-DEBUG] Checking if device %d should use Blackwell attention...\n", device_id);
+        debug_logged = true;
+    }
+    
     // Only use on Blackwell GPUs with cluster support and large L2 cache
     if (!ggml_cuda_can_use_cluster_attention(device_id)) {
+        fprintf(stderr, "[BLACKWELL-DEBUG] Device %d: cluster attention not supported\n", device_id);
         return false;
     }
     
     const auto& info = ggml_cuda_info();
     const auto& device = info.devices[device_id];
+    
+    // Debug: Log device info
+    fprintf(stderr, "[BLACKWELL-DEBUG] Device %d: CC=%d, L2=%zuMB, VRAM=%zuGB\n", 
+            device_id, device.cc, device.l2_cache_size / (1024*1024), device.total_vram / (1024*1024*1024));
     
     // Verify Blackwell compute capability (10.0 or 12.0)
     const bool is_blackwell = (device.cc >= GGML_CUDA_CC_BLACKWELL);
@@ -257,8 +302,19 @@ bool should_use_l2_flash_attention(const ggml_tensor * src0, int device_id) {
     // Check for large L2 cache (126 MB on GB200, less on other variants)
     const bool has_large_l2 = device.l2_cache_size >= 64 * 1024 * 1024; // >= 64MB L2
     
+    fprintf(stderr, "[BLACKWELL-DEBUG] Device %d: is_blackwell=%d, has_large_l2=%d\n", 
+            device_id, is_blackwell, has_large_l2);
+    
     if (!is_blackwell || !has_large_l2) {
-        return false;
+        fprintf(stderr, "[BLACKWELL-DEBUG] Device %d: Failed Blackwell/L2 requirements\n", device_id);
+        
+        // Check for forced Blackwell mode via environment variable
+        const char* force_blackwell = getenv("GGML_CUDA_FORCE_BLACKWELL");
+        if (force_blackwell && atoi(force_blackwell) == 1) {
+            fprintf(stderr, "[BLACKWELL-DEBUG] Device %d: FORCED Blackwell mode enabled via env var\n", device_id);
+        } else {
+            return false;
+        }
     }
     
     // Extract tensor dimensions

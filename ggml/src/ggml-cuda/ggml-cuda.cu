@@ -215,15 +215,16 @@ static void ggml_cuda_detect_kernel_capabilities_impl(const ggml_cuda_device_inf
         caps->supports_cluster_gemm = true;          // Benefits large GEMM operations
         caps->supports_distributed_shmem = true;     // Helps with memory bandwidth
         caps->supports_fp8_kernels = false;          // Disable until proven beneficial
-        caps->supports_cluster_attention = false;    // Disable until optimized for MoE
+        caps->supports_cluster_attention = true;     // Enable Blackwell cluster attention
         caps->supports_large_tile_attn = true;       // Large L2 cache helps
         caps->supports_mqa_optimization = true;      // High bandwidth benefits
         caps->supports_hbm3_bandwidth = true;        // RTX 5090 specific
         caps->supports_l2_cache_hints = true;        // 128MB L2 cache
     } else {
-        // Lower-end Blackwell: minimal enhancements to avoid overhead
+        // Lower-end Blackwell: enable basic cluster features but avoid overhead
         caps->supports_cluster_gemm = false;
         caps->supports_distributed_shmem = false;
+        caps->supports_cluster_attention = true;     // Enable for all Blackwell
         caps->supports_large_tile_attn = false;
     }
     
@@ -787,14 +788,6 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_cuda_set_device(buft_ctx->device);
 
-    // Blackwell multi-GPU fix: Prevent large single-device allocations when multiple GPUs are available
-    int device_count = ggml_backend_cuda_get_device_count();
-    const size_t large_tensor_threshold = 20ULL * 1024 * 1024 * 1024; // 20GB threshold
-    if (device_count > 1 && size > large_tensor_threshold) {
-        GGML_LOG_ERROR("%s: Multi-GPU setup detected but attempting large single-device allocation of %.2f GiB on device %d. This tensor should use split buffers.\n", 
-                       __func__, size / (1024.0 * 1024.0 * 1024.0), buft_ctx->device);
-        return nullptr;
-    }
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -3641,6 +3634,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     return nullptr;
 }
+
 
 static const ggml_backend_reg_i ggml_backend_cuda_reg_interface = {
     /* .get_name          = */ ggml_backend_cuda_reg_get_name,
