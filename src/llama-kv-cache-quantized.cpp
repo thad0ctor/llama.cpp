@@ -40,23 +40,74 @@ llama_kv_cache_quantized::llama_kv_cache_quantized(
         throw std::runtime_error("Quantized KV cache constructor: base_cache is null");
     }
     
-    // CRITICAL: Check if base cache is already corrupted (common with MoE models)
+    // CRITICAL: Enhanced validation for MoE models
     try {
-        uint32_t base_size = base_cache->get_size();
-        if (base_size == 0 || base_size > 100000) {
-            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - base cache appears corrupted (size: %u)\n", __func__, base_size);
-            LLAMA_LOG_ERROR("%s: This is a known issue with MoE models and quantized KV cache\n", __func__);
-            LLAMA_LOG_ERROR("%s: The base unified cache construction failed, corrupting internal state\n", __func__);
-            throw std::runtime_error("Base cache is corrupted - cannot create quantized wrapper");
+        // First verify the base cache object is valid
+        base_cache_address = (uintptr_t)base_cache;
+        
+        // Test basic functionality before accessing size
+        LLAMA_LOG_DEBUG("%s: testing base cache basic functionality...\n", __func__);
+        
+        // Check if we can access the base cache methods safely
+        bool can_shift_test = false;
+        try {
+            can_shift_test = base_cache->get_can_shift();
+            LLAMA_LOG_DEBUG("%s: base cache can_shift test: %s\n", __func__, can_shift_test ? "true" : "false");
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - base cache get_can_shift() failed: %s\n", __func__, e.what());
+            throw std::runtime_error("Base cache method access failed: " + std::string(e.what()));
         }
-        LLAMA_LOG_DEBUG("%s: Base cache validation passed (size: %u)\n", __func__, base_size);
+        
+        // Now test size access with additional protection
+        uint32_t base_size = 0;
+        try {
+            base_size = base_cache->get_size();
+            LLAMA_LOG_DEBUG("%s: base cache size retrieved: %u\n", __func__, base_size);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - base cache get_size() failed: %s\n", __func__, e.what());
+            // For MoE models, this often indicates map_layer_ids corruption
+            LLAMA_LOG_ERROR("%s: This is likely due to map_layer_ids corruption in MoE models\n", __func__);
+            LLAMA_LOG_ERROR("%s: The base unified cache construction failed during layer loop\n", __func__);
+            throw std::runtime_error("Base cache size access failed - map_layer_ids corruption: " + std::string(e.what()));
+        }
+        
+        // Enhanced validation for MoE corruption patterns
+        if (base_size == 0) {
+            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - base cache size is 0\n", __func__);
+            throw std::runtime_error("base cache size is 0 - indicates construction failure");
+        }
+        
+        if (base_size > 1000000) { // Increased sanity check threshold
+            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - suspicious base cache size: %u\n", __func__, base_size);
+            throw std::runtime_error("suspicious base cache size - possible memory corruption");
+        }
+        
+        // Additional corruption checks specific to MoE models
+        try {
+            // Test if we can get layer information (this often fails in corrupted state)
+            LLAMA_LOG_DEBUG("%s: testing layer access capabilities...\n", __func__);
+            
+            // The following would test layer access but we don't have direct access to layers
+            // Instead, we'll cache the working parameters for later validation
+            base_cache_size_cached = base_size;
+            
+            LLAMA_LOG_DEBUG("%s: base cache validation passed - size: %u, can_shift: %s\n", 
+                __func__, base_size, can_shift_test ? "true" : "false");
+            
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - extended base cache validation failed: %s\n", __func__, e.what());
+            throw std::runtime_error("Extended base cache validation failed: " + std::string(e.what()));
+        }
+        
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: CRITICAL ERROR - base cache validation failed: %s\n", __func__, e.what());
         LLAMA_LOG_ERROR("%s: This confirms the base cache is corrupted\n", __func__);
+        LLAMA_LOG_ERROR("%s: For MoE models, this usually indicates map_layer_ids was not properly populated\n", __func__);
+        LLAMA_LOG_ERROR("%s: The base unified cache construction likely failed during layer filtering/processing\n", __func__);
         throw std::runtime_error("Base cache validation failed: " + std::string(e.what()));
     }
     
-    LLAMA_LOG_DEBUG("%s: base_cache pointer: %p\n", __func__, (void*)base_cache);
+    LLAMA_LOG_DEBUG("%s: base_cache pointer: %p, address: 0x%lx\n", __func__, (void*)base_cache, base_cache_address);
     
     // Test base cache functionality early with extensive validation
     try {

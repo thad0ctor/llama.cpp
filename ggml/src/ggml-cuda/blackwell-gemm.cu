@@ -3,14 +3,14 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 
-// Blackwell cluster features require CUDA 12.8+ and compute capability 12.0+
-// RTX 5090 is Blackwell architecture with compute capability 12.0
-#if CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1200)
+// Blackwell cluster features require CUDA 12.0+ and compute capability 10.0+
+// Standardized to CC 10.0 for all Blackwell features for consistency
+#if CUDART_VERSION >= 12000 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
 
 #include <cooperative_groups.h>
-#if CUDART_VERSION >= 12080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
 #include <cooperative_groups/memcpy_async.h>
-// Cluster features available on Blackwell (compute 12.0+) with CUDA 12.8+
+// Cluster features available on Blackwell (compute 10.0+) with CUDA 12.0+
 #define CLUSTER_SUPPORT_AVAILABLE
 #endif
 
@@ -61,7 +61,7 @@ __global__ void blackwell_optimized_gemm_kernel(
     T* smem_B = (T*)(smem + SMEM_SIZE_A);
     
     // Accumulator registers optimized for Blackwell tensor cores
-    float acc[4][4] = {{0.0f}};  // FIXED: Reduced from 8x8 to 4x4 per thread
+    float acc[8][8] = {{0.0f}};  // FIXED: Restored to 8x8 per thread to match thread mapping
     
     // FIXED: Correct thread mapping for 256 threads -> 128x128 block
     // 256 threads arranged as 16x16 grid, each thread handles 8x8 output elements
@@ -74,6 +74,7 @@ __global__ void blackwell_optimized_gemm_kernel(
         const int k_size = k_end - k_start;
         
         // Load A tile with vectorized memory operations (128-bit aligned)
+        // FIXED: Add matrix transposition handling for src0 (A matrix)
         #pragma unroll
         for (int load_iter = tid; load_iter < BLOCK_SIZE_M * BLOCK_SIZE_K; load_iter += blockDim.x) {
             const int row = load_iter / BLOCK_SIZE_K;
@@ -82,8 +83,9 @@ __global__ void blackwell_optimized_gemm_kernel(
             const int global_col = k_start + col;
             
             if (global_row < M && global_col < K && col < k_size) {
-                // FIXED: Correct matrix indexing for row-major layout
-                smem_A[row * BLOCK_SIZE_K + col] = A[global_row * lda + global_col];
+                // FIXED: Handle matrix layout - llama.cpp uses transposed A matrix
+                // A is stored as KxM but accessed as MxK, so we need to transpose during load
+                smem_A[row * BLOCK_SIZE_K + col] = A[global_col * lda + global_row];
             } else {
                 smem_A[row * BLOCK_SIZE_K + col] = T(0);
             }
@@ -98,7 +100,7 @@ __global__ void blackwell_optimized_gemm_kernel(
             const int global_col = block_n + col;
             
             if (global_row < K && global_col < N && row < k_size) {
-                // FIXED: Correct matrix indexing for row-major layout
+                // B matrix is stored normally as KxN
                 smem_B[row * BLOCK_SIZE_N + col] = B[global_row * ldb + global_col];
             } else {
                 smem_B[row * BLOCK_SIZE_N + col] = T(0);
@@ -107,13 +109,13 @@ __global__ void blackwell_optimized_gemm_kernel(
         
         __syncthreads();
         
-        // FIXED: Compute with access to full cluster shared memory
+        // FIXED: Compute with full 8x8 accumulator
         #pragma unroll
         for (int k_idx = 0; k_idx < k_size; ++k_idx) {
             #pragma unroll
-            for (int i = 0; i < 4; ++i) {  // FIXED: 4x4 instead of 8x8
+            for (int i = 0; i < 8; ++i) {  // FIXED: 8x8 instead of 4x4
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
+                for (int j = 0; j < 8; ++j) {
                     const int m_idx = thread_m + i;
                     const int n_idx = thread_n + j;
                     
@@ -131,9 +133,9 @@ __global__ void blackwell_optimized_gemm_kernel(
     
     // FIXED: Write results back to global memory with correct indexing
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {  // FIXED: 4x4 instead of 8x8
+    for (int i = 0; i < 8; ++i) {  // FIXED: 8x8 instead of 4x4
         #pragma unroll
-        for (int j = 0; j < 4; ++j) {
+        for (int j = 0; j < 8; ++j) {
             const int global_row = block_m + thread_m + i;
             const int global_col = block_n + thread_n + j;
             
@@ -186,7 +188,7 @@ __global__ void blackwell_cluster_gemm_kernel(
     T* cluster_smem_B = smem_B;
     
     // Accumulator registers
-    float acc[4][4] = {{0.0f}};  // FIXED: Reduced from 8x8 to 4x4
+    float acc[8][8] = {{0.0f}};  // FIXED: Corrected to 8x8 to match thread mapping
     
     // FIXED: Correct thread mapping for 256 threads -> 128x128 block
     const int thread_m = (tid / 16) * 8;        // tid/16 gives rows 0-15, *8 gives 0,8,16...120
@@ -248,9 +250,9 @@ __global__ void blackwell_cluster_gemm_kernel(
         #pragma unroll
         for (int k_idx = 0; k_idx < k_size; ++k_idx) {
             #pragma unroll
-            for (int i = 0; i < 4; ++i) {  // FIXED: 4x4 instead of 8x8
+            for (int i = 0; i < 8; ++i) {  // FIXED: 8x8 instead of 4x4
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
+                for (int j = 0; j < 8; ++j) {
                     const int m_idx = thread_m + i;
                     const int n_idx = thread_n + j;
                     
@@ -269,9 +271,9 @@ __global__ void blackwell_cluster_gemm_kernel(
     
     // FIXED: Write results back to global memory
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {  // FIXED: 4x4 instead of 8x8
+    for (int i = 0; i < 8; ++i) {  // FIXED: 8x8 instead of 4x4
         #pragma unroll
-        for (int j = 0; j < 4; ++j) {
+        for (int j = 0; j < 8; ++j) {
             const int global_row = block_m + thread_m + i;
             const int global_col = block_n + thread_n + j;
             
@@ -315,7 +317,7 @@ __global__ void blackwell_standard_gemm_kernel(
     T* smem_B = (T*)(smem + SMEM_SIZE_A);
     
     // Accumulator registers
-    float acc[4][4] = {{0.0f}};  // FIXED: Reduced from 8x8 to 4x4
+    float acc[8][8] = {{0.0f}};  // FIXED: Corrected to 8x8 to match thread mapping
     
     // FIXED: Correct thread mapping for 256 threads -> 128x128 block
     const int thread_m = (tid / 16) * 8;        // tid/16 gives rows 0-15, *8 gives 0,8,16...120
@@ -360,9 +362,9 @@ __global__ void blackwell_standard_gemm_kernel(
         #pragma unroll
         for (int k_idx = 0; k_idx < k_size; ++k_idx) {
             #pragma unroll
-            for (int i = 0; i < 4; ++i) {  // FIXED: 4x4 instead of 8x8
+            for (int i = 0; i < 8; ++i) {  // FIXED: 8x8 instead of 4x4
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
+                for (int j = 0; j < 8; ++j) {
                     const int m_idx = thread_m + i;
                     const int n_idx = thread_n + j;
                     
@@ -380,9 +382,9 @@ __global__ void blackwell_standard_gemm_kernel(
     
     // FIXED: Write results to global memory with correct indexing
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {  // FIXED: 4x4 instead of 8x8
+    for (int i = 0; i < 8; ++i) {  // FIXED: 8x8 instead of 4x4
         #pragma unroll
-        for (int j = 0; j < 4; ++j) {
+        for (int j = 0; j < 8; ++j) {
             const int global_row = block_m + thread_m + i;
             const int global_col = block_n + thread_n + j;
             
@@ -525,7 +527,7 @@ bool should_use_cluster_gemm(const ggml_tensor * src0, const ggml_tensor * src1,
 
 // Capability detection functions are defined in ggml-cuda.cu
 
-#else // CUDART_VERSION < 12080 || __CUDA_ARCH__ < 1200
+#else // CUDART_VERSION < 12000 || __CUDA_ARCH__ < 1000
 
 // Fallback implementations for older CUDA versions
 void ggml_cuda_mul_mat_cluster_gemm(
@@ -560,4 +562,4 @@ void launch_blackwell_cluster_gemm(
     GGML_ABORT("Cluster GEMM not supported on this CUDA version or architecture");
 }
 
-#endif // CUDART_VERSION >= 12080 && __CUDA_ARCH__ >= 1200 
+#endif // CUDART_VERSION >= 12000 && __CUDA_ARCH__ >= 1000 

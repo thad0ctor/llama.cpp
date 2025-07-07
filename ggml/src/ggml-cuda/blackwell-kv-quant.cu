@@ -1,9 +1,9 @@
 #include "blackwell-kv-quant.cuh"
 #include "common.cuh"
 
-// Blackwell KV cache quantization features require CUDA 11.8+ and compute capability 9.0+
-// Note: Changed from 12.0 to 9.0 (Ada Lovelace) for broader compatibility
-#if CUDART_VERSION >= 11080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
+// Blackwell KV cache quantization features require CUDA 12.0+ and compute capability 10.0+
+// Standardized to CC 10.0 for all Blackwell features for consistency
+#if CUDART_VERSION >= 12000 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
 
 #include <cooperative_groups.h>
 #if CUDART_VERSION >= 12000
@@ -538,7 +538,7 @@ float benchmark_quantization_performance(
 
 } // namespace blackwell_kv_quant
 
-#else // CUDART_VERSION < 11080 || __CUDA_ARCH__ < 900
+#else // CUDART_VERSION < 12000 || __CUDA_ARCH__ < 1000
 
 // Fallback implementations for older CUDA versions
 namespace blackwell_kv_quant {
@@ -655,4 +655,4 @@ float benchmark_quantization_performance(
 
 } // namespace blackwell_kv_quant
 
-#endif // CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 900 
+#endif // CUDART_VERSION >= 12000 && __CUDA_ARCH__ >= 1000 

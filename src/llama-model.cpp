@@ -13650,9 +13650,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
                 
-                LLAMA_LOG_DEBUG("%s: enable_quantized=%s, n_layer=%u, model_size=%zu GB\n", 
-                    __func__, enable_quantized ? "true" : "false", hparams.n_layer, 
-                    hparams.n_layer * hparams.n_embd * hparams.n_embd / (1024 * 1024 * 1024 / 2));
+                                LLAMA_LOG_DEBUG("%s: enable_quantized=%s, n_layer=%u, model_size=%zu GB\n",
+                    __func__, enable_quantized ? "true" : "false", hparams.n_layer,
+                    (size_t)hparams.n_layer * hparams.n_embd * hparams.n_embd / (1024 * 1024 * 1024 / 2));
 
                 if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                     GGML_ASSERT(hparams.is_swa_any());

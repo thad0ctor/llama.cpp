@@ -85,9 +85,15 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# Blackwell MoE enhancements
+option(BLACKWELL_UNIFIED_MOE "Enable unified Blackwell MoE system for large models" OFF)
+
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
+
+# Include Blackwell MoE configuration
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/BlackwellMoEFixes.cmake)
 
 if (NOT DEFINED LLAMA_BUILD_NUMBER)
     set(LLAMA_BUILD_NUMBER        ${BUILD_NUMBER})
@@ -179,6 +185,11 @@ endif()
 #
 
 add_subdirectory(src)
+
+# Apply unified Blackwell MoE configuration
+if (BLACKWELL_UNIFIED_MOE)
+    add_unified_blackwell_moe(llama)
+endif()
 
 #
 # utils, programs, examples and tests

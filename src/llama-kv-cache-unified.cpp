@@ -75,6 +75,12 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
     LLAMA_LOG_DEBUG("%s: starting layer loop, n_layer=%u\n", __func__, hparams.n_layer);
     
+    // CRITICAL: Pre-validate layer loop parameters to prevent corruption
+    if (hparams.n_layer > 1000) { // Sanity check
+        LLAMA_LOG_ERROR("%s: ERROR - suspicious n_layer value: %u\n", __func__, hparams.n_layer);
+        throw std::runtime_error("KV cache constructor: suspicious layer count");
+    }
+    
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (filter && !filter(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: skipped by filter\n", __func__, il);
@@ -83,8 +89,22 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
         LLAMA_LOG_DEBUG("%s: processing layer %3d\n", __func__, il);
 
+        // CRITICAL: Add bounds checking for embedding dimensions
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
+        
+        // Validate embedding dimensions to prevent corruption
+        if (n_embd_k_gqa == 0 || n_embd_v_gqa == 0) {
+            LLAMA_LOG_ERROR("%s: ERROR - layer %d has zero embedding dimensions: k=%u, v=%u\n", 
+                __func__, il, n_embd_k_gqa, n_embd_v_gqa);
+            throw std::runtime_error("Invalid embedding dimensions for layer " + std::to_string(il));
+        }
+        
+        if (n_embd_k_gqa > 32768 || n_embd_v_gqa > 32768) { // Sanity check
+            LLAMA_LOG_ERROR("%s: ERROR - layer %d has suspicious embedding dimensions: k=%u, v=%u\n", 
+                __func__, il, n_embd_k_gqa, n_embd_v_gqa);
+            throw std::runtime_error("Suspicious embedding dimensions for layer " + std::to_string(il));
+        }
 
         const char * dev_name = "CPU";
 
@@ -92,8 +112,11 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+            if (!dev) {
+                LLAMA_LOG_ERROR("%s: ERROR - failed to get device for layer %d\n", __func__, il);
+                throw std::runtime_error("Failed to get device for layer " + std::to_string(il));
+            }
             buft = ggml_backend_dev_buffer_type(dev);
-
             dev_name = ggml_backend_dev_name(dev);
         }
 
@@ -108,19 +131,25 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         LLAMA_LOG_DEBUG("%s: layer %3d: creating tensors - type_k=%d, type_v=%d, n_embd_k_gqa=%u, n_embd_v_gqa=%u, kv_size=%u\n", 
             __func__, il, (int)type_k, (int)type_v, n_embd_k_gqa, n_embd_v_gqa, kv_size);
 
-        ggml_tensor * k;
-        ggml_tensor * v;
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
 
-        k = ggml_new_tensor_2d(ctx, type_k, n_embd_k_gqa, kv_size);
-        if (!k) {
-            LLAMA_LOG_ERROR("%s: ERROR - failed to create K tensor for layer %d\n", __func__, il);
-            throw std::runtime_error("failed to create K tensor for kv cache");
-        }
+        // CRITICAL: Add extensive error checking for tensor creation
+        try {
+            k = ggml_new_tensor_2d(ctx, type_k, n_embd_k_gqa, kv_size);
+            if (!k) {
+                LLAMA_LOG_ERROR("%s: ERROR - failed to create K tensor for layer %d\n", __func__, il);
+                throw std::runtime_error("failed to create K tensor for layer " + std::to_string(il));
+            }
 
-        v = ggml_new_tensor_2d(ctx, type_v, n_embd_v_gqa, kv_size);
-        if (!v) {
-            LLAMA_LOG_ERROR("%s: ERROR - failed to create V tensor for layer %d\n", __func__, il);
-            throw std::runtime_error("failed to create V tensor for kv cache");
+            v = ggml_new_tensor_2d(ctx, type_v, n_embd_v_gqa, kv_size);
+            if (!v) {
+                LLAMA_LOG_ERROR("%s: ERROR - failed to create V tensor for layer %d\n", __func__, il);
+                throw std::runtime_error("failed to create V tensor for layer " + std::to_string(il));
+            }
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: CRITICAL ERROR - tensor creation failed for layer %d: %s\n", __func__, il, e.what());
+            throw std::runtime_error("Tensor creation failed for layer " + std::to_string(il) + ": " + e.what());
         }
 
         ggml_format_name(k, "cache_k_l%d", il);
@@ -129,8 +158,20 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         LLAMA_LOG_DEBUG("%s: layer %3d: successfully created tensors, adding to map_layer_ids[%d] = %zu\n", 
             __func__, il, il, layers.size());
 
+        // CRITICAL: Validate map_layer_ids state before and after insertion
+        if (map_layer_ids.count(il) != 0) {
+            LLAMA_LOG_ERROR("%s: ERROR - layer %d already exists in map_layer_ids\n", __func__, il);
+            throw std::runtime_error("Duplicate layer " + std::to_string(il) + " in map_layer_ids");
+        }
+
         map_layer_ids[il] = layers.size();
         layers.push_back({ il, k, v });
+        
+        // Validate the insertion was successful
+        if (map_layer_ids[il] != layers.size() - 1) {
+            LLAMA_LOG_ERROR("%s: ERROR - map_layer_ids corruption detected for layer %d\n", __func__, il);
+            throw std::runtime_error("map_layer_ids corruption for layer " + std::to_string(il));
+        }
         
         LLAMA_LOG_DEBUG("%s: layer %3d added to map_layer_ids[%d] = %zu\n", __func__, il, il, layers.size() - 1);
     }
@@ -767,7 +808,7 @@ ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint
         LLAMA_LOG_ERROR("%s: DETECTED CORRUPTION - hparams.n_layer is invalid: %u\n", __func__, hparams.n_layer);
         LLAMA_LOG_ERROR("%s: This indicates memory corruption of the unified cache object\n", __func__);
         LLAMA_LOG_ERROR("%s: Object address: %p, map_layer_ids size: %zu, layers size: %zu\n", 
-            __func__, (void*)this, map_layer_ids.size(), layers.size());
+            __func__, (const void*)this, map_layer_ids.size(), layers.size());
         throw std::runtime_error("unified cache object has been corrupted");
     }
     

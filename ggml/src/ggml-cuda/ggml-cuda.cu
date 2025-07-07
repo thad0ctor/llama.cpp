@@ -200,16 +200,20 @@ static void ggml_cuda_detect_kernel_capabilities_impl(const ggml_cuda_device_inf
         caps->supports_cluster_gemm = true;          // Benefits large GEMM operations
         caps->supports_distributed_shmem = true;     // Helps with memory bandwidth
         caps->supports_fp8_kernels = false;          // Disable until proven beneficial
-        caps->supports_cluster_attention = false;    // Disable until optimized for MoE
+        caps->supports_cluster_attention = true;     // Enable cluster attention for RTX 5090
         caps->supports_large_tile_attn = true;       // Large L2 cache helps
         caps->supports_mqa_optimization = true;      // High bandwidth benefits
         caps->supports_hbm3_bandwidth = true;        // RTX 5090 specific
         caps->supports_l2_cache_hints = true;        // 128MB L2 cache
     } else {
-        // Lower-end Blackwell: minimal enhancements to avoid overhead
+        // Lower-end Blackwell: enable some features based on actual capabilities
         caps->supports_cluster_gemm = false;
         caps->supports_distributed_shmem = false;
-        caps->supports_large_tile_attn = false;
+        caps->supports_large_tile_attn = (device.total_vram >= (16ULL * 1024 * 1024 * 1024)); // 16GB+ gets large tile
+        caps->supports_cluster_attention = false; // Keep disabled for stability on lower-end
+        caps->supports_mqa_optimization = (device.total_vram >= (12ULL * 1024 * 1024 * 1024)); // 12GB+ gets MQA opt
+        caps->supports_hbm3_bandwidth = true; // All Blackwell has HBM3
+        caps->supports_l2_cache_hints = (device.l2_cache_size >= (64 * 1024 * 1024)); // 64MB+ L2 cache
     }
     
     // Common Blackwell capabilities (all variants)
@@ -389,12 +393,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 device_info.hbm3_support = true;         // RTX 5090 has HBM3e
                 
                 // Log RTX 5090 detection
-                fprintf(stderr, "[BLACKWELL] Detected RTX 5090 with %zuGB VRAM - enabling all optimizations\n", 
-                        prop.totalGlobalMem / (1024ULL * 1024 * 1024));
+                fprintf(stderr, "[BLACKWELL] Detected RTX 5090 with %lluGB VRAM - enabling all optimizations\n", 
+                        (unsigned long long)(prop.totalGlobalMem / (1024ULL * 1024 * 1024)));
             } else {
                 // Lower-end Blackwell: enable basic features but avoid overhead
-                fprintf(stderr, "[BLACKWELL] Detected lower-end Blackwell GPU with %zuGB VRAM - limited optimizations\n", 
-                        prop.totalGlobalMem / (1024ULL * 1024 * 1024));
+                fprintf(stderr, "[BLACKWELL] Detected lower-end Blackwell GPU with %lluGB VRAM - limited optimizations\n", 
+                        (unsigned long long)(prop.totalGlobalMem / (1024ULL * 1024 * 1024)));
             }
         }
         

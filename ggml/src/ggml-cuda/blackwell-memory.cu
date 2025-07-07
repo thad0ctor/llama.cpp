@@ -1,9 +1,9 @@
 #include "blackwell-memory.cuh"
 #include "common.cuh"
 
-// Blackwell HBM3 features require CUDA 11.8+ and compute capability 9.0+
-// Note: Changed from 12.0 to 9.0 (Ada Lovelace) for broader compatibility
-#if CUDART_VERSION >= 11080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
+// Blackwell HBM3 memory optimization features require CUDA 12.0+ and compute capability 10.0+
+// Standardized to CC 10.0 for all Blackwell features for consistency
+#if CUDART_VERSION >= 12000 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
 
 #include <cooperative_groups.h>
 
@@ -255,7 +255,7 @@ bool validate_hbm3_optimizations(int device_id) {
     return has_high_bandwidth && has_large_l2;
 }
 
-#else // CUDART_VERSION < 11080 || __CUDA_ARCH__ < 900
+#else // CUDART_VERSION < 12000 || __CUDA_ARCH__ < 1000
 
 // Fallback implementations for older CUDA versions
 void ggml_cuda_cpy_hbm3_optimized(
@@ -282,4 +282,4 @@ bool validate_hbm3_optimizations(int device_id) {
     return false; // Never valid on older systems
 }
 
-#endif // CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 900 
+#endif // CUDART_VERSION >= 12000 && __CUDA_ARCH__ >= 1000 
