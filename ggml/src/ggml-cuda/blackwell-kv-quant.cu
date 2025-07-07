@@ -98,8 +98,8 @@ __global__ void blackwell_quantize_kv_int8_kernel(
     
     // Store scales in shared memory with proper division by zero protection
     if (lid == 0) {
-        k_scales[wid] = (k_max > 1e-8f) ? (k_max / 127.0f) : 1e-8f; // INT8 symmetric quantization
-        v_scales[wid] = (v_max > 1e-8f) ? (v_max / 127.0f) : 1e-8f; // Use small epsilon instead of 1.0f
+        k_scales[wid] = (k_max > 1e-6f) ? (k_max / 127.0f) : 1e-6f; // INT8 symmetric quantization
+        v_scales[wid] = (v_max > 1e-6f) ? (v_max / 127.0f) : 1e-6f; // Use larger epsilon for stability
     }
     
     __syncthreads();
@@ -184,8 +184,8 @@ __global__ void blackwell_quantize_kv_int4_kernel(
     }
     
     if (lid == 0) {
-        k_scales[wid] = (k_max > 1e-8f) ? (k_max / 7.0f) : 1e-8f; // INT4 symmetric quantization
-        v_scales[wid] = (v_max > 1e-8f) ? (v_max / 7.0f) : 1e-8f; // Use small epsilon instead of 0
+        k_scales[wid] = (k_max > 1e-6f) ? (k_max / 7.0f) : 1e-6f; // INT4 symmetric quantization
+        v_scales[wid] = (v_max > 1e-6f) ? (v_max / 7.0f) : 1e-6f; // Use larger epsilon for stability
     }
     
     __syncthreads();

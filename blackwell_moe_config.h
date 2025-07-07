@@ -18,30 +18,30 @@
 #define MOE_LARGE_MODEL_THRESHOLD 128          // Special handling for models with >128 experts
 
 // ========================================
-// NUMERICAL STABILITY SETTINGS (AGGRESSIVE FIX)
+// NUMERICAL STABILITY SETTINGS (FIXED - LESS AGGRESSIVE)
 // ========================================
 
-// Temperature scaling for expert diversity - MORE AGGRESSIVE
-#define MOE_TEMPERATURE_SCALE 0.90f            // More aggressive scaling for better diversity
-#define MOE_STABILITY_EPSILON 1e-8f            // Higher precision numerical stability
-#define MOE_WEIGHT_EPSILON 1e-9f               // Higher precision weight normalization
+// Temperature scaling for expert diversity - FIXED TO BE LESS AGGRESSIVE
+#define MOE_TEMPERATURE_SCALE 0.98f            // Less aggressive scaling (was 0.90f)
+#define MOE_STABILITY_EPSILON 1e-7f            // Reduced precision to prevent over-correction (was 1e-8f)
+#define MOE_WEIGHT_EPSILON 1e-8f               // Reduced precision (was 1e-9f)
 
 // ========================================
-// OUTPUT STABILIZATION SETTINGS (AGGRESSIVE FIX)
+// OUTPUT STABILIZATION SETTINGS (FIXED - LESS AGGRESSIVE)
 // ========================================
 
-// Progressive clamping values - MORE AGGRESSIVE
-#define MOE_BASE_CLAMP_VALUE 25.0f             // More aggressive base clamping
-#define MOE_MEDIUM_CLAMP_VALUE 20.0f           // More aggressive for 64+ experts  
-#define MOE_LARGE_CLAMP_VALUE 15.0f            // More aggressive for 128+ experts
+// Progressive clamping values - FIXED TO BE LESS AGGRESSIVE
+#define MOE_BASE_CLAMP_VALUE 35.0f             // Less aggressive base clamping (was 25.0f)
+#define MOE_MEDIUM_CLAMP_VALUE 30.0f           // Less aggressive for 64+ experts (was 20.0f)
+#define MOE_LARGE_CLAMP_VALUE 25.0f            // Less aggressive for 128+ experts (was 15.0f)
 
-// Architecture-specific scaling - MORE AGGRESSIVE
-#define MOE_QWEN3_CLAMP_MULTIPLIER 0.7f        // Much more aggressive for Qwen3
-#define MOE_QWEN3_STABILITY_SCALE 0.90f        // More aggressive Qwen3 stability scaling
-#define MOE_GENERAL_STABILITY_SCALE 0.95f      // More aggressive general stability scaling
+// Architecture-specific scaling - FIXED TO BE LESS AGGRESSIVE
+#define MOE_QWEN3_CLAMP_MULTIPLIER 0.9f        // Less aggressive for Qwen3 (was 0.7f)
+#define MOE_QWEN3_STABILITY_SCALE 0.98f        // Less aggressive Qwen3 stability scaling (was 0.90f)
+#define MOE_GENERAL_STABILITY_SCALE 0.99f      // Less aggressive general stability scaling (was 0.95f)
 
-// Emergency measures - ENHANCED
-#define MOE_EMERGENCY_NOISE_SCALE 1.0f + 2e-6f // Stronger noise injection scale
+// Emergency measures - FIXED TO BE LESS AGGRESSIVE
+#define MOE_EMERGENCY_NOISE_SCALE 1.0f + 1e-7f // Reduced noise injection scale (was 2e-6f)
 
 // ========================================
 // BLACKWELL INTEGRATION SETTINGS

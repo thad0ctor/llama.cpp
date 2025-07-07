@@ -733,8 +733,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // Step 2: Enhanced temperature scaling for large MoE models
     if (enable_enhanced_moe) {
-        // Conservative temperature scaling to improve expert diversity
-        const float temperature_scale = 0.95f;
+        // FIXED: Less aggressive temperature scaling to improve expert diversity
+        // Changed from 0.95f to 0.98f to preserve more signal
+        const float temperature_scale = 0.98f;
         logits = ggml_scale(ctx0, logits, temperature_scale);
         cb(logits, "ffn_moe_logits_scaled", il);
     }
@@ -879,25 +880,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // Step 17: UNIFIED output stabilization (single pass)
     if (enable_enhanced_moe) {
-        // Progressive clamping based on model size
+        // Progressive clamping based on model size - FIXED VALUES
         float clamp_value = 50.0f;
-        if (n_expert > 64) clamp_value = 30.0f;
-        if (n_expert > 128) clamp_value = 20.0f;
-        if (arch == LLM_ARCH_QWEN3MOE) clamp_value *= 0.8f;
+        if (n_expert > 64) clamp_value = 35.0f;   // Less aggressive than 30.0f
+        if (n_expert > 128) clamp_value = 25.0f;  // Less aggressive than 20.0f
+        
+        // FIXED: Less aggressive Qwen3MOE multiplier
+        if (arch == LLM_ARCH_QWEN3MOE) clamp_value *= 0.9f;  // Changed from 0.8f to 0.9f (22.5f instead of 16.0f)
         
         moe_out = ggml_clamp(ctx0, moe_out, -clamp_value, clamp_value);
         cb(moe_out, "ffn_moe_out_clamped", il);
         
-        // Single stability scaling for very large models
+        // FIXED: Less aggressive stability scaling for very large models
         if (n_expert > 64) {
-            const float stability_scale = (arch == LLM_ARCH_QWEN3MOE) ? 0.95f : 0.98f;
+            // FIXED: Reduced aggressiveness - changed from 0.95f to 0.98f for Qwen3MOE
+            const float stability_scale = (arch == LLM_ARCH_QWEN3MOE) ? 0.98f : 0.99f;
             moe_out = ggml_scale(ctx0, moe_out, stability_scale);
             cb(moe_out, "ffn_moe_out_stabilized", il);
         }
         
-        // Final emergency measure for extreme cases
+        // FIXED: Reduced emergency noise injection - only for extreme cases and less aggressive
         if (n_expert > 128 && (arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_DEEPSEEK2)) {
-            const float noise_scale = 1.0f + 1e-6f;
+            // FIXED: Reduced noise scale from 1e-6f to 1e-7f
+            const float noise_scale = 1.0f + 1e-7f;
             moe_out = ggml_scale(ctx0, moe_out, noise_scale);
             cb(moe_out, "ffn_moe_out_final", il);
         }
