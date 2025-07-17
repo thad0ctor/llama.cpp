@@ -168,7 +168,7 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         layers.push_back({ il, k, v });
         
         // Validate the insertion was successful
-        if (map_layer_ids[il] != layers.size() - 1) {
+        if (map_layer_ids[il] != static_cast<int>(layers.size() - 1)) {
             LLAMA_LOG_ERROR("%s: ERROR - map_layer_ids corruption detected for layer %d\n", __func__, il);
             throw std::runtime_error("map_layer_ids corruption for layer " + std::to_string(il));
         }
