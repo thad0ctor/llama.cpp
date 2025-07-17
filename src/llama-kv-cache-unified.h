@@ -7,6 +7,8 @@
 
 #include <unordered_map>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 struct llama_cparams;
 struct llama_hparams;
@@ -155,7 +157,10 @@ private:
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
-    uint32_t head = 0;
+    std::atomic<uint32_t> head{0};
+    
+    // Thread safety for KV cache operations
+    mutable std::mutex kv_mutex;
 
     const uint32_t n_seq_max = 1;
 

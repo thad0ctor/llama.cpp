@@ -29,6 +29,7 @@ add_library(llama
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-pattern-detection.cpp
             llama-quant.cpp
             llama-sampling.cpp
             llama-vocab.cpp
@@ -38,7 +39,7 @@ add_library(llama
             )
 
 target_include_directories(llama PRIVATE .)
-target_include_directories(llama PUBLIC ../include)
+target_include_directories(llama PUBLIC ../include .)  # Add current src directory as public
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)

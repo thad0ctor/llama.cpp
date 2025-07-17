@@ -69,7 +69,7 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         return it->second;
     };
 
-    head = 0;
+    head.store(0);
 
     cells.resize(kv_size);
 
@@ -213,9 +213,11 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 }
 
 void llama_kv_cache_unified::clear(bool data) {
+    std::lock_guard<std::mutex> lock(kv_mutex);
+    
     cells.reset();
 
-    head = 0;
+    head.store(0);
 
     if (data) {
         for (auto & buf : bufs) {
@@ -225,6 +227,8 @@ void llama_kv_cache_unified::clear(bool data) {
 }
 
 bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    std::lock_guard<std::mutex> lock(kv_mutex);
+    
     uint32_t new_head = cells.size();
 
     if (p0 < 0) {
@@ -263,8 +267,9 @@ bool llama_kv_cache_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     }
 
     // If we freed up a slot, set head to it so searching can start there.
-    if (new_head != cells.size() && new_head < head) {
-        head = new_head;
+    uint32_t current_head = head.load();
+    if (new_head != cells.size() && new_head < current_head) {
+        head.store(new_head);
     }
 
     return true;
@@ -295,6 +300,8 @@ void llama_kv_cache_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 }
 
 void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
+    std::lock_guard<std::mutex> lock(kv_mutex);
+    
     uint32_t new_head = cells.size();
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -306,8 +313,9 @@ void llama_kv_cache_unified::seq_keep(llama_seq_id seq_id) {
     }
 
     // If we freed up a slot, set head to it so searching can start there.
-    if (new_head != cells.size() && new_head < head) {
-        head = new_head;
+    uint32_t current_head = head.load();
+    if (new_head != cells.size() && new_head < current_head) {
+        head.store(new_head);
     }
 }
 
@@ -316,6 +324,8 @@ void llama_kv_cache_unified::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
         return;
     }
 
+    std::lock_guard<std::mutex> lock(kv_mutex);
+    
     uint32_t new_head = cells.size();
 
     if (p0 < 0) {
@@ -347,7 +357,7 @@ void llama_kv_cache_unified::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
 
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
-    head = new_head != cells.size() ? new_head : 0;
+    head.store(new_head != cells.size() ? new_head : 0);
 }
 
 void llama_kv_cache_unified::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -451,6 +461,8 @@ llama_memory_state_ptr llama_kv_cache_unified::init_update(llama_context * lctx,
 }
 
 llama_kv_cache_unified::ubatch_heads llama_kv_cache_unified::prepare(const std::vector<llama_ubatch> & ubatches) {
+    std::lock_guard<std::mutex> lock(kv_mutex);
+    
     llama_kv_cache_unified::ubatch_heads res;
 
     struct state {
@@ -477,7 +489,7 @@ llama_kv_cache_unified::ubatch_heads llama_kv_cache_unified::prepare(const std::
         res.push_back(head_new);
 
         // store the old state of the cells in the recovery stack
-        states.push_back({head, (uint32_t) head_new, cells.cp(head_new, ubatch.n_tokens)});
+        states.push_back({head.load(), (uint32_t) head_new, cells.cp(head_new, ubatch.n_tokens)});
 
         // now emplace the ubatch
         apply_ubatch(head_new, ubatch);
@@ -486,7 +498,7 @@ llama_kv_cache_unified::ubatch_heads llama_kv_cache_unified::prepare(const std::
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         cells.set(it->head_new, it->cells);
-        head = it->head_old;
+        head.store(it->head_old);
     }
 
     if (!success) {
@@ -556,7 +568,7 @@ bool llama_kv_cache_unified::update(llama_context * lctx, bool do_shift, const d
             }
 
             // reset the head so we can find the first free slot during the next ubatch
-            head = 0;
+            head.store(0);
         }
 
         ggml_backend_sched_reset(sched);
@@ -590,7 +602,7 @@ bool llama_kv_cache_unified::update(llama_context * lctx, bool do_shift, const d
 int32_t llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
-    uint32_t head_cur = this->head;
+    uint32_t head_cur = this->head.load();
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
@@ -604,7 +616,7 @@ int32_t llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) const {
     }
 
     if (debug > 0) {
-        LLAMA_LOG_DEBUG("%s: n = %5d, used = %5d, head = %5d, size = %5d, n_swa = %5d\n", __func__, cells.used_max_p1(), cells.get_used(), head, get_size(), n_swa);
+        LLAMA_LOG_DEBUG("%s: n = %5d, used = %5d, head = %5d, size = %5d, n_swa = %5d\n", __func__, cells.used_max_p1(), cells.get_used(), head.load(), get_size(), n_swa);
 
         if ((debug == 2 && n_swa > 0) || debug > 2) {
             std::string ss;
@@ -777,7 +789,7 @@ void llama_kv_cache_unified::apply_ubatch(uint32_t head_cur, const llama_ubatch 
         }
     }
     // move the head at the end of the slot
-    head = head_cur + ubatch.n_tokens;
+    head.store(head_cur + ubatch.n_tokens);
 }
 
 bool llama_kv_cache_unified::get_can_shift() const {
@@ -1761,7 +1773,7 @@ bool llama_kv_cache_unified::state_read_meta(llama_io_read_i & io, uint32_t cell
         apply_ubatch(head_cur, ubatch);
 
         // keep the head at the old position because we will read the KV data into it in state_read_data()
-        head = head_cur;
+        head.store(head_cur);
 
         // DEBUG CHECK: head_cur should be our first cell, head_cur + cell_count - 1 should be our last cell (verify seq_id and pos values)
         // Assume that this is one contiguous block of cells
@@ -1802,7 +1814,7 @@ bool llama_kv_cache_unified::state_read_meta(llama_io_read_i & io, uint32_t cell
             }
         }
 
-        head = 0;
+        head.store(0);
     }
 
     return true;
@@ -1856,7 +1868,8 @@ bool llama_kv_cache_unified::state_read_data(llama_io_read_i & io, uint32_t cell
 
         if (cell_count) {
             // Read and set the keys for the whole cell range
-            ggml_backend_tensor_set(layer.k, io.read(cell_count * k_size_row), head * k_size_row, cell_count * k_size_row);
+            const uint32_t head_offset = head.load();
+            ggml_backend_tensor_set(layer.k, io.read(cell_count * k_size_row), head_offset * k_size_row, cell_count * k_size_row);
         }
     }
 
@@ -1886,7 +1899,8 @@ bool llama_kv_cache_unified::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 // Read and set the values for the whole cell range
-                ggml_backend_tensor_set(layer.v, io.read(cell_count * v_size_row), head * v_size_row, cell_count * v_size_row);
+                const uint32_t head_offset = head.load();
+                ggml_backend_tensor_set(layer.v, io.read(cell_count * v_size_row), head_offset * v_size_row, cell_count * v_size_row);
             }
         }
     } else {
@@ -1924,8 +1938,9 @@ bool llama_kv_cache_unified::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 // For each row in the transposed matrix, read the values for the whole cell range
+                const uint32_t head_offset = head.load();
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    const size_t dst_offset = (head + j * cells.size()) * v_size_el;
+                    const size_t dst_offset = (head_offset + j * cells.size()) * v_size_el;
                     ggml_backend_tensor_set(layer.v, io.read(cell_count * v_size_el), dst_offset, cell_count * v_size_el);
                 }
             }

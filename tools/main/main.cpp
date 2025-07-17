@@ -5,6 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "llama-pattern-detection.h"
 
 #include <cstdio>
 #include <cstring>
@@ -532,6 +533,9 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
+    
+    // Pattern detection for MoE models
+    PatternDetector pattern_detector;
 
     // single-token antiprompts
     std::vector<llama_token> antiprompt_token;
@@ -705,6 +709,20 @@ int main(int argc, char ** argv) {
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
             embd.push_back(id);
+            
+            // Pattern detection for MoE models
+            if (pattern_detector.detect_repetition(id)) {
+                LOG_WRN("Repetitive pattern detected (count: %d)! Taking corrective action...\n", 
+                        pattern_detector.get_repetition_count());
+                
+                if (pattern_detector.should_clear_kv_cache()) {
+                    LOG_WRN("Clearing KV cache due to repetitive patterns...\n");
+                    // Clear KV cache to break repetition patterns
+                    llama_memory_clear(mem, true);
+                    n_past = 0;
+                    pattern_detector.reset_state();
+                }
+            }
 
             // echo this to console
             input_echo = true;

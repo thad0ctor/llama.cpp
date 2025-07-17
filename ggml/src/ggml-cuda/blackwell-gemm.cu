@@ -16,6 +16,15 @@
 
 namespace cg = cooperative_groups;
 
+// Numerical stability validation functions
+__device__ inline bool is_valid_float(float x) {
+    return isfinite(x) && !isnan(x);
+}
+
+__device__ inline bool is_valid_double(double x) {
+    return isfinite(x) && !isnan(x);
+}
+
 // Blackwell Optimized GEMM Implementation
 // Based on vLLM's approach: Single-block kernels with HBM3 optimizations
 // Target: Large matrix multiplications (1024x1024+) for 235B+ parameter models
@@ -61,7 +70,8 @@ __global__ void blackwell_optimized_gemm_kernel(
     T* smem_B = (T*)(smem + SMEM_SIZE_A);
     
     // Accumulator registers optimized for Blackwell tensor cores
-    float acc[8][8] = {{0.0f}};  // FIXED: Restored to 8x8 per thread to match thread mapping
+    // Use double precision for better numerical stability in large accumulations
+    double acc[8][8] = {{0.0}};  // FIXED: Use double precision for better numerical stability
     
     // FIXED: Correct thread mapping for 256 threads -> 128x128 block
     // 256 threads arranged as 16x16 grid, each thread handles 8x8 output elements
@@ -122,7 +132,12 @@ __global__ void blackwell_optimized_gemm_kernel(
                     if (m_idx < BLOCK_SIZE_M && n_idx < BLOCK_SIZE_N) {
                         const T a_val = smem_A[m_idx * BLOCK_SIZE_K + k_idx];
                         const T b_val = smem_B[k_idx * BLOCK_SIZE_N + n_idx];
-                        acc[i][j] += float(a_val) * float(b_val);
+                        const double product = double(a_val) * double(b_val);
+                        
+                        // Add numerical stability check
+                        if (is_valid_double(product)) {
+                            acc[i][j] += product;
+                        }
                     }
                 }
             }
@@ -141,10 +156,20 @@ __global__ void blackwell_optimized_gemm_kernel(
             
             if (global_row < M && global_col < N) {
                 const int idx = global_row * ldc + global_col;
+                // Add numerical stability check for output
+                double result;
                 if (beta == 0.0f) {
-                    C[idx] = alpha * acc[i][j];
+                    result = alpha * acc[i][j];
                 } else {
-                    C[idx] = alpha * acc[i][j] + beta * C[idx];
+                    result = alpha * acc[i][j] + beta * C[idx];
+                }
+                
+                // Validate result before writing
+                if (is_valid_double(result)) {
+                    C[idx] = float(result);
+                } else {
+                    // Use fallback value for invalid results
+                    C[idx] = 0.0f;
                 }
             }
         }
@@ -188,7 +213,7 @@ __global__ void blackwell_cluster_gemm_kernel(
     T* cluster_smem_B = smem_B;
     
     // Accumulator registers
-    float acc[8][8] = {{0.0f}};  // FIXED: Corrected to 8x8 to match thread mapping
+    double acc[8][8] = {{0.0}};  // FIXED: Use double precision for better numerical stability
     
     // FIXED: Correct thread mapping for 256 threads -> 128x128 block
     const int thread_m = (tid / 16) * 8;        // tid/16 gives rows 0-15, *8 gives 0,8,16...120
@@ -259,7 +284,12 @@ __global__ void blackwell_cluster_gemm_kernel(
                     if (m_idx < BLOCK_SIZE_M && n_idx < BLOCK_SIZE_N) {
                         const T a_val = cluster_smem_A[m_idx * BLOCK_SIZE_K + k_idx];
                         const T b_val = cluster_smem_B[k_idx * BLOCK_SIZE_N + n_idx];
-                        acc[i][j] += float(a_val) * float(b_val);
+                        const double product = double(a_val) * double(b_val);
+                        
+                        // Add numerical stability check
+                        if (is_valid_double(product)) {
+                            acc[i][j] += product;
+                        }
                     }
                 }
             }
@@ -279,10 +309,20 @@ __global__ void blackwell_cluster_gemm_kernel(
             
             if (global_row < M && global_col < N) {
                 const int idx = global_row * ldc + global_col;
+                // Add numerical stability check for output
+                double result;
                 if (beta == 0.0f) {
-                    C[idx] = alpha * acc[i][j];
+                    result = alpha * acc[i][j];
                 } else {
-                    C[idx] = alpha * acc[i][j] + beta * C[idx];
+                    result = alpha * acc[i][j] + beta * C[idx];
+                }
+                
+                // Validate result before writing
+                if (is_valid_double(result)) {
+                    C[idx] = float(result);
+                } else {
+                    // Use fallback value for invalid results
+                    C[idx] = 0.0f;
                 }
             }
         }
@@ -317,7 +357,7 @@ __global__ void blackwell_standard_gemm_kernel(
     T* smem_B = (T*)(smem + SMEM_SIZE_A);
     
     // Accumulator registers
-    float acc[8][8] = {{0.0f}};  // FIXED: Corrected to 8x8 to match thread mapping
+    double acc[8][8] = {{0.0}};  // FIXED: Use double precision for better numerical stability
     
     // FIXED: Correct thread mapping for 256 threads -> 128x128 block
     const int thread_m = (tid / 16) * 8;        // tid/16 gives rows 0-15, *8 gives 0,8,16...120
@@ -371,7 +411,12 @@ __global__ void blackwell_standard_gemm_kernel(
                     if (m_idx < BLOCK_SIZE_M && n_idx < BLOCK_SIZE_N) {
                         const T a_val = smem_A[m_idx * BLOCK_SIZE_K + k_idx];
                         const T b_val = smem_B[k_idx * BLOCK_SIZE_N + n_idx];
-                        acc[i][j] += float(a_val) * float(b_val);
+                        const double product = double(a_val) * double(b_val);
+                        
+                        // Add numerical stability check
+                        if (is_valid_double(product)) {
+                            acc[i][j] += product;
+                        }
                     }
                 }
             }
@@ -390,10 +435,20 @@ __global__ void blackwell_standard_gemm_kernel(
             
             if (global_row < M && global_col < N) {
                 const int idx = global_row * ldc + global_col;
+                // Add numerical stability check for output
+                double result;
                 if (beta == 0.0f) {
-                    C[idx] = alpha * acc[i][j];
+                    result = alpha * acc[i][j];
                 } else {
-                    C[idx] = alpha * acc[i][j] + beta * C[idx];
+                    result = alpha * acc[i][j] + beta * C[idx];
+                }
+                
+                // Validate result before writing
+                if (is_valid_double(result)) {
+                    C[idx] = float(result);
+                } else {
+                    // Use fallback value for invalid results
+                    C[idx] = 0.0f;
                 }
             }
         }

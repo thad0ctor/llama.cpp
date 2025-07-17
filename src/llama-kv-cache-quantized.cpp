@@ -1,5 +1,5 @@
 #include "llama-kv-cache-quantized.h"
-// #include "llama-kv-cache-moe-quantized.h" // Temporarily disabled
+#include "llama-kv-cache-moe-quantized.h" // Re-enabled for MoE quantization support
 #include "llama-io.h"
 #include "llama-impl.h"
 #include "llama-model.h"

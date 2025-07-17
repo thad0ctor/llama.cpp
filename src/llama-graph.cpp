@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "llama-moe-fixes.h"
+#include "../blackwell_moe_config.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -733,9 +734,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // Step 2: Enhanced temperature scaling for large MoE models
     if (enable_enhanced_moe) {
-        // FIXED: Less aggressive temperature scaling to improve expert diversity
-        // Changed from 0.95f to 0.98f to preserve more signal
-        const float temperature_scale = 0.98f;
+        // Use configured temperature scale from blackwell_moe_config.h
+        const float temperature_scale = MOE_TEMPERATURE_SCALE;
         logits = ggml_scale(ctx0, logits, temperature_scale);
         cb(logits, "ffn_moe_logits_scaled", il);
     }
@@ -758,7 +758,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // Step 4: Enhanced numerical stability for large models
     if (enable_enhanced_moe) {
-        const float stability_scale = 1.0f + 1e-7f;
+        const float stability_scale = 1.0f + MOE_STABILITY_EPSILON;
         probs = ggml_scale(ctx0, probs, stability_scale);
         cb(probs, "ffn_moe_probs_stabilized", il);
     }
@@ -793,7 +793,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Enhanced epsilon protection for large models
-        const float epsilon_scale = enable_enhanced_moe ? 1.0f + 1e-8f : 1.0f + 1e-6f;
+        const float epsilon_scale = enable_enhanced_moe ? 1.0f + MOE_WEIGHT_EPSILON : 1.0f + 1e-6f;
         weights_sum = ggml_scale(ctx0, weights_sum, epsilon_scale);
         cb(weights_sum, "ffn_moe_weights_sum_protected", il);
 
@@ -880,29 +880,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // Step 17: UNIFIED output stabilization (single pass)
     if (enable_enhanced_moe) {
-        // Progressive clamping based on model size - FIXED VALUES
-        float clamp_value = 50.0f;
-        if (n_expert > 64) clamp_value = 35.0f;   // Less aggressive than 30.0f
-        if (n_expert > 128) clamp_value = 25.0f;  // Less aggressive than 20.0f
+        // Progressive clamping based on model size - using configured values
+        float clamp_value = MOE_BASE_CLAMP_VALUE;
+        if (n_expert > MOE_ENHANCED_PROCESSING_THRESHOLD) clamp_value = MOE_MEDIUM_CLAMP_VALUE;
+        if (n_expert > MOE_LARGE_MODEL_THRESHOLD) clamp_value = MOE_LARGE_CLAMP_VALUE;
         
-        // FIXED: Less aggressive Qwen3MOE multiplier
-        if (arch == LLM_ARCH_QWEN3MOE) clamp_value *= 0.9f;  // Changed from 0.8f to 0.9f (22.5f instead of 16.0f)
+        // Architecture-specific handling
+        if (arch == LLM_ARCH_QWEN3MOE) clamp_value *= MOE_QWEN3_CLAMP_MULTIPLIER;
         
         moe_out = ggml_clamp(ctx0, moe_out, -clamp_value, clamp_value);
         cb(moe_out, "ffn_moe_out_clamped", il);
         
-        // FIXED: Less aggressive stability scaling for very large models
-        if (n_expert > 64) {
-            // FIXED: Reduced aggressiveness - changed from 0.95f to 0.98f for Qwen3MOE
-            const float stability_scale = (arch == LLM_ARCH_QWEN3MOE) ? 0.98f : 0.99f;
+        // Architecture-specific stability scaling
+        if (n_expert > MOE_ENHANCED_PROCESSING_THRESHOLD) {
+            const float stability_scale = (arch == LLM_ARCH_QWEN3MOE) ? MOE_QWEN3_STABILITY_SCALE : MOE_GENERAL_STABILITY_SCALE;
             moe_out = ggml_scale(ctx0, moe_out, stability_scale);
             cb(moe_out, "ffn_moe_out_stabilized", il);
         }
         
-        // FIXED: Reduced emergency noise injection - only for extreme cases and less aggressive
-        if (n_expert > 128 && (arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_DEEPSEEK2)) {
-            // FIXED: Reduced noise scale from 1e-6f to 1e-7f
-            const float noise_scale = 1.0f + 1e-7f;
+        // Emergency noise injection for extreme cases
+        if (n_expert > MOE_LARGE_MODEL_THRESHOLD && (arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_DEEPSEEK2)) {
+            const float noise_scale = MOE_EMERGENCY_NOISE_SCALE;
             moe_out = ggml_scale(ctx0, moe_out, noise_scale);
             cb(moe_out, "ffn_moe_out_final", il);
         }
