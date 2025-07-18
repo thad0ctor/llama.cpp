@@ -197,7 +197,7 @@ static void ggml_cuda_detect_kernel_capabilities_impl(const ggml_cuda_device_inf
     
     if (is_rtx_5090) {
         // Enable RTX 5090 specific optimizations for large models (235B+)
-        caps->supports_cluster_gemm = true;          // Benefits large GEMM operations
+        caps->supports_cluster_gemm = false;         // DISABLED - has corruption bugs causing gibberish
         caps->supports_distributed_shmem = true;     // Helps with memory bandwidth
         caps->supports_fp8_kernels = false;          // Disable until proven beneficial
         caps->supports_cluster_attention = true;     // Enable cluster attention for RTX 5090

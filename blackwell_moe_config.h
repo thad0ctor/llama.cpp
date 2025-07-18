@@ -10,8 +10,8 @@
 // UNIFIED MOE CONFIGURATION
 // ========================================
 
-// Master switch for unified MoE processing
-#define BLACKWELL_UNIFIED_MOE_ENABLED 1
+// Master switch for unified MoE processing - DISABLED to restore original MoE
+#define BLACKWELL_UNIFIED_MOE_ENABLED 0
 
 // Enhanced processing thresholds
 #define MOE_ENHANCED_PROCESSING_THRESHOLD 64    // Enable enhanced processing for models with >64 experts

@@ -1,6 +1,7 @@
 #include "llama-graph.h"
-#include "llama-moe-fixes.h"
-#include "../blackwell_moe_config.h"
+// Blackwell MoE fixes disabled - using original upstream MoE implementation
+// #include "llama-moe-fixes.h"
+// #include "../blackwell_moe_config.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -713,34 +714,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                float   w_scale,
          llama_expert_gating_func_type gating_op,
                  int   il) const {
-    
-    // UNIFIED BLACKWELL MOE IMPLEMENTATION
-    // Combines MoE fixes with standard implementation for consistency
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
-    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4;
-    
-    // Enhanced MoE processing for large models
-    const bool enable_enhanced_moe = (n_expert > 64);
-    
-    if (enable_enhanced_moe) {
-        LLAMA_LOG_INFO("Unified MoE processing for layer %d (experts: %ld, arch: %d)\n", 
-            il, n_expert, (int)arch);
-    }
+    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // Step 1: Compute gate logits
     ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
     cb(logits, "ffn_moe_logits", il);
 
-    // Step 2: Enhanced temperature scaling for large MoE models
-    if (enable_enhanced_moe) {
-        // Use configured temperature scale from blackwell_moe_config.h
-        const float temperature_scale = MOE_TEMPERATURE_SCALE;
-        logits = ggml_scale(ctx0, logits, temperature_scale);
-        cb(logits, "ffn_moe_logits_scaled", il);
-    }
-
-    // Step 3: Compute probabilities with enhanced stability
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
@@ -756,69 +736,54 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(probs, "ffn_moe_probs", il);
 
-    // Step 4: Enhanced numerical stability for large models
-    if (enable_enhanced_moe) {
-        const float stability_scale = 1.0f + MOE_STABILITY_EPSILON;
-        probs = ggml_scale(ctx0, probs, stability_scale);
-        cb(probs, "ffn_moe_probs_stabilized", il);
-    }
-
-    // Step 5: Add experts selection bias (DeepSeek V3 feature)
+    // add experts selection bias - introduced in DeepSeek V3
+    // leave probs unbiased as it's later used to get expert weights
     ggml_tensor * selection_probs = probs;
     if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
-    // Step 6: Architecture-specific handling
+    // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
+    // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
     if (arch == LLM_ARCH_LLAMA4) {
         selection_probs = logits;
     }
 
-    // Step 7: Select experts
+    // select experts
     ggml_tensor * selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
-    // Step 8: Extract expert weights with enhanced validation
     ggml_tensor * weights = ggml_get_rows(ctx0,
             ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
-    // Step 9: UNIFIED weight normalization (enhanced for large models)
     if (norm_w) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Enhanced epsilon protection for large models
-        const float epsilon_scale = enable_enhanced_moe ? 1.0f + MOE_WEIGHT_EPSILON : 1.0f + 1e-6f;
-        weights_sum = ggml_scale(ctx0, weights_sum, epsilon_scale);
-        cb(weights_sum, "ffn_moe_weights_sum_protected", il);
-
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
         cb(weights, "ffn_moe_weights_norm", il);
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
-    
     if (scale_w) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    // Step 10: Prepare input tensor
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    // Step 11: Apply weights before FFN (architecture-specific)
     if (weight_before_ffn) {
+        // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
-        cb(cur, "ffn_moe_weighted_before", il);
+        cb(cur, "ffn_moe_weighted", il);
     }
 
-    // Step 12: Expert processing
     ggml_tensor * up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
     cb(up, "ffn_moe_up", il);
 
@@ -830,38 +795,54 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cur = up;
     }
 
-    // Step 13: Apply activation function
     switch (type_op) {
         case LLM_FFN_SILU:
             {
                 cur = ggml_silu(ctx0, cur);
                 cb(cur, "ffn_moe_silu", il);
+
+                cur = ggml_mul(ctx0, cur, up);
+                cb(cur, "ffn_moe_gate_par", il);
             } break;
         case LLM_FFN_GELU:
             {
                 cur = ggml_gelu(ctx0, cur);
                 cb(cur, "ffn_moe_gelu", il);
+
+                cur = ggml_mul(ctx0, cur, up);
+                cb(cur, "ffn_moe_gate_par", il);
+            } break;
+        case LLM_FFN_RELU:
+            {
+                cur = ggml_relu(ctx0, cur);
+                cb(cur, "ffn_moe_relu", il);
+
+                cur = ggml_mul(ctx0, cur, up);
+                cb(cur, "ffn_moe_gate_par", il);
+            } break;
+        case LLM_FFN_RELU_SQR:
+            {
+                cur = ggml_relu(ctx0, cur);
+                cb(cur, "ffn_moe_relu", il);
+
+                cur = ggml_sqr(ctx0, cur);
+                cb(cur, "ffn_moe_relu_sqr", il);
+
+                cur = ggml_mul(ctx0, cur, up);
+                cb(cur, "ffn_moe_gate_par", il);
             } break;
         default:
             GGML_ABORT("fatal error");
     }
 
-    if (gate_exps) {
-        cur = ggml_mul(ctx0, cur, up); // [n_ff, n_expert_used, n_tokens]
-        cb(cur, "ffn_moe_gate_par", il);
-    }
-
-    // Step 14: Down projection
     experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
-    // Step 15: UNIFIED weight application (only once!)
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted_after", il);
+        cb(experts, "ffn_moe_weighted", il);
     }
 
-    // Step 16: UNIFIED expert aggregation
     ggml_tensor * moe_out = nullptr;
     for (int i = 0; i < n_expert_used; ++i) {
         ggml_tensor * cur_expert = ggml_view_2d(ctx0, experts, n_embd, n_tokens,
@@ -876,34 +857,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (n_expert_used == 1) {
         moe_out = ggml_cont(ctx0, moe_out);
-    }
-
-    // Step 17: UNIFIED output stabilization (single pass)
-    if (enable_enhanced_moe) {
-        // Progressive clamping based on model size - using configured values
-        float clamp_value = MOE_BASE_CLAMP_VALUE;
-        if (n_expert > MOE_ENHANCED_PROCESSING_THRESHOLD) clamp_value = MOE_MEDIUM_CLAMP_VALUE;
-        if (n_expert > MOE_LARGE_MODEL_THRESHOLD) clamp_value = MOE_LARGE_CLAMP_VALUE;
-        
-        // Architecture-specific handling
-        if (arch == LLM_ARCH_QWEN3MOE) clamp_value *= MOE_QWEN3_CLAMP_MULTIPLIER;
-        
-        moe_out = ggml_clamp(ctx0, moe_out, -clamp_value, clamp_value);
-        cb(moe_out, "ffn_moe_out_clamped", il);
-        
-        // Architecture-specific stability scaling
-        if (n_expert > MOE_ENHANCED_PROCESSING_THRESHOLD) {
-            const float stability_scale = (arch == LLM_ARCH_QWEN3MOE) ? MOE_QWEN3_STABILITY_SCALE : MOE_GENERAL_STABILITY_SCALE;
-            moe_out = ggml_scale(ctx0, moe_out, stability_scale);
-            cb(moe_out, "ffn_moe_out_stabilized", il);
-        }
-        
-        // Emergency noise injection for extreme cases
-        if (n_expert > MOE_LARGE_MODEL_THRESHOLD && (arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_DEEPSEEK2)) {
-            const float noise_scale = MOE_EMERGENCY_NOISE_SCALE;
-            moe_out = ggml_scale(ctx0, moe_out, noise_scale);
-            cb(moe_out, "ffn_moe_out_final", il);
-        }
     }
 
     cb(moe_out, "ffn_moe_out", il);
