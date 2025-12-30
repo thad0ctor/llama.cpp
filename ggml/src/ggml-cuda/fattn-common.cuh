@@ -769,10 +769,11 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, typename KernelFunc, typename... Args>
 void launch_fattn(
-    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, KernelFunc fattn_kernel, const int nwarps, const size_t nbytes_shared,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size,
+    Args... args
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -900,6 +901,26 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    if (max_blocks_per_sm <= 0) {
+        fprintf(stderr, "FATTN ERROR: max_blocks_per_sm = %d\n", max_blocks_per_sm);
+        fprintf(stderr, "  nbytes_shared = %lu\n", nbytes_shared);
+        fprintf(stderr, "  block_dim = %d, %d, %d (total %d)\n", block_dim.x, block_dim.y, block_dim.z, block_dim.x * block_dim.y * block_dim.z);
+        int dev_id;
+        cudaGetDevice(&dev_id);
+        int max_shmem = 0;
+        cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id);
+        fprintf(stderr, "  max_shmem_optin = %d\n", max_shmem);
+        int max_regs = 0;
+        cudaDeviceGetAttribute(&max_regs, cudaDevAttrMaxRegistersPerBlock, dev_id);
+        fprintf(stderr, "  max_regs_per_block = %d\n", max_regs);
+        
+        cudaFuncAttributes attrs;
+        if (cudaFuncGetAttributes(&attrs, fattn_kernel) == cudaSuccess) {
+            fprintf(stderr, "  kernel regs = %d\n", attrs.numRegs);
+            fprintf(stderr, "  kernel shmem (static) = %lu\n", attrs.sharedSizeBytes);
+            fprintf(stderr, "  kernel local = %lu\n", attrs.localSizeBytes);
+        }
+    }
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
@@ -978,6 +999,13 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    // L2 cache persistence for K/V cache on Blackwell (RTX 5090 has 96MB L2)
+    // Persists K tensor in L2 during decode for faster repeated access
+#if CUDART_VERSION >= 11000
+    const size_t kv_cache_size = K->ne[0] * K->ne[1] * sizeof(half);
+    ggml_cuda_l2_persist_guard l2_guard(main_stream, const_cast<char *>(K_data), kv_cache_size, cc);
+#endif
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,
@@ -992,7 +1020,8 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        args...
     );
     CUDA_CHECK(cudaGetLastError());
 

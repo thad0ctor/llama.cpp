@@ -60,6 +60,8 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
+#include <cuda.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>

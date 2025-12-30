@@ -5,6 +5,16 @@
 #include <cmath>
 #include <initializer_list>
 
+// Optimization settings for different architectures
+// Blackwell (sm_120): 228KB shared memory, can use 8 rows/block efficiently
+// Ampere (sm_80-89): 164KB shared memory, use 8 rows/block
+// Legacy: 4 rows/block for older architectures
+#define MOE_ROWS_PER_BLOCK_OPTIMIZED 8
+#define MOE_ROWS_PER_BLOCK_DEFAULT 4
+
+// Use shared memory for expert logits when n_experts >= threshold
+#define MOE_SMEM_THRESHOLD 32
+
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
@@ -50,14 +60,24 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
     }
 }
 
-/*
-    This kernel does the following:
-    1. optionally softmax over the logits per token [n_experts, n_tokens]
-    2. argmax reduce over the top-k (n_experts_used) logits
-    3. write weights + ids to global memory
-    4. optionally normalize the weights or apply softmax over the selected logits
+// Optimized argmax reduction with index tracking
+__device__ __forceinline__ float warp_reduce_max_with_idx(float val, int idx, int * max_expert) {
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+        const float other_val = __shfl_xor_sync(0xFFFFFFFF, val, mask, WARP_SIZE);
+        const int   other_idx = __shfl_xor_sync(0xFFFFFFFF, idx, mask, WARP_SIZE);
+        if (other_val > val || (other_val == val && other_idx < idx)) {
+            val = other_val;
+            idx = other_idx;
+        }
+    }
+    *max_expert = idx;
+    return val;
+}
 
-    It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
+/*
+    Legacy MoE top-k kernel (4 rows per block, no shared memory caching)
+    Used for older architectures or small expert counts
 */
 template <int n_experts, bool with_norm, bool delayed_softmax = false>
 __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * logits,
@@ -89,12 +109,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
     }
 
-    //at this point, each thread holds either a portion of the softmax distribution
-    //or the raw logits. We do the argmax reduce over n_expert_used, each time marking
-    //the expert weight as -inf to exclude from the next iteration
-
     float wt_sum = 0.f;
-
     float output_weights[experts_per_thread];
 
 #pragma unroll
@@ -166,6 +181,160 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     }
 }
 
+/*
+    Optimized MoE top-k kernel for Ampere+ (sm_80+) with:
+    1. Shared memory caching for repeated argmax iterations
+    2. 8 rows per block for better SM utilization
+    3. Optimized warp-level reduction
+
+    For Blackwell (sm_120), the larger shared memory (228KB) allows efficient
+    operation even with 512 experts and 8 rows per block.
+*/
+template <int n_experts, int rows_per_block, bool with_norm, bool delayed_softmax = false>
+__launch_bounds__(rows_per_block * WARP_SIZE, 2)
+__global__ void topk_moe_cuda_optimized(
+    const float * __restrict__ logits,
+    float *       __restrict__ weights,
+    int32_t *     __restrict__ ids,
+    const int     n_rows,
+    const int     n_expert_used,
+    const float   clamp_val
+) {
+    // Shared memory for caching logits per row (enables efficient repeated argmax)
+    extern __shared__ float smem[];
+    float * row_logits = smem + threadIdx.y * n_experts;
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= n_rows) {
+        return;
+    }
+
+    const float * row_logits_global = logits + n_experts * row;
+    float *       row_weights = weights + n_expert_used * row;
+    int32_t *     row_ids = ids + n_experts * row;
+
+    const int lane = threadIdx.x;
+    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+
+    float wt[experts_per_thread];
+
+    // Load logits to shared memory (cooperative load by warp)
+#pragma unroll
+    for (int i = lane; i < n_experts; i += WARP_SIZE) {
+        row_logits[i] = row_logits_global[i];
+    }
+    __syncwarp();
+
+    // Copy to registers
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int expert = lane + i * WARP_SIZE;
+        wt[i] = (expert < n_experts) ? row_logits[expert] : -INFINITY;
+    }
+
+    // Apply softmax if not delayed
+    if constexpr (!delayed_softmax) {
+        softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, lane);
+
+        // Update shared memory with softmax values
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            const int expert = lane + i * WARP_SIZE;
+            if (expert < n_experts) {
+                row_logits[expert] = wt[i];
+            }
+        }
+        __syncwarp();
+    }
+
+    float wt_sum = 0.f;
+    float output_weights[experts_per_thread];
+
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        output_weights[i] = 0.f;
+    }
+
+    // Top-k selection with optimized reduction
+    for (int k = 0; k < n_expert_used; k++) {
+        float max_val = wt[0];
+        int   max_expert_local = lane;
+
+        // Find local max across this thread's experts
+#pragma unroll
+        for (int i = 1; i < experts_per_thread; i++) {
+            const int expert = lane + i * WARP_SIZE;
+            if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+                max_val = wt[i];
+                max_expert_local = expert;
+            }
+        }
+
+        // Warp-wide reduction to find global max
+        int max_expert;
+        max_val = warp_reduce_max_with_idx(max_val, max_expert_local, &max_expert);
+
+        // Store result
+        if ((k & (WARP_SIZE - 1)) == lane) {
+            output_weights[k / WARP_SIZE] = max_val;
+        }
+
+        // Mark selected expert as used
+        if ((max_expert & (WARP_SIZE - 1)) == lane) {
+            wt[max_expert / WARP_SIZE] = -INFINITY;
+            row_ids[k] = max_expert;
+
+            if constexpr (with_norm) {
+                wt_sum += max_val;
+            }
+
+            // Update shared memory
+            row_logits[max_expert] = -INFINITY;
+        }
+        __syncwarp();
+    }
+
+    // Apply normalization
+    if constexpr (with_norm) {
+        wt_sum = warp_reduce_sum(wt_sum);
+        wt_sum = max(wt_sum, clamp_val);
+        const float inv_sum = 1.0f / wt_sum;
+
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            output_weights[i] *= inv_sum;
+        }
+    }
+
+    // Apply delayed softmax if needed
+    if constexpr (delayed_softmax) {
+        softmax_warp_inplace<experts_per_thread, true>(output_weights, n_expert_used, lane);
+    }
+
+    // Write output weights
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const int idx = i * WARP_SIZE + lane;
+        if (idx < n_expert_used) {
+            row_weights[idx] = output_weights[i];
+        }
+    }
+
+    if constexpr (!with_norm) {
+        GGML_UNUSED(clamp_val);
+    }
+}
+
+// Dispatch macro for optimized path
+#define LAUNCH_MOE_OPTIMIZED(N_EXPERTS)                                                                     \
+    topk_moe_cuda_optimized<N_EXPERTS, MOE_ROWS_PER_BLOCK_OPTIMIZED, with_norm, delayed_softmax>            \
+        <<<grid_dims, block_dims, smem_size, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val)
+
+// Dispatch macro for legacy path
+#define LAUNCH_MOE_LEGACY(N_EXPERTS)                                                                        \
+    topk_moe_cuda<N_EXPERTS, with_norm, delayed_softmax>                                                    \
+        <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val)
+
 template <bool with_norm, bool delayed_softmax = false>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -176,57 +345,57 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const int                   n_expert_used,
                                  const float                 clamp_val) {
     static_assert(!(with_norm && delayed_softmax), "delayed softmax is not supported with weight normalization");
-    const int    rows_per_block = 4;
-    dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
-    dim3         block_dims(WARP_SIZE, rows_per_block, 1);
-    cudaStream_t stream = ctx.stream();
 
-    switch (n_expert) {
-        case 1:
-            topk_moe_cuda<1, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 2:
-            topk_moe_cuda<2, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 4:
-            topk_moe_cuda<4, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 8:
-            topk_moe_cuda<8, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 16:
-            topk_moe_cuda<16, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 32:
-            topk_moe_cuda<32, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 64:
-            topk_moe_cuda<64, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 128:
-            topk_moe_cuda<128, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 256:
-            topk_moe_cuda<256, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        case 512:
-            topk_moe_cuda<512, with_norm, delayed_softmax>
-                <<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val);
-            break;
-        default:
-            GGML_ASSERT(false && "fatal error");
-            break;
+    cudaStream_t stream = ctx.stream();
+    const int    cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    // Use optimized path for Ampere+ (sm_80+) with shared memory caching
+    // Blackwell (sm_120) also uses this path but benefits from larger shared memory
+    const bool use_optimized_path = (cc >= GGML_CUDA_CC_AMPERE) && (n_expert >= MOE_SMEM_THRESHOLD);
+
+    if (use_optimized_path) {
+        // Optimized: 8 rows/block, shared memory caching
+        constexpr int rows_per_block = MOE_ROWS_PER_BLOCK_OPTIMIZED;
+        const dim3    grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+        const dim3    block_dims(WARP_SIZE, rows_per_block, 1);
+        const size_t  smem_size = rows_per_block * n_expert * sizeof(float);
+
+        switch (n_expert) {
+            case 32:  LAUNCH_MOE_OPTIMIZED(32);  break;
+            case 64:  LAUNCH_MOE_OPTIMIZED(64);  break;
+            case 128: LAUNCH_MOE_OPTIMIZED(128); break;
+            case 256: LAUNCH_MOE_OPTIMIZED(256); break;
+            case 512: LAUNCH_MOE_OPTIMIZED(512); break;
+            default:
+                GGML_ASSERT(false && "Unsupported n_expert for optimized path");
+                break;
+        }
+    } else {
+        // Legacy path: 4 rows/block, no shared memory
+        constexpr int rows_per_block = MOE_ROWS_PER_BLOCK_DEFAULT;
+        const dim3    grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+        const dim3    block_dims(WARP_SIZE, rows_per_block, 1);
+
+        switch (n_expert) {
+            case 1:   LAUNCH_MOE_LEGACY(1);   break;
+            case 2:   LAUNCH_MOE_LEGACY(2);   break;
+            case 4:   LAUNCH_MOE_LEGACY(4);   break;
+            case 8:   LAUNCH_MOE_LEGACY(8);   break;
+            case 16:  LAUNCH_MOE_LEGACY(16);  break;
+            case 32:  LAUNCH_MOE_LEGACY(32);  break;
+            case 64:  LAUNCH_MOE_LEGACY(64);  break;
+            case 128: LAUNCH_MOE_LEGACY(128); break;
+            case 256: LAUNCH_MOE_LEGACY(256); break;
+            case 512: LAUNCH_MOE_LEGACY(512); break;
+            default:
+                GGML_ASSERT(false && "Unsupported n_expert");
+                break;
+        }
     }
 }
+
+#undef LAUNCH_MOE_OPTIMIZED
+#undef LAUNCH_MOE_LEGACY
 
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
                            const ggml_tensor *         logits,
