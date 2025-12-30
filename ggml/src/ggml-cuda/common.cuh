@@ -195,6 +195,11 @@ static const char * cu_get_error_str(CUresult err) {
 // Blackwell MMA available for sm_120+
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
 #define BLACKWELL_MMA_AVAILABLE
+#define BLACKWELL_TMA_AVAILABLE
+// WGMMA is only available on Compute Blackwell (sm_100), not Consumer (sm_120)
+#if __CUDA_ARCH__ == 100
+#define BLACKWELL_WGMMA_AVAILABLE
+#endif
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
 #if !defined(GGML_CUDA_NO_FA)
@@ -267,6 +272,10 @@ static bool cp_async_available(const int cc) {
 static bool blackwell_mma_available(const int cc) {
     return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
+}
+
+static inline bool ggml_cuda_has_blackwell_features(int cc) {
+    return cc >= GGML_CUDA_CC_BLACKWELL;
 }
 
 // CUDA warp size is always 32

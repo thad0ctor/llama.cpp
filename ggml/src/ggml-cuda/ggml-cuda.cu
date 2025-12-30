@@ -60,6 +60,44 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
+#include <cuda.h>
+
+#if CUDART_VERSION >= 12000
+
+// Create tensor map for 2D tile loads (K x N matrix, loading tiles of tile_k x tile_n)
+static CUresult ggml_cuda_create_tensor_map_2d(
+    CUtensorMap* tensor_map,
+    CUtensorMapDataType dtype,
+    void* global_ptr,
+    uint64_t dim_k,
+    uint64_t dim_n,
+    uint64_t stride_n_bytes,  // Typically dim_k * sizeof(element)
+    uint32_t tile_k,
+    uint32_t tile_n)
+{
+    const uint64_t dims[2] = {dim_k, dim_n};
+    const uint64_t globalStrides[1] = {stride_n_bytes};
+    const uint32_t tile_dims[2] = {tile_k, tile_n};
+    const uint32_t elem_strides[2] = {1, 1};
+
+    return cuTensorMapEncodeTiled(
+        tensor_map,
+        dtype,
+        2,                              // 2D
+        global_ptr,
+        dims,
+        globalStrides,                  // Only need stride for dim > 0
+        tile_dims,
+        elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,     // 128-byte swizzle for bank-conflict-free
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+}
+
+#endif // CUDART_VERSION >= 12000
+
 #include <algorithm>
 #include <array>
 #include <atomic>
