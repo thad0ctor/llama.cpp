@@ -5,6 +5,20 @@
 
 #if CUDART_VERSION >= 12000
 // Create tensor map for 2D tile loads (K x N matrix, loading tiles of tile_k x tile_n)
+//
+// L2 Cache Promotion Options (l2_promotion parameter):
+//   - CU_TENSOR_MAP_L2_PROMOTION_NONE:   No L2 promotion (data may bypass L2)
+//   - CU_TENSOR_MAP_L2_PROMOTION_L2_64B: 64-byte L2 promotion granularity
+//   - CU_TENSOR_MAP_L2_PROMOTION_L2_128B: 128-byte L2 promotion granularity
+//   - CU_TENSOR_MAP_L2_PROMOTION_L2_256B: 256-byte L2 promotion granularity (default)
+//
+// For Flash Attention on Blackwell (96MB L2 cache on RTX 5090):
+//   - L2_256B is optimal for large tile loads (nbatch_fa x nbatch_K2/V2)
+//   - During decode, K/V cache benefits from L2 residency across iterations
+//   - Larger promotion granularity reduces L2 tag pressure for streaming access
+//
+// Note: Stream-level L2 persistence (cudaStreamSetAttribute with accessPolicyWindow)
+// could further benefit decode workloads but requires per-tensor configuration.
 static inline __host__ CUresult ggml_cuda_create_tensor_map_2d(
     CUtensorMap* tensor_map,
     CUtensorMapDataType dtype,
@@ -13,7 +27,8 @@ static inline __host__ CUresult ggml_cuda_create_tensor_map_2d(
     uint64_t dim_n,
     uint64_t stride_n_bytes,  // Typically dim_k * sizeof(element)
     uint32_t tile_k,
-    uint32_t tile_n)
+    uint32_t tile_n,
+    CUtensorMapL2promotion l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B)
 {
 #ifndef __CUDA_ARCH__
     const uint64_t dims[2] = {dim_k, dim_n};
@@ -32,11 +47,11 @@ static inline __host__ CUresult ggml_cuda_create_tensor_map_2d(
         elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B,     // 128-byte swizzle for bank-conflict-free
-        CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        l2_promotion,                   // L2 cache promotion granularity
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 #else
-    GGML_UNUSED_VARS(tensor_map, dtype, global_ptr, dim_k, dim_n, stride_n_bytes, tile_k, tile_n);
+    GGML_UNUSED_VARS(tensor_map, dtype, global_ptr, dim_k, dim_n, stride_n_bytes, tile_k, tile_n, l2_promotion);
     return (CUresult)0;
 #endif // __CUDA_ARCH__
 }
