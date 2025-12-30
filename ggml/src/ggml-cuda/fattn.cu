@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
+#include "attention_v5.cuh"
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -203,11 +204,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_NONE         =   0,
+    BEST_FATTN_KERNEL_TILE         = 200,
+    BEST_FATTN_KERNEL_VEC          = 100,
+    BEST_FATTN_KERNEL_WMMA_F16     = 300,
+    BEST_FATTN_KERNEL_MMA_F16      = 400,
+    BEST_FATTN_KERNEL_ATTENTION_V5 = 500,  // SM_120 (Blackwell) BF16 optimized
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -284,6 +286,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // SM_120 (Blackwell): Use optimized attention_v5 kernel if supported
+    if (cc >= GGML_CUDA_CC_BLACKWELL && ggml_cuda_flash_attn_ext_attention_v5_supported(dst)) {
+        return BEST_FATTN_KERNEL_ATTENTION_V5;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -370,6 +377,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_ATTENTION_V5:
+            ggml_cuda_flash_attn_ext_attention_v5(ctx, dst);
             break;
     }
 }

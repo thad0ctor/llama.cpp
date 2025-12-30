@@ -137,3 +137,7 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Custom build scripts
+/build_rtx5090_optimized.sh
+results.csv

@@ -3,6 +3,8 @@
 #include "common.cuh"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "cp-async.cuh"
+#include "tma.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -12,6 +14,8 @@ using namespace ggml_cuda_mma;
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K 256
 #define MMQ_ITER_K_MXFP4_FP4    512
+#define MMQ_ITER_K_Q8_0_BLACKWELL 512  // Datacenter Blackwell (sm_100, B200/B100) uses 2x K iteration for Q8_0 with m16n8k32
+#define MMQ_ITER_K_Q8_0_SM120   256    // Consumer Blackwell (sm_120, RTX 5090) uses standard K iteration due to 99KB shared memory limit
 #define MMQ_NWARPS 8
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
@@ -125,7 +129,16 @@ static int get_mmq_y_host(const int cc) {
 
 static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    return type == GGML_TYPE_MXFP4 ? MMQ_ITER_K_MXFP4_FP4 : MMQ_ITER_K;
+    // sm_120 (RTX 5090) has 99KB shared memory limit, use reduced iteration
+    // sm_100 (B200/B100) has 227KB, can use full 512 iteration
+    if (type == GGML_TYPE_MXFP4) {
+        // MXFP4 uses same iteration on both sm_100 and sm_120 (fits in 99KB)
+        return ggml_cuda_is_consumer_blackwell_device() ? MMQ_ITER_K : MMQ_ITER_K_MXFP4_FP4;
+    }
+    if (type == GGML_TYPE_Q8_0) {
+        return ggml_cuda_is_consumer_blackwell_device() ? MMQ_ITER_K_Q8_0_SM120 : MMQ_ITER_K_Q8_0_BLACKWELL;
+    }
+    return MMQ_ITER_K;
 #else
     return MMQ_ITER_K;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -144,6 +157,7 @@ static constexpr __device__ int get_mmq_y_device() {
 // The final tile size in K direction is padded to avoid shared memory bank conflicts,
 // in terms of 32 bit elements that means K % 2 == 1 for dp4a or K % 8 == 4 for mma.
 #define MMQ_TILE_NE_K 32
+#define MMQ_Q8_0_PAD 4
 
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{mmq_y*MMQ_TILE_NE_K   + mmq_y, mmq_y*MMQ_TILE_NE_K/QI4_0   + mmq_y/QI4_0,     0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{mmq_y*MMQ_TILE_NE_K   + mmq_y, mmq_y*MMQ_TILE_NE_K/QI4_1   + mmq_y/QI4_1,     0}
@@ -181,19 +195,23 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
     }
 }
 
-#define MMQ_MMA_TILE_X_K_Q8_0 (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0                   + 4)
-#define MMQ_MMA_TILE_X_K_FP4  (2*MMQ_TILE_NE_K + 8                                       + 4)
-#define MMQ_MMA_TILE_X_K_Q8_1 (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0                   + 4)
+#define MMQ_MMA_TILE_X_K_Q8_0           (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4)
+#define MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL (4*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD) + 4*MMQ_TILE_NE_K/QI8_0 + 4) // 2x for datacenter Blackwell (sm_100) 512 K iteration
+#define MMQ_MMA_TILE_X_K_Q8_0_SM120     MMQ_MMA_TILE_X_K_Q8_0  // Consumer Blackwell (sm_120, RTX 5090) uses standard tile due to 99KB shared memory limit
+#define MMQ_MMA_TILE_X_K_FP4            (2*MMQ_TILE_NE_K + 8                     + 4)
+#define MMQ_MMA_TILE_X_K_Q8_1           (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4)
 #define MMQ_MMA_TILE_X_K_Q2_K (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K                           + 4)
 #define MMQ_MMA_TILE_X_K_Q3_K (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2                         + 4)
 #define MMQ_MMA_TILE_X_K_Q6_K (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K   + MMQ_TILE_NE_K/8 + 7)
 
-static_assert(MMQ_MMA_TILE_X_K_Q8_0 % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q8_1 % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q2_K % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q3_K % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q6_K % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_FP4  % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_0           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_0_SM120     % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_1           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q2_K           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q3_K           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q6_K           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_FP4            % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_FP4 == MMQ_MMA_TILE_X_K_Q8_1, "Wrong tile size for MXFP4");
 
 static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
@@ -202,7 +220,12 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q4_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q5_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
+#ifdef BLACKWELL_MMA_AVAILABLE
+        // sm_120 (RTX 5090) has 99KB limit, use smaller tile; sm_100 (B200) has 227KB, use large tile
+        case GGML_TYPE_Q8_0:    return ggml_cuda_is_consumer_blackwell_device() ? MMQ_MMA_TILE_X_K_Q8_0_SM120 : MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL;
+#else
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
+#endif // BLACKWELL_MMA_AVAILABLE
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q2_K:    return MMQ_MMA_TILE_X_K_Q2_K;
@@ -674,6 +697,60 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+#ifdef BLACKWELL_MMA_AVAILABLE
+// Blackwell-optimized Q8_0 load_tiles with 512 K iteration (16 blocks instead of 8)
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0_blackwell(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 4*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD));  // 4x for Blackwell
+
+    // Load quantized data: 16 blocks = 512 Q8_0 values = 128 int32s
+    // Use 32 threads per row, each thread loads one int32 per block group
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI8_0;   // kbx = 0..3 (4 blocks per group)
+    const int kqsx = txi % QI8_0;   // kqsx = 0..7 (8 ints per block)
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
+
+        // Load 4 groups of 4 blocks each (16 blocks total = 512 values)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 0*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD) + txi] = get_int_b2(bxi[0].qs,  kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 1*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD) + txi] = get_int_b2(bxi[4].qs,  kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 2*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD) + txi] = get_int_b2(bxi[8].qs,  kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 3*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD) + txi] = get_int_b2(bxi[12].qs, kqsx);
+    }
+
+    // Load scales: 16 blocks = 16 float scales
+    constexpr int blocks_per_tile_x_row = 4*MMQ_TILE_NE_K / QI8_0;  // 16 blocks
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;  // 32/16 = 2
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbxd;
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + kbxd] = bxi->d;
+    }
+}
+#endif // BLACKWELL_MMA_AVAILABLE
+
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -952,6 +1029,90 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
+
+#ifdef BLACKWELL_MMA_AVAILABLE
+// Blackwell-optimized Q8_0 vec_dot using m16n8k32
+// Each call processes MMQ_TILE_NE_K = 32 int32 elements (128 Q8_0 values)
+// With 4 calls in main loop, processes all 512 Q8_0 values per iteration
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_blackwell(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+
+    typedef tile<16, 8, int> tile_A;
+    typedef tile< 8, 8, int> tile_B;
+    typedef tile<16, 8, int> tile_C;
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = 2 * granularity;
+    constexpr int ntx = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 4*(MMQ_TILE_NE_K + MMQ_Q8_0_PAD);  // 4x for Blackwell 512 K
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
+    float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
+
+    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
+
+    // Load A tiles
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int k0 = k00 + k01;
+            // Pad k0 for x_qs access
+            const int k0_padded = (k00 / MMQ_TILE_NE_K) * (MMQ_TILE_NE_K + MMQ_Q8_0_PAD) + k01;
+
+            load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + k0_padded, MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL);
+        }
+
+#pragma unroll
+        for (int l = 0; l < tile_C::ne/2; ++l) {
+            const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+
+#pragma unroll
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+                const int k0 = k00 + k01;
+
+                dA[n][l][k01/QI8_0] = x_df[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + k0/QI8_0];
+            }
+        }
+    }
+
+    // Compute with m16n8k32 MMA
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            tile_B B;
+            float dB[tile_C::ne/2];
+
+            load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+                dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n][k01/QI8_0], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                }
+            }
+        }
+    }
+}
+#endif // BLACKWELL_MMA_AVAILABLE
 
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_mxfp4_mxfp4_mma(const int * __restrict__ x,
@@ -3195,8 +3356,19 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q5_1> {
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
     static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ;
+#ifdef BLACKWELL_MMA_AVAILABLE
+    // sm_120 (RTX 5090, 99KB): Use standard load/vec_dot due to smaller tiles
+    // sm_100 (B200, 227KB): Use Blackwell-optimized functions with 512K iteration
+    static constexpr load_tiles_mmq_t load_tiles   = ggml_cuda_is_consumer_blackwell_device()
+        ? load_tiles_q8_0<mmq_y, need_check>
+        : load_tiles_q8_0_blackwell<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = ggml_cuda_is_consumer_blackwell_device()
+        ? vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>
+        : vec_dot_q8_0_q8_1_mma_blackwell<mmq_x, mmq_y>;
+#else
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q8_0<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+#endif // BLACKWELL_MMA_AVAILABLE
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
@@ -3204,8 +3376,14 @@ template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
     static constexpr int              vdr          = VDR_MXFP4_Q8_1_MMQ;
 #ifdef BLACKWELL_MMA_AVAILABLE
-    static constexpr load_tiles_mmq_t load_tiles  = load_tiles_mxfp4_fp4<mmq_y, need_check>;
-    static constexpr vec_dot_mmq_t    vec_dot_mma = vec_dot_mxfp4_mxfp4_mma<mmq_x, mmq_y>;
+    // sm_120 (RTX 5090, 99KB): Use standard load/vec_dot due to 256K iteration
+    // sm_100 (B200, 227KB): Use Blackwell-optimized functions with 512K iteration
+    static constexpr load_tiles_mmq_t load_tiles  = ggml_cuda_is_consumer_blackwell_device()
+        ? load_tiles_mxfp4<mmq_y, need_check>
+        : load_tiles_mxfp4_fp4<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma = ggml_cuda_is_consumer_blackwell_device()
+        ? vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>
+        : vec_dot_mxfp4_mxfp4_mma<mmq_x, mmq_y>;
 #else
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp4<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
@@ -3331,8 +3509,27 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
 
     extern __shared__ int data_mul_mat_q[];
-    int * tile_y = data_mul_mat_q + mmq_x;
-    int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+
+    // Determine number of Y buffers
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    // Datacenter Blackwell (sm_100, 227KB): 4 buffers for 2-tile burst pipeline
+    // Consumer Blackwell (sm_120, 99KB): 2 buffers for single-tile pipeline (fits in 99KB)
+    constexpr int n_y_buffers = (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4)
+                                ? (ggml_cuda_is_consumer_blackwell_device() ? 2 : 4)
+                                : 1;
+#else
+    constexpr int n_y_buffers = 1;
+#endif
+
+    // Shared memory layout:
+    // [ids: mmq_x] [tile_y_0...tile_y_n: n_y_buffers * tile_y_size] [tile_x: tile_x_size]
+    constexpr int tile_y_size = GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+
+    int * tile_y_0 = data_mul_mat_q + mmq_x;
+    int * tile_x   = tile_y_0 + n_y_buffers * tile_y_size;
+
+    // tile_y_1 is used in legacy/fallback paths.
+    int * tile_y_1 = (n_y_buffers > 1) ? (tile_y_0 + tile_y_size) : tile_y_0;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
@@ -3343,8 +3540,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    // FP4 tile stores 8 blocks
-    constexpr int ne_block = (type == GGML_TYPE_MXFP4) ? 8 * QK_MXFP4 : 4 * QK8_1;
+    // Datacenter Blackwell (sm_100): 512 K iteration -> 8 blocks MXFP4 / 4 blocks Q8_0
+    // Consumer Blackwell (sm_120): 256 K iteration -> standard block count
+    constexpr int ne_block = (type == GGML_TYPE_MXFP4)
+                             ? (ggml_cuda_is_consumer_blackwell_device() ? 4 * QK_MXFP4 : 8 * QK_MXFP4)
+                             : (ggml_cuda_is_consumer_blackwell_device() ? 4 * QK8_1 : 4 * QK8_1);
 #else
     constexpr int ne_block = 4 * QK8_1;
 #endif  // defined(BLACKWELL_MMA_AVAILABLE)
@@ -3355,40 +3555,187 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int tile_y_elems = mmq_x * MMQ_TILE_Y_K;
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+
+#if defined(BLACKWELL_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+        // Blackwell Q8_0/MXFP4 pipeline:
+        // - sm_100 (B200, 227KB): 4 buffers, 2-tile burst pipeline (Load 2, Compute 2, repeat)
+        // - sm_120 (RTX 5090, 99KB): 2 buffers, simple double-buffering (Load 1, Compute 1)
+        if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4) {
+            const int * y_base = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            const int tid = threadIdx.y * warp_size + threadIdx.x;
+            const int nthreads = nwarps * warp_size;
+
+            constexpr int chunks_per_tile = tile_y_elems / 4;
+
+            if constexpr (n_y_buffers == 4) {
+                // sm_100 (Datacenter Blackwell): 4-buffer, 2-tile burst pipeline
+                int * buf_A[2] = { tile_y_0, tile_y_0 + tile_y_size };
+                int * buf_B[2] = { tile_y_0 + 2*tile_y_size, tile_y_0 + 3*tile_y_size };
+
+                // Stage 1: Load Tile 0 & 1 into Buffer A
+                {
+                    const int * by0 = y_base;
+                    const int * by1 = y_base + ncols_y * sz;
+
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
-            }
-        }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, 0);
-
-        __syncthreads();
-
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
+                        const int offset = c * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_A[0] + offset), by0 + offset);
+                    }
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
+                        const int offset = c * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_A[1] + offset), by1 + offset);
+                    }
+                    cp_async_commit_group();
+                }
 
-                tile_y[l] = by0[l];
+                // Stage 2: Start loading Tile 2 & 3 into Buffer B (Async)
+                {
+                    const int * by2 = y_base + ncols_y * 2 * sz;
+                    const int * by3 = y_base + ncols_y * 3 * sz;
+
+#pragma unroll
+                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
+                        const int offset = c * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_B[0] + offset), by2 + offset);
+                    }
+#pragma unroll
+                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
+                        const int offset = c * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_B[1] + offset), by3 + offset);
+                    }
+                    cp_async_commit_group();
+                }
+
+                cp_async_wait_group<1>();
+                __syncthreads();
+
+                vec_dot(tile_x, buf_A[0], sum, 0);
+                vec_dot(tile_x, buf_A[1], sum, MMQ_TILE_NE_K);
+
+                cp_async_wait_group<0>();
+                __syncthreads();
+
+                vec_dot(tile_x, buf_B[0], sum, 2*MMQ_TILE_NE_K);
+                vec_dot(tile_x, buf_B[1], sum, 3*MMQ_TILE_NE_K);
+
+                __syncthreads();
+            } else {
+                // sm_120 (Consumer Blackwell): 2-buffer, simple double-buffering
+                int * buf_A = tile_y_0;
+                int * buf_B = tile_y_0 + tile_y_size;
+
+                // Load Tile 0 into Buffer A
+                {
+                    const int * by0 = y_base;
+#pragma unroll
+                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
+                        const int offset = c * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_A + offset), by0 + offset);
+                    }
+                    cp_async_commit_group();
+                }
+
+                // Start loading Tile 1 into Buffer B (Async)
+                {
+                    const int * by1 = y_base + ncols_y * sz;
+#pragma unroll
+                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
+                        const int offset = c * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_B + offset), by1 + offset);
+                    }
+                    cp_async_commit_group();
+                }
+
+                // Wait for Tile 0, compute it
+                cp_async_wait_group<1>();
+                __syncthreads();
+                vec_dot(tile_x, buf_A, sum, 0);
+
+                // Wait for Tile 1, compute it
+                cp_async_wait_group<0>();
+                __syncthreads();
+                vec_dot(tile_x, buf_B, sum, MMQ_TILE_NE_K);
+
+                __syncthreads();
             }
+        } else
+#endif // BLACKWELL_MMA_AVAILABLE && CP_ASYNC_AVAILABLE
+        {
+            // Non-Blackwell or non-Q8_0: Original sequential loading path
+            int * tile_y = tile_y_0;
+
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < tile_y_elems; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < tile_y_elems; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+            // MXFP4 on Datacenter Blackwell (sm_100): 2 additional vec_dot calls for 512 K iteration
+            // Consumer Blackwell (sm_120) uses 256K iteration, no extra calls needed
+            if constexpr (type == GGML_TYPE_MXFP4 && !ggml_cuda_is_consumer_blackwell_device()) {
+                {
+                    const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + 2*sz);
+#pragma unroll
+                    for (int l0 = 0; l0 < tile_y_elems; l0 += nwarps * warp_size) {
+                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                        tile_y[l] = by0[l];
+                    }
+                }
+
+                __syncthreads();
+
+                vec_dot(tile_x, tile_y, sum, 2*MMQ_TILE_NE_K);
+
+                __syncthreads();
+
+                {
+                    const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + 3*sz);
+#pragma unroll
+                    for (int l0 = 0; l0 < tile_y_elems; l0 += nwarps * warp_size) {
+                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                        tile_y[l] = by0[l];
+                    }
+                }
+
+                __syncthreads();
+
+                vec_dot(tile_x, tile_y, sum, 3*MMQ_TILE_NE_K);
+
+                __syncthreads();
+            }
+#endif // BLACKWELL_MMA_AVAILABLE
         }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
-
-        __syncthreads();
     }
 
     if (fixup) {
@@ -3755,11 +4102,25 @@ struct mmq_args {
 template<ggml_type type>
 static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
-    const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
+    // For Q8_0 on Blackwell, use architecture-specific tile sizes:
+    // - sm_120 (RTX 5090, 99KB): Use standard tile size
+    // - sm_100 (B200/B100, 227KB): Use larger tile size for 512 K iteration
+    int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
+    if (type == GGML_TYPE_Q8_0 && blackwell_mma_available(cc)) {
+        mmq_tile_x_k = ggml_cuda_is_consumer_blackwell(cc) ? MMQ_MMA_TILE_X_K_Q8_0_SM120 : MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL;
+    }
     const size_t nbs_ids = mmq_x*sizeof(int);
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
-    const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+    const size_t nbs_y_single = GGML_PAD(mmq_x * (sizeof(block_q8_1_mmq)), nwarps*warp_size*sizeof(int));
+    // Blackwell Y buffer count:
+    // - sm_120 (RTX 5090, 99KB): 2 buffers for single-tile pipeline
+    // - sm_100 (B200/B100, 227KB): 4 buffers for 2-tile burst pipeline
+    const bool is_blackwell_type = (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4);
+    const int n_y_buffers = is_blackwell_type && blackwell_mma_available(cc)
+                            ? (ggml_cuda_is_consumer_blackwell(cc) ? 2 : 4)
+                            : 1;
+    const size_t nbs_y = n_y_buffers * nbs_y_single;
+    return nbs_ids + nbs_x + nbs_y;
 }
 
 template <ggml_type type, int mmq_x>
