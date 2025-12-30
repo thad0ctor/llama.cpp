@@ -842,6 +842,48 @@ __device__ __forceinline__ void wgmma_fence() {
     asm volatile("wgmma.fence.sync.aligned;");
 }
 
+#else
+
+__device__ __forceinline__ uint64_t make_smem_desc(
+    const void* smem_ptr, 
+    uint32_t leading_dim_bytes,
+    uint32_t stride_dim_bytes,
+    uint32_t swizzle_bits = 3)
+{
+    GGML_UNUSED(smem_ptr);
+    GGML_UNUSED(leading_dim_bytes);
+    GGML_UNUSED(stride_dim_bytes);
+    GGML_UNUSED(swizzle_bits);
+    NO_DEVICE_CODE;
+    return 0;
+}
+
+__device__ __forceinline__ void wgmma_m64n64k16_f16_f32(
+    float* accum,
+    const half* A_smem,
+    uint64_t B_desc,
+    bool scale_D = true)
+{
+    GGML_UNUSED(accum);
+    GGML_UNUSED(A_smem);
+    GGML_UNUSED(B_desc);
+    GGML_UNUSED(scale_D);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void wgmma_commit_group() {
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void wgmma_wait_group(int n = 0) {
+    GGML_UNUSED(n);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void wgmma_fence() {
+    NO_DEVICE_CODE;
+}
+
 #endif // BLACKWELL_WGMMA_AVAILABLE
 
 } // namespace ggml_cuda_wgmma

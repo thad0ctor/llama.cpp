@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "cp-async.cuh"
+#include "tma.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
 
@@ -74,6 +75,18 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_blackwell(const int DKQ, const int DV, const int ncols) {
+    // For now, use Ampere config as baseline.
+    // TODO: Tune for Blackwell (sm_120) specifically:
+    //   - sm_120 has 128KB shared memory/SM (vs Ampere 100KB) - can use larger tiles
+    //   - 96MB L2 cache (vs 6MB) - consider L2 residency hints for K/V
+    //   - Same 48 warps/SM and 64K registers as Ampere
+    //   - May benefit from larger nbatch_fa with TMA bulk loads
+    //   - Consider cudaFuncAttributePreferredSharedMemoryCarveout tuning
+    //   - Benchmark on RTX 5090 to find optimal tile configurations
+    return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+}
+
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_turing(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  64, 128, 128, 128, 2, true);
@@ -99,6 +112,9 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
+    if (ggml_cuda_has_blackwell_features(cc)) {
+        return ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
+    }
     if (ampere_mma_available(cc)) {
         return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
     }
@@ -110,7 +126,9 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
 }
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
-#if defined(AMPERE_MMA_AVAILABLE)
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    return ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
+#elif defined(AMPERE_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 #elif defined(TURING_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
@@ -199,6 +217,30 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
     GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2);
     return 0;
 #endif // CP_ASYNC_AVAILABLE
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+
+template<int stride_tile, int nwarps, int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma(
+        const char * __restrict__ tensor_maps,
+        const int map_idx,
+        half2 * const __restrict__ tile_KV,
+        uint64_t* __restrict__ mbar,
+        int32_t coord_x,
+        int32_t coord_y) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+    const CUtensorMap* tensor_map = (const CUtensorMap*)(tensor_maps + map_idx * sizeof(CUtensorMap));
+    tma_load_2d(tile_KV, tensor_map, mbar, coord_x, coord_y);
+#else
+    GGML_UNUSED(tensor_maps);
+    GGML_UNUSED(map_idx);
+    GGML_UNUSED(tile_KV);
+    GGML_UNUSED(mbar);
+    GGML_UNUSED(coord_x);
+    GGML_UNUSED(coord_y);
+    NO_DEVICE_CODE;
+#endif
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -365,7 +407,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
-    bool use_logit_softcap, bool mla, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
+    bool use_logit_softcap, bool mla, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check, bool use_tma,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
 static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const float2 * const __restrict__ Q_f2,
@@ -392,7 +434,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_rowsum,
         const int jt,
         const int kb0,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        const char * __restrict__ tensor_maps,
+        uint64_t* __restrict__ mbar_ptr,
+        uint32_t& phase_K,
+        uint32_t& phase_V) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -422,15 +468,38 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(!mla, "multi-stage loading not implemented for MLA");
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi stage loading");
         constexpr bool use_cp_async = true;
-        cp_async_wait_all();
+        if constexpr (use_tma) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+            // Wait for preloaded data (Mask and K)
+            cp_async_wait_all(); // Mask
+            mbarrier_wait(mbar_ptr, phase_K); // K
+            phase_K ^= 1;
+            __syncthreads();
+            
+            // Load V via TMA
+            uint32_t bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+            if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr + 1, bytes_V);
+            flash_attn_ext_f16_load_tile_tma<stride_tile_V, nwarps, nbatch_fa>(tensor_maps, 1, tile_V, mbar_ptr + 1, 0, k_VKQ_0);
+            mbarrier_wait(mbar_ptr + 1, phase_V);
+            phase_V ^= 1;
+#endif
+        } else {
+            cp_async_wait_all();
+        }
         __syncthreads();
-        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-            (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
+        if constexpr (!use_tma) {
+            flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
+        }
     } else {
         constexpr bool use_cp_async = nstages == 1;
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+            if constexpr (use_tma && use_cp_async) {
+                cp_async_wait_all(); // Wait for mask before inner loop
+                __syncthreads();
+            }
         }
     }
 
@@ -441,10 +510,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
-            if (use_cp_async) {
-                cp_async_wait_all();
+            if constexpr (use_tma) {
+                 #ifdef BLACKWELL_TMA_AVAILABLE
+                 uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                 if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+                 #endif
+                 flash_attn_ext_f16_load_tile_tma<stride_tile_K, nwarps, nbatch_fa>(tensor_maps, 0, tile_K, mbar_ptr, k0_start, k_VKQ_0);
+                 #ifdef BLACKWELL_TMA_AVAILABLE
+                 mbarrier_wait(mbar_ptr, phase_K);
+                 phase_K ^= 1;
+                 #endif
+            } else {
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
+                if (use_cp_async) {
+                    cp_async_wait_all();
+                }
             }
             __syncthreads();
         }
@@ -688,17 +769,31 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
     if constexpr (nstages > 1) {
-        // Preload K tile for next iteration:
+        // Preload K/mask tile for next iteration:
         constexpr bool use_cp_async = true;
-        cp_async_wait_all();
-        __syncthreads();
+        
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+        }
+
+        if constexpr (use_tma) {
+             if (!last_iter) {
+                 #ifdef BLACKWELL_TMA_AVAILABLE
+                 uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                 if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+                 #endif
+                 flash_attn_ext_f16_load_tile_tma<stride_tile_K, nwarps, nbatch_fa>(tensor_maps, 0, tile_K, mbar_ptr, 0, k_VKQ_0 + nbatch_fa);
+             }
+        } else {
+            cp_async_wait_all();
+            __syncthreads();
+            if (!last_iter) {
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+            }
         }
     }
 
@@ -717,10 +812,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             if (i0_start < reusable_cutoff) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
-                if (use_cp_async) {
-                    cp_async_wait_all();
+                if constexpr (use_tma) {
+                    #ifdef BLACKWELL_TMA_AVAILABLE
+                    uint32_t bytes_V = nbatch_fa * (i0_diff/2) * sizeof(half2);
+                    if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr + 1, bytes_V);
+                    flash_attn_ext_f16_load_tile_tma<stride_tile_V, nwarps, nbatch_fa>(tensor_maps, 1, tile_V, mbar_ptr + 1, i0_start/2, k_VKQ_0);
+                    mbarrier_wait(mbar_ptr + 1, phase_V);
+                    phase_V ^= 1;
+                    #endif
+                } else {
+                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
+                    if (use_cp_async) {
+                        cp_async_wait_all();
+                    }
                 }
                 __syncthreads();
             }
@@ -805,7 +910,7 @@ template<int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool mla, bool needs_fixup, bool is_fixup>
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool mla, bool needs_fixup, bool is_fixup, bool use_tma>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -827,7 +932,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int stride_mask,
         const int jt,
         const int kb0_start,
-        const int kb0_stop) {
+        const int kb0_stop,
+        const char * __restrict__ tensor_maps) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -867,6 +973,32 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
+
+    // Mbarrier allocation at the end of shared memory
+    uint64_t* mbar_ptr = nullptr;
+    if constexpr (use_tma) {
+        const size_t nbytes_shared_mask_actual = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+        mbar_ptr = (uint64_t*)((char*)tile_mask + nbytes_shared_mask_actual);
+        
+        // Ensure alignment
+        size_t addr = (size_t)mbar_ptr;
+        if (addr % 8 != 0) {
+            mbar_ptr = (uint64_t*)(addr + 8 - (addr % 8));
+        }
+        
+        #ifdef BLACKWELL_TMA_AVAILABLE
+        __syncthreads(); // Ensure tile_mask calculation is done and others are ready
+        if (threadIdx.x == 0) {
+            // Initialize 2 mbarriers with count 1 (for the thread that issues the copy)
+            mbarrier_init(mbar_ptr, 1);     // K mbarrier
+            mbarrier_init(mbar_ptr + 1, 1); // V mbarrier
+        }
+        #endif
+        __syncthreads();
+    }
+    
+    uint32_t phase_K = 0;
+    uint32_t phase_V = 0;
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
@@ -947,12 +1079,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool use_cp_async = true;
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
+        
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-            (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+
+        if constexpr (use_tma) {
+             #ifdef BLACKWELL_TMA_AVAILABLE
+             uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+             if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+             #endif
+             // Load K via TMA
+             flash_attn_ext_f16_load_tile_tma<stride_tile_K, nwarps, nbatch_fa>(tensor_maps, 0, tile_K, mbar_ptr, 0, kb0*nbatch_fa);
+             // No wait here, wait is in iter
+        } else {
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+        }
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -962,41 +1106,39 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check,
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check,
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
-    } else {
+                              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);    } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check,
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check,
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
-    }
+                              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);    }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
     //     there can be a race condition on shared memory access for combining/writing back results.
@@ -1322,7 +1464,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool mla>
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool mla, bool use_tma>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * __restrict__ Q,
@@ -1345,8 +1487,9 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
-#if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE))
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const char * __restrict__ tensor_maps) {
+#if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE))
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256)) {
@@ -1409,14 +1552,14 @@ static __global__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop);
+                 ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop);
+                 ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
         }
 
         kbc += iter_k;
@@ -1453,9 +1596,9 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop);
+         ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -1465,9 +1608,10 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+              tensor_maps);
     NO_DEVICE_CODE;
-#endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE))
+#endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE))
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>
@@ -1499,40 +1643,105 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
+    // Allocate space for 2 mbarriers (K and V) if TMA is used.
+    // mbarrier is 64-bit (8 bytes). 2 * 8 = 16 bytes.
+    // We add a bit more for alignment safety.
+    const size_t nbytes_mbar = 128; 
+
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask) + nbytes_mbar;
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    fattn_kernel_t fattn_kernel;
+    // Handle Blackwell features (TMA)
+    bool use_tma_runtime = ggml_cuda_has_blackwell_features(cc);
+
+    // Verify alignment and strides for TMA
+    if (use_tma_runtime) {
+        const ggml_tensor * K = dst->src[1];
+        if (((uint64_t)K->data % 16 != 0) || (K->nb[1] % 16 != 0) || (K->ne[0] % 2 != 0)) {
+            use_tma_runtime = false;
+        }
+        
+        const ggml_tensor * V = mla ? K : dst->src[2];
+        void* V_ptr = mla ? (char*)K->data + (DKQ - DV) * sizeof(half) : V->data;
+        if (((uint64_t)V_ptr % 16 != 0) || (V->nb[1] % 16 != 0) || (V->ne[0] % 2 != 0)) {
+            use_tma_runtime = false;
+        }
+    }
+    
+    char* tensor_maps_dev_ptr = nullptr;
+    ggml_cuda_pool_alloc<char> tensor_maps_alloc(ctx.pool(id));
+    
+#if CUDART_VERSION >= 12000
+    if (use_tma_runtime) {
+        // Create 2 maps: K and V
+        tensor_maps_alloc.alloc(2 * sizeof(CUtensorMap));
+        tensor_maps_dev_ptr = tensor_maps_alloc.get();
+        
+        CUtensorMap maps[2];
+        memset(maps, 0, sizeof(maps));
+        
+        // K tensor
+        const ggml_tensor * K = dst->src[1];
+        uint64_t K_rows = ggml_nrows(K); // N
+        // Map as (D, N) where D is contiguous.
+        // dim_k (D0) = D (elements) = K->ne[0]/2 (uint32)
+        // dim_n (D1) = N (rows)     = K_rows
+        // stride = K->nb[1] (bytes)
+        
+        // Tile size: (tile_D, tile_N) = (nbatch_K2/2, nbatch_fa)
+        
+        CU_CHECK(ggml_cuda_create_tensor_map_2d(&maps[0], CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, 
+             K->data, K->ne[0]/2, K_rows, K->nb[1], nbatch_K2, nbatch_fa));
+        
+        // V tensor
+        const ggml_tensor * V = mla ? K : dst->src[2]; 
+        void* V_ptr = V->data;
+        if (mla) {
+             V_ptr = (char*)K->data + (DKQ - DV) * sizeof(half);
+        }
+        
+        uint64_t V_rows = ggml_nrows(V);
+        
+        CU_CHECK(ggml_cuda_create_tensor_map_2d(&maps[1], CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+             V_ptr, V->ne[0]/2, V_rows, V->nb[1], nbatch_V2, nbatch_fa)); 
+        
+        cudaMemcpyAsync(tensor_maps_dev_ptr, maps, 2 * sizeof(CUtensorMap), cudaMemcpyHostToDevice, ctx.stream());
+    }
+#endif
+
+    auto launch_kernel = [&](auto kernel_func, bool tma) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+        if (!shared_memory_limit_raised[id]) {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            shared_memory_limit_raised[id] = true;
+        }
+#endif
+        launch_fattn<DV, ncols1, ncols2>(
+            ctx, dst, kernel_func, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, WARP_SIZE,
+            tma ? tensor_maps_dev_ptr : nullptr
+        );
+    };
+
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla>;
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(fattn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+        if (use_tma_runtime) {
+             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, true>, true);
+        } else {
+             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, false>, false);
         }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla>;
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(fattn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+        if (use_tma_runtime) {
+             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, true>, true);
+        } else {
+             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, false>, false);
         }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     }
-
-    launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true);
 }
 
 
