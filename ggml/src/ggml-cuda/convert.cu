@@ -37,7 +37,7 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
 
 template <bool need_check>
 static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+    // sm_86+ always has Pascal+ features
     constexpr int nint = CUDA_Q8_0_NE_ALIGN/sizeof(int) + WARP_SIZE;
 
     const int64_t   i0 = CUDA_Q8_0_NE_ALIGN*blockIdx.x;
@@ -70,10 +70,6 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
 
         y2[iy/2 + threadIdx.x] = __hmul2(make_half2(qs.x, qs.y), __half2half2(d));
     }
-#else
-    GGML_UNUSED_VARS(vx, y, k);
-    NO_DEVICE_CODE;
-#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 }
 
 template<typename dst_t>

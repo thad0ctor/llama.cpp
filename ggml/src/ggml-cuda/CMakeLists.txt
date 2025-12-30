@@ -6,49 +6,14 @@ if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # native == GPUs available at build time
-        # 50     == Maxwell, lowest CUDA 12 standard
-        # 60     == P100, FP16 CUDA intrinsics
-        # 61     == Pascal, __dp4a instruction (per-byte integer dot product)
-        # 70     == V100, FP16 tensor cores
-        # 75     == Turing, int8 tensor cores
-        # 80     == Ampere, asynchronous data loading, faster tensor core instructions
-        # 86     == RTX 3000, needs CUDA v11.1
-        # 89     == RTX 4000, needs CUDA v11.8
+        # Targeting only:
+        # 86     == RTX 3000 (Ampere), needs CUDA v11.1
         # 120    == Blackwell, needs CUDA v12.8, FP4 tensor cores
         #
-        # XX-virtual == compile CUDA code as PTX, do JIT compilation to binary code on first run
-        # XX-real    == compile CUDA code as device code for this specific architecture
-        # no suffix  == compile as both PTX and device code
-        #
-        # The default behavior for a non-native is to build virtual architectures as needed to cover all features needed
-        #     for best performance and to also build real architectures for the most commonly used GPUs.
-        if (GGML_NATIVE AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.6" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-            set(CMAKE_CUDA_ARCHITECTURES "native")
-        else()
-            if (CUDAToolkit_VERSION VERSION_LESS "13")
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 50-virtual 61-virtual 70-virtual)
-            endif ()
-
-            list(APPEND CMAKE_CUDA_ARCHITECTURES 75-virtual 80-virtual 86-real)
-
-            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real)
-            endif()
-
-            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
-                # The CUDA architecture 120f-virtual would in principle work for Blackwell support
-                #     but the newly added "f" suffix conflicted with a preexising regex for validating CUDA architectures in CMake.
-                # So either a recent CMake version or one with the backported fix is needed.
-                # The following versions should work:
-                #   - CMake >= v3.31.8 && CMake < v4.0.0
-                #   - CMake >= v4.0.2
-                # This is NOT documented in the CMake release notes,
-                #     check Modules/Internal/CMakeCUDAArchitecturesValidate.cmake in the CMake git repository instead.
-                # However, the architectures 120a-real and 121a-real should work with basically any CMake version and
-                #     until the release of e.g. Rubin there is no benefit to shipping virtual architectures for Blackwell.
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real 121a-real)
-            endif()
+        # XX-real == compile CUDA code as device code for this specific architecture
+        set(CMAKE_CUDA_ARCHITECTURES "86-real")
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real)
         endif()
     endif()
 
