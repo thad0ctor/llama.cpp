@@ -55,12 +55,74 @@ static inline __host__ CUresult ggml_cuda_create_tensor_map_2d(
     return (CUresult)0;
 #endif // __CUDA_ARCH__
 }
+// Extended version with configurable swizzle parameter.
+// For TMA on Blackwell with large tiles:
+//   - CU_TENSOR_MAP_SWIZZLE_128B requires inner dim <= 128 bytes
+//   - For larger tiles, use CU_TENSOR_MAP_SWIZZLE_NONE which has no size limit
+//   - SWIZZLE_NONE is still faster than cp.async due to hardware bulk transfer
+static inline __host__ CUresult ggml_cuda_create_tensor_map_2d_ex(
+    CUtensorMap* tensor_map,
+    CUtensorMapDataType dtype,
+    void* global_ptr,
+    uint64_t dim_k,
+    uint64_t dim_n,
+    uint64_t stride_n_bytes,
+    uint32_t tile_k,
+    uint32_t tile_n,
+    CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_128B,
+    CUtensorMapL2promotion l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B)
+{
+#ifndef __CUDA_ARCH__
+    const uint64_t dims[2] = {dim_k, dim_n};
+    const uint64_t globalStrides[1] = {stride_n_bytes};
+    const uint32_t tile_dims[2] = {tile_k, tile_n};
+    const uint32_t elem_strides[2] = {1, 1};
+
+    return cuTensorMapEncodeTiled(
+        tensor_map,
+        dtype,
+        2,                              // 2D
+        global_ptr,
+        dims,
+        globalStrides,
+        tile_dims,
+        elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle,
+        l2_promotion,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+#else
+    GGML_UNUSED_VARS(tensor_map, dtype, global_ptr, dim_k, dim_n, stride_n_bytes, tile_k, tile_n, swizzle, l2_promotion);
+    return (CUresult)0;
+#endif // __CUDA_ARCH__
+}
+
+// TMA tile size constants (legacy, kept for template API compatibility).
+// These were used for chunking with SWIZZLE_128B but with SWIZZLE_NONE
+// we can load full tiles in single TMA operations regardless of size.
+static constexpr int TMA_SWIZZLE_128B_MAX_BYTES = 128;
+static constexpr int TMA_HALF2_BYTES = 4;  // sizeof(half2)
+static constexpr int TMA_MAX_HALF2_PER_CHUNK = TMA_SWIZZLE_128B_MAX_BYTES / TMA_HALF2_BYTES;  // 32
+
+// Calculate number of TMA chunks needed for a given nbatch_K2/V2
+static constexpr __host__ __device__ int tma_chunks_needed(const int nbatch_half2) {
+    return (nbatch_half2 + TMA_MAX_HALF2_PER_CHUNK - 1) / TMA_MAX_HALF2_PER_CHUNK;
+}
+
+// Calculate chunk size (half2 elements per chunk)
+static constexpr __host__ __device__ int tma_chunk_size(const int nbatch_half2, const int num_chunks) {
+    // Distribute evenly across chunks
+    return (nbatch_half2 + num_chunks - 1) / num_chunks;
+}
 #endif // CUDART_VERSION >= 12000
 
 #ifdef BLACKWELL_TMA_AVAILABLE
 
 // Async bulk load: global -> shared via tensor map
 // Signals mbarrier when complete
+// Note: shared::cluster is used even for non-clustered kernels (cluster size 1).
+// This is the standard TMA addressing mode on Hopper/Blackwell.
 __device__ __forceinline__ void tma_load_2d(
     void* __restrict__ smem_ptr,
     const CUtensorMap* __restrict__ tensor_map,
@@ -74,7 +136,7 @@ __device__ __forceinline__ void tma_load_2d(
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes "
         "[%0], [%1, {%2, %3}], [%4] ;"
-        : 
+        :
         : "r"(smem_addr), "l"(tmap_addr), "r"(coord_x), "r"(coord_y),
           "l"(mbar_ptr)
         : "memory"

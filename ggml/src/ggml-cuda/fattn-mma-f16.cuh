@@ -67,10 +67,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32, 288, 256, 128, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 4,  32, 288, 256, 128, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  64,  32,  32, 128, 2, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 4,  64,  32,  32, 128, 2, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32,  32,  32, 128, 2, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32,  32,  32, 128, 2, false);
 
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
@@ -256,6 +256,48 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma(
     GGML_UNUSED(tile_KV);
     GGML_UNUSED(mbar);
     GGML_UNUSED(coord_x);
+    GGML_UNUSED(coord_y);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// TMA tile loading for Blackwell.
+// With SWIZZLE_NONE for large tiles (nbatch_K2/V2 > 32), we load the full tile
+// in a single TMA operation. This is faster than cp.async due to hardware bulk
+// transfer, even without automatic bank-conflict-free layout.
+//
+// The tensor map is created with full tile dimensions (nbatch_K2 * 2 or nbatch_V2 * 2
+// half elements), so TMA loads the entire tile at once.
+//
+// Template parameters:
+//   stride_tile: stride between rows in shared memory (half2 elements) - unused for TMA
+//   nwarps: number of warps per block
+//   nbatch_fa: number of rows per tile
+//   nbatch_K2: number of half2 elements per row (K dimension / 2)
+//   num_chunks: legacy parameter, ignored (kept for API compatibility)
+//   chunk_size: legacy parameter, ignored (kept for API compatibility)
+template<int stride_tile, int nwarps, int nbatch_fa, int nbatch_K2, int num_chunks, int chunk_size>
+static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma_chunked(
+        const char * __restrict__ tensor_maps,
+        const int map_idx,
+        half2 * const __restrict__ tile_KV,
+        uint64_t* __restrict__ mbar,
+        int32_t coord_x_base,
+        int32_t coord_y) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+    const CUtensorMap* tensor_map = (const CUtensorMap*)(tensor_maps + map_idx * sizeof(CUtensorMap));
+
+    // Single TMA load for full tile.
+    // coord_x_base is in half2 units from caller, convert to half: * 2
+    // Tensor map has full tile dimensions, so TMA loads the complete tile.
+    int32_t coord_x = coord_x_base * 2;
+    tma_load_2d(tile_KV, tensor_map, mbar, coord_x, coord_y);
+#else
+    GGML_UNUSED(tensor_maps);
+    GGML_UNUSED(map_idx);
+    GGML_UNUSED(tile_KV);
+    GGML_UNUSED(mbar);
+    GGML_UNUSED(coord_x_base);
     GGML_UNUSED(coord_y);
     NO_DEVICE_CODE;
 #endif
@@ -468,11 +510,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2);
 
+    // TMA tile parameters (legacy chunk variables kept for template API compatibility).
+    // With SWIZZLE_NONE for large tiles, we load full tiles in single TMA operations.
+    constexpr int  chunks_K        = tma_chunks_needed(nbatch_K2);
+    constexpr int  chunks_V        = tma_chunks_needed(nbatch_V2);
+    constexpr int  chunk_size_K    = (nbatch_K2 + chunks_K - 1) / chunks_K;
+    constexpr int  chunk_size_V    = (nbatch_V2 + chunks_V - 1) / chunks_V;
+    (void)chunk_size_V;  // May be unused in some template instantiations
+
     constexpr int stride_tile_Q = DKQ/2     + 4;
-    constexpr int stride_tile_K = nbatch_K2 + 4;
+    // TMA writes compactly without padding. Use compact stride when TMA is enabled.
+    // Without TMA (cp.async), use +4 padding for bank conflict avoidance.
+    constexpr int stride_tile_K = use_tma ? nbatch_K2 : nbatch_K2 + 4;
 
     static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
-    constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
+    // For TMA: V uses its own compact stride (nbatch_V2) since V overwrites K's memory
+    // after K is processed. For non-TMA MLA: V shares K's stride for memory layout.
+    constexpr int stride_tile_V = use_tma ? nbatch_V2 : (mla ? stride_tile_K : nbatch_V2 + 4);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(TURING_MMA_AVAILABLE)
@@ -483,23 +537,30 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
-        static_assert(!mla, "multi-stage loading not implemented for MLA");
-        static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi stage loading");
         constexpr bool use_cp_async = true;
         if constexpr (use_tma) {
 #ifdef BLACKWELL_TMA_AVAILABLE
-            // Wait for preloaded data (Mask and K)
+            // Wait for preloaded data (Mask)
             cp_async_wait_all(); // Mask
-            mbarrier_wait(mbar_ptr, phase_K); // K
-            phase_K ^= 1;
+            
+            // For MLA, K is processed in chunks in the loop, so we wait there.
+            // For non-MLA, we wait here for K.
+            if (!mla) {
+                mbarrier_wait(mbar_ptr, phase_K); // K
+                phase_K ^= 1;
+            }
             __syncthreads();
             
             // Load V via TMA
-            uint32_t bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
-            if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr + 1, bytes_V);
-            flash_attn_ext_f16_load_tile_tma<stride_tile_V, nwarps, nbatch_fa>(tensor_maps, 1, tile_V, mbar_ptr + 1, 0, k_VKQ_0);
-            mbarrier_wait(mbar_ptr + 1, phase_V);
-            phase_V ^= 1;
+            if (!mla) {
+                uint32_t bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+                if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr + 1, bytes_V);
+                // V tensor map is at index 1
+                flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_V, nwarps, nbatch_fa, nbatch_V2, chunks_V, chunk_size_V>(
+                    tensor_maps, 1, tile_V, mbar_ptr + 1, 0, k_VKQ_0);
+                mbarrier_wait(mbar_ptr + 1, phase_V);
+                phase_V ^= 1;
+            }
 #endif
         } else {
             cp_async_wait_all();
@@ -521,19 +582,31 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
+    int k_buf = 0; // 0 or 1 for double buffering
+
 #pragma unroll
     for (int k0_start = 0; k0_start < DKQ/2; k0_start += nbatch_K2) {
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
         const int k0_diff = k0_stop - k0_start;
 
+        half2 * current_tile_K = tile_K;
+        if constexpr (nstages > 1 && use_tma && mla) {
+            // For MLA pipelining, we use tile_K (buf 0) and tile_V (buf 1, effectively K[1])
+            current_tile_K = k_buf == 0 ? tile_K : tile_V;
+        }
+
         if constexpr (nstages <= 1) {
             constexpr bool use_cp_async = nstages == 1;
             if constexpr (use_tma) {
                  #ifdef BLACKWELL_TMA_AVAILABLE
+                 // Load K via TMA (full tile with SWIZZLE_NONE for large tiles)
+                 // All chunks signal same mbarrier with aggregate byte count
                  uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
                  if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
                  #endif
-                 flash_attn_ext_f16_load_tile_tma<stride_tile_K, nwarps, nbatch_fa>(tensor_maps, 0, tile_K, mbar_ptr, k0_start, k_VKQ_0);
+                 // K chunks start at map index 0
+                 flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                     tensor_maps, 0, tile_K, mbar_ptr, k0_start, k_VKQ_0);
                  #ifdef BLACKWELL_TMA_AVAILABLE
                  mbarrier_wait(mbar_ptr, phase_K);
                  phase_K ^= 1;
@@ -546,6 +619,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
             }
             __syncthreads();
+        } else if constexpr (use_tma && mla) {
+            #ifdef BLACKWELL_TMA_AVAILABLE
+            // MLA Pipelining:
+            // 1. Wait for current buffer (issued in previous iter or preload)
+            uint64_t* mbar = k_buf == 0 ? mbar_ptr : (mbar_ptr + 1);
+            uint32_t& phase = k_buf == 0 ? phase_K : phase_V;
+            
+            mbarrier_wait(mbar, phase);
+            phase ^= 1;
+
+            // 2. Issue load for next buffer
+            if (k0_start + nbatch_K2 < DKQ/2) {
+                int next_k_buf = k_buf ^ 1;
+                half2* next_tile_K = next_k_buf == 0 ? tile_K : tile_V;
+                uint64_t* next_mbar = next_k_buf == 0 ? mbar_ptr : (mbar_ptr + 1);
+                
+                uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                if (threadIdx.x == 0) mbarrier_arrive_expect_tx(next_mbar, bytes_K);
+                
+                flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                     tensor_maps, 0, next_tile_K, next_mbar, k0_start + nbatch_K2, k_VKQ_0);
+            }
+            #endif
         }
 
         // Calculate tile of KQ:
@@ -556,7 +652,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
                     T_A_KQ K_A;
-                    load_ldmatrix(K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                    load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
                     if constexpr (cols_per_warp == 8) {
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
                     } else {
@@ -576,7 +672,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i_KQ_0 = i_KQ_00 + (threadIdx.y % np)*T_A_KQ::I;
 
                     T_A_KQ K_A;
-                    load_ldmatrix(K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                    load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
 
                     // Wide version of KQ_C is column-major => swap A and B.
                     mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
@@ -586,6 +682,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             __syncthreads(); // Only needed if tile_K == tile_V.
+        } else if constexpr (use_tma && mla) {
+            k_buf ^= 1;
         }
     }
 
@@ -798,12 +896,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 
         if constexpr (use_tma) {
-             if (!last_iter) {
+             if (!last_iter && !mla) { // Only for non-MLA here
                  #ifdef BLACKWELL_TMA_AVAILABLE
+                 // Preload K for next iteration via TMA (full tile)
                  uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
                  if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
                  #endif
-                 flash_attn_ext_f16_load_tile_tma<stride_tile_K, nwarps, nbatch_fa>(tensor_maps, 0, tile_K, mbar_ptr, 0, k_VKQ_0 + nbatch_fa);
+                 flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                     tensor_maps, 0, tile_K, mbar_ptr, 0, k_VKQ_0 + nbatch_fa);
              }
         } else {
             cp_async_wait_all();
@@ -818,23 +918,47 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     // For MLA K and V have the same data.
     // Therefore, iterate over V in reverse and re-use the data if possible.
-    static_assert(!mla || nstages <= 1, "combination of MLA and multi-stage loading not implemented");
     constexpr int reusable_cutoff = mla ? (DKQ - 1) - (DKQ - 1) % (2*nbatch_K2) - (DKQ - DV) : DV;
+
+    // MLA V-loop pipelining
+    int v_buf = 0; 
+#ifndef BLACKWELL_TMA_AVAILABLE
+    GGML_UNUSED(v_buf);
+#endif
+ 
+    // If MLA, we haven't loaded any V yet. We must issue the first V load here if we want to pipeline.
+    if constexpr (mla && use_tma && nstages > 1) {
+        #ifdef BLACKWELL_TMA_AVAILABLE
+        int i0_first = DV - 2*nbatch_V2 > 0 ? DV - 2*nbatch_V2 : 0; // The first iter i0_start
+        if (i0_first < reusable_cutoff) {
+             uint32_t bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+             if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr + 1, bytes_V);
+             flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_V, nwarps, nbatch_fa, nbatch_V2, chunks_V, chunk_size_V>(
+                 tensor_maps, 1, tile_V, mbar_ptr + 1, i0_first/2, k_VKQ_0);
+        }
+        #endif
+    }
 
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll
     for (int i0_stop = DV; i0_stop > 0; i0_stop -= 2*nbatch_V2) {
         const int i0_start = i0_stop - 2*nbatch_V2 > 0 ? i0_stop - 2*nbatch_V2 : 0;
         const int i0_diff  = i0_stop - i0_start;
+        
+        const half2 * tile_V_i = tile_V;
 
         if constexpr (nstages <= 1) {
             if (i0_start < reusable_cutoff) {
                 constexpr bool use_cp_async = nstages == 1;
                 if constexpr (use_tma) {
                     #ifdef BLACKWELL_TMA_AVAILABLE
+                    // Load V via TMA (full tile with SWIZZLE_NONE for large tiles)
+                    // Note: For common configs, i0_diff == 2*nbatch_V2, so we load full tile
                     uint32_t bytes_V = nbatch_fa * (i0_diff/2) * sizeof(half2);
                     if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr + 1, bytes_V);
-                    flash_attn_ext_f16_load_tile_tma<stride_tile_V, nwarps, nbatch_fa>(tensor_maps, 1, tile_V, mbar_ptr + 1, i0_start/2, k_VKQ_0);
+                    // V tensor map is at index 1
+                    flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_V, nwarps, nbatch_fa, nbatch_V2, chunks_V, chunk_size_V>(
+                        tensor_maps, 1, tile_V, mbar_ptr + 1, i0_start/2, k_VKQ_0);
                     mbarrier_wait(mbar_ptr + 1, phase_V);
                     phase_V ^= 1;
                     #endif
@@ -847,8 +971,40 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
                 __syncthreads();
             }
+            tile_V_i = i0_start < reusable_cutoff ? tile_V : tile_V + (i0_start - reusable_cutoff)/2;
+        } else if constexpr (mla && use_tma) {
+             #ifdef BLACKWELL_TMA_AVAILABLE
+             // Pipelined V loop
+             if (i0_start < reusable_cutoff) {
+                 uint64_t* mbar = v_buf == 0 ? (mbar_ptr + 1) : mbar_ptr; // buf0 -> mbar_V, buf1 -> mbar_K
+                 uint32_t& phase = v_buf == 0 ? phase_V : phase_K;
+                 
+                 mbarrier_wait(mbar, phase);
+                 phase ^= 1;
+                 
+                 tile_V_i = v_buf == 0 ? tile_V : tile_K; 
+                 
+                 // Issue next load
+                 int i0_next_stop = i0_stop - 2*nbatch_V2;
+                 if (i0_next_stop > 0) {
+                     int i0_next_start = i0_next_stop - 2*nbatch_V2 > 0 ? i0_next_stop - 2*nbatch_V2 : 0;
+                     if (i0_next_start < reusable_cutoff) {
+                         int next_v_buf = v_buf ^ 1;
+                         half2* next_tile_V = next_v_buf == 0 ? tile_V : tile_K;
+                         uint64_t* next_mbar = next_v_buf == 0 ? (mbar_ptr + 1) : mbar_ptr;
+                         
+                         uint32_t bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+                         if (threadIdx.x == 0) mbarrier_arrive_expect_tx(next_mbar, bytes_V);
+                         
+                         flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_V, nwarps, nbatch_fa, nbatch_V2, chunks_V, chunk_size_V>(
+                             tensor_maps, 1, next_tile_V, next_mbar, i0_next_start/2, k_VKQ_0);
+                     }
+                 }
+                 
+                 v_buf ^= 1;
+             }
+             #endif
         }
-        const half2 * tile_V_i = i0_start < reusable_cutoff ? tile_V : tile_V + (i0_start - reusable_cutoff)/2;
 
 #if defined(TURING_MMA_AVAILABLE)
         constexpr int i0_stride = cols_per_warp == 8 ? T_C_VKQ::I : 2*T_C_VKQ::J;
@@ -888,6 +1044,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             __syncthreads(); // Only needed if tile_K == tile_V.
+        }
+    }
+
+    if constexpr (nstages > 1 && mla) {
+        // Preload K for next iteration:
+        if constexpr (use_tma) {
+             if (!last_iter) {
+                 #ifdef BLACKWELL_TMA_AVAILABLE
+                 // Preload K for next iteration via TMA (full tile)
+                 // This is issued after V loop, so V loop is done with tile_K/tile_V.
+                 // We must ensure all threads have finished reading from SHMEM before we issue TMA write to that SHMEM.
+                 __syncthreads(); 
+                 
+                 uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                 if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+                 
+                 flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                     tensor_maps, 0, tile_K, mbar_ptr, 0, k_VKQ_0 + nbatch_fa);
+                 #endif
+             }
         }
     }
 #else
@@ -973,6 +1149,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2);
 
+    // TMA tile parameters (legacy chunk variables kept for template API compatibility).
+    // With SWIZZLE_NONE for large tiles, we load full tiles in single TMA operations.
+    constexpr int  chunks_K        = tma_chunks_needed(nbatch_K2);
+    constexpr int  chunks_V        = tma_chunks_needed(nbatch_V2);
+    constexpr int  chunk_size_K    = (nbatch_K2 + chunks_K - 1) / chunks_K;
+    constexpr int  chunk_size_V    = (nbatch_V2 + chunks_V - 1) / chunks_V;
+    (void)chunk_size_V;  // May be unused in some template instantiations
+
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
         return;
@@ -981,10 +1165,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     static_assert(nwarps * (cols_per_warp/ncols2) % ncols1 == 0, "bad nwarps");
 
     constexpr int stride_tile_Q = DKQ/2     + 4;
-    constexpr int stride_tile_K = nbatch_K2 + 4;
+    // TMA writes compactly without padding. Use compact stride when TMA is enabled.
+    // Without TMA (cp.async), use +4 padding for bank conflict avoidance.
+    constexpr int stride_tile_K = use_tma ? nbatch_K2 : nbatch_K2 + 4;
 
     static_assert(!mla || nbatch_K2 >= nbatch_V2, "bad nbatch_K2, nbatch_V2 for MLA");
-    constexpr int stride_tile_V = mla ? stride_tile_K : nbatch_V2 + 4;
+    // For TMA: V uses its own compact stride (nbatch_V2) since V overwrites K's memory
+    // after K is processed. For non-TMA MLA: V shares K's stride for memory layout.
+    constexpr int stride_tile_V = use_tma ? nbatch_V2 : (mla ? stride_tile_K : nbatch_V2 + 4);
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
 
     extern __shared__ half2 tile_Q[];
@@ -1093,7 +1281,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
-        static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
+        // static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline"); // Removed
         constexpr bool use_cp_async = true;
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
@@ -1105,11 +1293,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         if constexpr (use_tma) {
              #ifdef BLACKWELL_TMA_AVAILABLE
+             // Load K via TMA (full tile with SWIZZLE_NONE for large tiles)
              uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
              if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
              #endif
-             // Load K via TMA
-             flash_attn_ext_f16_load_tile_tma<stride_tile_K, nwarps, nbatch_fa>(tensor_maps, 0, tile_K, mbar_ptr, 0, kb0*nbatch_fa);
+             // K chunks start at map index 0
+             flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                 tensor_maps, 0, tile_K, mbar_ptr, 0, kb0*nbatch_fa);
              // No wait here, wait is in iter
         } else {
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -1692,41 +1882,74 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     
     char* tensor_maps_dev_ptr = nullptr;
     ggml_cuda_pool_alloc<char> tensor_maps_alloc(ctx.pool(id));
-    
+
 #if CUDART_VERSION >= 12000
+    // TMA with ldmatrix requires SWIZZLE_128B for correct shared memory layout.
+    // SWIZZLE_128B requires inner dimension <= 128 bytes = 64 half = 32 half2.
+    // For larger tiles, we must fall back to cp.async (no TMA).
+    // Note: SWIZZLE_NONE would allow larger tiles but produces row-major layout
+    // that is incompatible with ldmatrix, causing incorrect matrix loads.
+    const bool tma_tile_compatible = (nbatch_K2 <= 32) && (nbatch_V2 <= 32);
+
+    if (!tma_tile_compatible) {
+        use_tma_runtime = false;  // Fall back to cp.async for large tiles
+    }
+
     if (use_tma_runtime) {
-        // Create 2 maps: K and V
+        // Create 2 tensor maps: one for K, one for V
+        // Using SWIZZLE_128B for ldmatrix compatibility
         tensor_maps_alloc.alloc(2 * sizeof(CUtensorMap));
         tensor_maps_dev_ptr = tensor_maps_alloc.get();
-        
+
         CUtensorMap maps[2];
         memset(maps, 0, sizeof(maps));
-        
-        // K tensor
+
+        // K tensor map
         const ggml_tensor * K = dst->src[1];
-        uint64_t K_rows = ggml_nrows(K); // N
-        // Map as (D, N) where D is contiguous.
-        // dim_k (D0) = D (elements) = K->ne[0]/2 (uint32)
-        // dim_n (D1) = N (rows)     = K_rows
-        // stride = K->nb[1] (bytes)
-        
-        // Tile size: (tile_D, tile_N) = (nbatch_K2/2, nbatch_fa)
-        
-        CU_CHECK(ggml_cuda_create_tensor_map_2d(&maps[0], CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, 
-             K->data, K->ne[0]/2, K_rows, K->nb[1], nbatch_K2, nbatch_fa));
-        
-        // V tensor
-        const ggml_tensor * V = mla ? K : dst->src[2]; 
+        uint64_t K_rows = ggml_nrows(K);
+
+        // tile_k = nbatch_K2 * 2 half elements (must be <= 64 for SWIZZLE_128B)
+        const uint32_t tile_k_half = nbatch_K2 * 2;
+
+        CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
+            &maps[0],
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+            K->data,
+            K->ne[0],           // Full K dimension in half elements
+            K_rows,             // Number of rows (N)
+            K->nb[1],           // Stride in bytes between rows
+            tile_k_half,        // Tile size in K dimension (half elements)
+            nbatch_fa,          // Tile size in N dimension (rows)
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B));
+
+        // V tensor map
+        const ggml_tensor * V = mla ? K : dst->src[2];
         void* V_ptr = V->data;
         if (mla) {
-             V_ptr = (char*)K->data + (DKQ - DV) * sizeof(half);
+            V_ptr = (char*)K->data + (DKQ - DV) * sizeof(half);
         }
-        
+
         uint64_t V_rows = ggml_nrows(V);
-        
-        CU_CHECK(ggml_cuda_create_tensor_map_2d(&maps[1], CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-             V_ptr, V->ne[0]/2, V_rows, V->nb[1], nbatch_V2, nbatch_fa)); 
-        
+        const uint32_t tile_v_half = nbatch_V2 * 2;
+
+        // For MLA, V_ptr is offset into K by (DKQ - DV) elements, so the valid
+        // dimension from V_ptr is DV, not K->ne[0]. Using K->ne[0] would cause
+        // TMA to compute incorrect memory bounds.
+        const uint64_t V_dim_k = mla ? DV : V->ne[0];
+
+        CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
+            &maps[1],
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+            V_ptr,
+            V_dim_k,            // Correct V dimension (DV for MLA)
+            V_rows,             // Number of rows
+            V->nb[1],           // Stride in bytes
+            tile_v_half,        // Tile size (half elements)
+            nbatch_fa,          // Rows per tile
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B));
+
         cudaMemcpyAsync(tensor_maps_dev_ptr, maps, 2 * sizeof(CUtensorMap), cudaMemcpyHostToDevice, ctx.stream());
     }
 #endif
