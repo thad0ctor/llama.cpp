@@ -196,8 +196,6 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t i02 = i2;
     const int64_t i03 = i3;
 
-    const float4 * x4 = (const float4 *) x;
-
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
     const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
@@ -205,7 +203,16 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi;
+    if (i0 < ne00) {
+        const int64_t base_idx = i03*s03 + i02*s02 + i01*s01 + i00;
+        xi.x = x[base_idx + 0];
+        xi.y = x[base_idx + 1];
+        xi.z = x[base_idx + 2];
+        xi.w = x[base_idx + 3];
+    } else {
+        xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));

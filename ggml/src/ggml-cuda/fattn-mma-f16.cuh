@@ -79,15 +79,24 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_blackwell(const int DKQ, const int DV, const int ncols) {
     // Blackwell sm_120 (RTX 5090) optimized configurations.
     // Warp Specialization: 1 Producer + 7 Consumers (256 threads)
-    
+
     if (DKQ == 576 && DV == 512) {
         // MLA configuration (576 = 64*9, 512 = 64*8)
         // nbatch_K2/V2 = 64 half2 = 128 elements.
         return fattn_mma_config(256, 2, 128, 64, 64, 32, 3, true, 7);
     }
-    
+
     // Default fallback to Ampere for other shapes
+    // Standard attention Blackwell support requires careful tuning of nbatch_fa/nwarps
+    // to satisfy divisibility constraints in flash_attn_ext_f16_iter
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+}
+
+// Compile-time check for native Blackwell support (not falling back to Ampere)
+// Currently only MLA is supported; standard attention requires careful tuning
+static constexpr __host__ __device__ bool ggml_cuda_fattn_has_blackwell_config(const int DKQ, const int DV, const int ncols) {
+    (void)ncols;  // ncols checked at runtime via config.num_consumers
+    return (DKQ == 576 && DV == 512);  // MLA only for now
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_turing(const int DKQ, const int DV, const int ncols) {
@@ -296,11 +305,12 @@ static __device__ __forceinline__ void load_tile_tma_multistrip(
         uint32_t bytes = nbatch_fa * nbatch_K2 * sizeof(half2);
         mbarrier_arrive_expect_tx(mbar, bytes);
     }
-    if (nbatch_K2 <= 64) {
+    constexpr int STRIP_H2 = 32; // 64 elements = 128 bytes. Matches SWIZZLE_128B.
+    if (nbatch_K2 <= STRIP_H2) {
         tma_load_2d(smem_buffer, tensor_map, mbar, coord_x_base_h2 * 2, coord_y);
     } else {
-        constexpr int STRIP = 64; 
-        for (int s = 0; s < nbatch_K2; s += STRIP) {
+        #pragma unroll
+        for (int s = 0; s < nbatch_K2; s += STRIP_H2) {
             tma_load_2d(smem_buffer + s * nbatch_fa, tensor_map, mbar, (coord_x_base_h2 + s) * 2, coord_y);
         }
     }
@@ -2023,6 +2033,12 @@ __global__ void flash_attn_ext_f16_blackwell(
          const int kb0_start_idx = 0;
          const int kb0_stop_idx = iter_k; // Simplification: assume block handles full seq or large chunk
 
+         const int stride_Q1   = nb01 / sizeof(float2);
+         const int stride_Q2   = nb02 / sizeof(float2);
+         const int stride_K    = nb11 / sizeof(half2);
+         const int stride_mask = nb31 / sizeof(half);
+         const int stride_V    = mla ? stride_K : nb21 / sizeof(half2);
+
          if (threadIdx.y == 0) {
              // Producer
              fattn_producer_loop<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
@@ -2035,7 +2051,7 @@ __global__ void flash_attn_ext_f16_blackwell(
              // Reuse process_tile to call iter
              flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
                  Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                  ne01, ne02, ne11, 0, 0, 0, 0, 0, jt, kb0_start, kb0_stop, tensor_maps);
+                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
          }
          
          kbc += iter_k;
@@ -2173,14 +2189,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     }
 #endif
 
-    // Update Shared Memory Calculation for Blackwell (MLA only)
+    // Update Shared Memory Calculation for Blackwell
     // Only apply larger shared memory when we'll actually use the Blackwell kernel
-    if constexpr (mla) {
-        if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime) {
-             constexpr int stage_size = 128 * (64+64) * sizeof(half2); // 32KB
-             // 3 stages = 96KB + State. Fits in 99KB.
-             nbytes_shared_total = 3 * stage_size + sizeof(fattn_pipeline_state) + 128;
-        }
+    const auto config_bw = ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
+    if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime && config_bw.num_consumers > 0) {
+        size_t stage_size = config_bw.nbatch_fa * (config_bw.nbatch_K2 + config_bw.nbatch_V2) * sizeof(half2);
+        nbytes_shared_total = config_bw.nstages_target * stage_size + sizeof(fattn_pipeline_state) + 128;
     }
 
     auto launch_kernel = [&](auto kernel_func, bool tma) {
@@ -2209,10 +2223,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     bool use_logit_softcap_kernel = (logit_softcap != 0.0f);
 
-    // Blackwell kernel only supports MLA (DKQ=576, DV=512) configurations.
-    // Use if constexpr to avoid instantiating the template for unsupported configs.
-    if constexpr (mla) {
-        if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime) {
+    // Blackwell kernel optimized for sm_120+ with Warp Specialization and TMA
+    // Use if constexpr to prevent template instantiation for unsupported DKQ/DV/ncols combinations
+    if constexpr (ggml_cuda_fattn_has_blackwell_config(DKQ, DV, ncols)) {
+        if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime && config_bw.num_consumers > 0) {
             if (use_logit_softcap_kernel) {
                  launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, true>, true);
             } else {
