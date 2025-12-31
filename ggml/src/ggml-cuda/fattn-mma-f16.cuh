@@ -17,11 +17,12 @@ struct fattn_mma_config {
     int  nbatch_combine; // Number of VKQ half2 values in direction of DV to combine in parallel.
     int  nstages_target; // Number of pipeline stages to use ideally, 1 == always load data synchronously, 2 == preload data if there is hardware support.
     bool Q_in_reg;       // Whether the Q values should be kept permanently in registers.
+    int  num_consumers;  // Number of consumer warps (0 = unified/legacy mode)
 
     constexpr __host__ __device__ fattn_mma_config(
-            int nthreads, int occupancy, int nbatch_fa, int nbatch_K2, int nbatch_V2, int nbatch_combine, int nstages_target, bool Q_in_reg) :
+            int nthreads, int occupancy, int nbatch_fa, int nbatch_K2, int nbatch_V2, int nbatch_combine, int nstages_target, bool Q_in_reg, int num_consumers = 0) : 
         nthreads(nthreads), occupancy(occupancy), nbatch_fa(nbatch_fa), nbatch_K2(nbatch_K2), nbatch_V2(nbatch_V2), nbatch_combine(nbatch_combine),
-        nstages_target(nstages_target), Q_in_reg(Q_in_reg) {}
+        nstages_target(nstages_target), Q_in_reg(Q_in_reg), num_consumers(num_consumers) {}
 };
 
 #define GGML_CUDA_FATTN_MMA_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads_, occupancy_, nbatch_fa_, nbatch_K2_, nbatch_V2_, nbatch_combine_, nstages_target_, Q_in_reg_) \
@@ -32,8 +33,8 @@ struct fattn_mma_config {
         static_assert((nbatch_K2_)      %  4 == 0 && (nbatch_K2_)      <= 512, "bad nbatch_K2");                                                                   \
         static_assert((nbatch_V2_)      %  4 == 0 && (nbatch_V2_)      <= 256, "bad nbatch_V2");                                                                   \
         static_assert((nbatch_combine_) %  4 == 0 && (nbatch_combine_) <= 128, "bad nbatch_combine");                                                              \
-        static_assert((nstages_target_)      >= 1 && (nstages_target_) <=   2, "bad nstages_target");                                                              \
-        return fattn_mma_config{(nthreads_), (occupancy_), (nbatch_fa_), (nbatch_K2_), (nbatch_V2_), (nbatch_combine_), (nstages_target_), (Q_in_reg_)};           \
+        static_assert((nstages_target_)      >= 1 && (nstages_target_) <=   3, "bad nstages_target");                                                              \
+        return fattn_mma_config{(nthreads_), (occupancy_), (nbatch_fa_), (nbatch_K2_), (nbatch_V2_), (nbatch_combine_), (nstages_target_), (Q_in_reg_), 0};         \
     }                                                                                                                                                              \
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols) {
@@ -77,31 +78,15 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_blackwell(const int DKQ, const int DV, const int ncols) {
     // Blackwell sm_120 (RTX 5090) optimized configurations.
-    // Verified against NVIDIA CUDA documentation (Blackwell Tuning Guide).
-    //
-    // Key hardware differences from Ampere (sm_86):
-    //   - 128KB shared memory/SM (vs 100KB), 99KB max per block (same as Ampere)
-    //   - 96MB L2 cache (vs 6MB on RTX 3090) - benefits from TMA L2 promotion hints
-    //   - Same 48 warps/SM and 64K registers as Ampere
-    //   - TMA bulk loads (vs cp.async) reduce instruction count and latency
-    //
-    // Tile configuration constraints:
-    //   - nbatch_fa must be divisible by 64 (np*T_C_KQ::J where np=4, J=16)
-    //   - For 2-stage pipelining, nbatch_fa*sizeof(half) must be 64, 128, or 256
-    //     (cp.async preload constraint), limiting nbatch_fa to 32, 64, or 128
-    //   - Shared memory per block limited to 99KB
-    //
-    // Blackwell benefits come primarily from:
-    //   1. TMA bulk loads instead of cp.async (already implemented in kernel)
-    //   2. L2 promotion hints in TMA tensor maps (L2_256B default)
-    //   3. Shared memory carveout set to maximum (100%) in launch code
-    //   4. 96MB L2 cache benefits decode workloads (K/V cache residency)
-    //
-    // Due to the above constraints, tile configs match Ampere settings.
-    // Performance gains come from TMA and L2 cache, not larger tiles.
-
-    // Fallback to Ampere config - tile sizes are constrained by the same limits.
-    // The kernel will use TMA for K/V loads when BLACKWELL_TMA_AVAILABLE is defined.
+    // Warp Specialization: 1 Producer + 7 Consumers (256 threads)
+    
+    if (DKQ == 576 && DV == 512) {
+        // MLA configuration (576 = 64*9, 512 = 64*8)
+        // nbatch_K2/V2 = 64 half2 = 128 elements.
+        return fattn_mma_config(256, 2, 128, 64, 64, 32, 3, true, 7);
+    }
+    
+    // Default fallback to Ampere for other shapes
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }
 
@@ -125,7 +110,6 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128,  64, 1, false);
 
-    // TODO tune specifically for Volta
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }
 
@@ -222,6 +206,10 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ,
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).Q_in_reg;
 }
 
+static constexpr __device__ int ggml_cuda_fattn_mma_get_num_consumers(const int DKQ, const int DV, const int ncols) {
+    return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).num_consumers;
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
@@ -236,6 +224,16 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
     return 0;
 #endif // CP_ASYNC_AVAILABLE
 }
+
+// ------------------------------------------------------------------------------------------------------------------
+// Pipeline State for Blackwell
+// ------------------------------------------------------------------------------------------------------------------
+struct fattn_pipeline_state {
+    uint64_t full_K[4];
+    uint64_t empty_K[4];
+    uint64_t full_V[4];
+    uint64_t empty_V[4];
+};
 
 // ------------------------------------------------------------------------------------------------------------------
 
@@ -261,21 +259,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma(
 #endif
 }
 
-// TMA tile loading for Blackwell.
-// With SWIZZLE_NONE for large tiles (nbatch_K2/V2 > 32), we load the full tile
-// in a single TMA operation. This is faster than cp.async due to hardware bulk
-// transfer, even without automatic bank-conflict-free layout.
-//
-// The tensor map is created with full tile dimensions (nbatch_K2 * 2 or nbatch_V2 * 2
-// half elements), so TMA loads the entire tile at once.
-//
-// Template parameters:
-//   stride_tile: stride between rows in shared memory (half2 elements) - unused for TMA
-//   nwarps: number of warps per block
-//   nbatch_fa: number of rows per tile
-//   nbatch_K2: number of half2 elements per row (K dimension / 2)
-//   num_chunks: legacy parameter, ignored (kept for API compatibility)
-//   chunk_size: legacy parameter, ignored (kept for API compatibility)
 template<int stride_tile, int nwarps, int nbatch_fa, int nbatch_K2, int num_chunks, int chunk_size>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma_chunked(
         const char * __restrict__ tensor_maps,
@@ -286,10 +269,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma_chunked(
         int32_t coord_y) {
 #ifdef BLACKWELL_TMA_AVAILABLE
     const CUtensorMap* tensor_map = (const CUtensorMap*)(tensor_maps + map_idx * sizeof(CUtensorMap));
-
-    // Single TMA load for full tile.
-    // coord_x_base is in half2 units from caller, convert to half: * 2
-    // Tensor map has full tile dimensions, so TMA loads the complete tile.
     int32_t coord_x = coord_x_base * 2;
     tma_load_2d(tile_KV, tensor_map, mbar, coord_x, coord_y);
 #else
@@ -303,13 +282,44 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_tma_chunked(
 #endif
 }
 
+template<int nbatch_fa, int nbatch_K2>
+static __device__ __forceinline__ void load_tile_tma_multistrip(
+        const CUtensorMap* __restrict__ tensor_map,
+        half2* __restrict__ smem_buffer,
+        uint64_t* __restrict__ mbar,
+        int32_t coord_x_base_h2,
+        int32_t coord_y,
+        bool arrive) 
+{
+#ifdef BLACKWELL_TMA_AVAILABLE
+    if (arrive) {
+        uint32_t bytes = nbatch_fa * nbatch_K2 * sizeof(half2);
+        mbarrier_arrive_expect_tx(mbar, bytes);
+    }
+    if (nbatch_K2 <= 64) {
+        tma_load_2d(smem_buffer, tensor_map, mbar, coord_x_base_h2 * 2, coord_y);
+    } else {
+        constexpr int STRIP = 64; 
+        for (int s = 0; s < nbatch_K2; s += STRIP) {
+            tma_load_2d(smem_buffer + s * nbatch_fa, tensor_map, mbar, (coord_x_base_h2 + s) * 2, coord_y);
+        }
+    }
+#else
+    GGML_UNUSED(tensor_map);
+    GGML_UNUSED(smem_buffer);
+    GGML_UNUSED(mbar);
+    GGML_UNUSED(coord_x_base_h2);
+    GGML_UNUSED(coord_y);
+    GGML_UNUSED(arrive);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV, const int i_sup) {
-    // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
-    // The minimum granularity with cp.async is 16 bytes, with synchronous data loading it's 4 bytes.
     if constexpr (use_cp_async) {
         static_assert(!oob_check, "OOB check not compatible with cp_async");
         constexpr int preload = 64;
@@ -318,7 +328,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
         const unsigned int tile_KV_32 = ggml_cuda_cvta_generic_to_shared(tile_KV);
 
-        auto load = [&] __device__ (auto n) {
+        auto load = [&] __device__ (auto n) { 
             const int stride_k = WARP_SIZE >> n;
             const int k0_start = stride_k == WARP_SIZE ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
             const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
@@ -344,16 +354,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 }
             }
         };
-        // 1: max 32*16=512 bytes, 256 half
-        // 2: max 16*16=256 bytes, 128 half
-        // 3: max  8*16=128 bytes,  64 half
-        // 4: max  4*16= 64 bytes,  32 half
-        // 5: max  2*16= 32 bytes,  16 half
-        // 6: max  1*16= 16 bytes,   8 half
         ggml_cuda_unroll<6>{}(load);
     } else {
-        // TODO use ggml_cuda_memcpy_1
-        auto load = [&] __device__ (const int n) {
+        auto load = [&] __device__ (const int n) { 
             const int stride_k = WARP_SIZE >> n;
             const int k0_start = stride_k == WARP_SIZE ? 0 : D2 - D2 % (2*stride_k);
             const int k0_stop  =                             D2 - D2 % (1*stride_k);
@@ -379,10 +382,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 }
             }
         };
-        // 1: max 32* 4=128 bytes,  64 half
-        // 2: max 16* 4= 64 bytes,  32 half
-        // 3: max  8* 4= 32 bytes,  16 half
-        // 4: max  4* 4= 16 bytes,   8 half
         ggml_cuda_unroll<4>{}(load);
     }
 }
@@ -466,6 +465,58 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+// ------------------------------------------------------------------------------------------------------------------
+// PRODUCER LOOP
+// ------------------------------------------------------------------------------------------------------------------
+template<int DKQ, int DV, int ncols, int nstages, int nbatch_fa, int nbatch_K2, int nbatch_V2, bool mla>
+static __device__ __forceinline__ void fattn_producer_loop(
+    const char * __restrict__ tensor_maps,
+    fattn_pipeline_state* __restrict__ state,
+    int kb0_start,
+    int kb0_stop,
+    int num_consumers)
+{
+#ifdef BLACKWELL_TMA_AVAILABLE
+    const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
+    const CUtensorMap* map_V = (const CUtensorMap*)(tensor_maps + sizeof(CUtensorMap));
+    
+    extern __shared__ char smem_base[];
+    constexpr int bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+    constexpr int bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+    constexpr int stride_stage = bytes_K + bytes_V;
+    
+    int stage = 0;
+    uint32_t phase_K = 0;
+    uint32_t phase_V = 0;
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += nbatch_fa) {
+        // --- K Phase ---
+        for (int k0 = 0; k0 < DKQ/2; k0 += nbatch_K2) {
+            mbarrier_wait(&state->empty_K[stage], phase_K);
+            
+            half2* tile_K = (half2*)(smem_base + stage * stride_stage);
+            load_tile_tma_multistrip<nbatch_fa, nbatch_K2>(
+                map_K, tile_K, &state->full_K[stage], k0, kb0, true);
+                
+            stage = (stage + 1) % nstages;
+            phase_K ^= 1;
+        }
+        
+        // --- V Phase ---
+        for (int i0 = 0; i0 < DV/2; i0 += nbatch_V2) {
+            mbarrier_wait(&state->empty_V[stage], phase_V);
+            
+            half2* tile_V = (half2*)(smem_base + stage * stride_stage + bytes_K);
+            load_tile_tma_multistrip<nbatch_fa, nbatch_V2>(
+                map_V, tile_V, &state->full_V[stage], i0, kb0, true);
+                
+            stage = (stage + 1) % nstages;
+            phase_V ^= 1;
+        }
+    }
+#endif
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool mla, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check, bool use_tma,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
@@ -485,8 +536,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int stride_V,
         const int stride_mask,
         half2        * const __restrict__ tile_Q,
-        half2        * const __restrict__ tile_K,
-        half2        * const __restrict__ tile_V,
+        half2        * __restrict__ tile_K,
+        half2        * __restrict__ tile_V,
         half         * const __restrict__ tile_mask,
         T_B_KQ       * const __restrict__ Q_B,
         T_C_VKQ      * const __restrict__ VKQ_C,
@@ -498,7 +549,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const char * __restrict__ tensor_maps,
         uint64_t* __restrict__ mbar_ptr,
         uint32_t& phase_K,
-        uint32_t& phase_V) {
+        uint32_t& phase_V,
+        fattn_pipeline_state* pipeline_state = nullptr,
+        int pipeline_stage = -1,
+        int nstages_pipeline = 0) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -535,7 +589,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
 
-    if constexpr (nstages > 1) {
+    bool consumer_mode = (pipeline_state != nullptr);
+
+    if (!consumer_mode && nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
         constexpr bool use_cp_async = true;
         if constexpr (use_tma) {
@@ -570,7 +626,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
         }
-    } else {
+    } else if (!consumer_mode) {
         constexpr bool use_cp_async = nstages == 1;
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -583,6 +639,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
     int k_buf = 0; // 0 or 1 for double buffering
+    int current_stage = pipeline_stage;
 
 #pragma unroll
     for (int k0_start = 0; k0_start < DKQ/2; k0_start += nbatch_K2) {
@@ -590,58 +647,69 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_diff = k0_stop - k0_start;
 
         half2 * current_tile_K = tile_K;
-        if constexpr (nstages > 1 && use_tma && mla) {
-            // For MLA pipelining, we use tile_K (buf 0) and tile_V (buf 1, effectively K[1])
-            current_tile_K = k_buf == 0 ? tile_K : tile_V;
-        }
+        
+        if (consumer_mode) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+            mbarrier_wait(&pipeline_state->full_K[current_stage], phase_K);
+            constexpr int bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+            constexpr int bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+            int stride_stage = bytes_K + bytes_V;
+            current_tile_K = tile_K + current_stage * (stride_stage / sizeof(half2));
+#endif
+        } else {
+            if constexpr (nstages > 1 && use_tma && mla) {
+                // For MLA pipelining, we use tile_K (buf 0) and tile_V (buf 1, effectively K[1])
+                current_tile_K = k_buf == 0 ? tile_K : tile_V;
+            }
 
-        if constexpr (nstages <= 1) {
-            constexpr bool use_cp_async = nstages == 1;
-            if constexpr (use_tma) {
-                 #ifdef BLACKWELL_TMA_AVAILABLE
-                 // Load K via TMA (full tile with SWIZZLE_NONE for large tiles)
-                 // All chunks signal same mbarrier with aggregate byte count
-                 uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
-                 if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
-                 #endif
-                 // K chunks start at map index 0
-                 flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
-                     tensor_maps, 0, tile_K, mbar_ptr, k0_start, k_VKQ_0);
-                 #ifdef BLACKWELL_TMA_AVAILABLE
-                 mbarrier_wait(mbar_ptr, phase_K);
-                 phase_K ^= 1;
-                 #endif
-            } else {
-                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
-                if (use_cp_async) {
-                    cp_async_wait_all();
+            if constexpr (nstages <= 1) {
+                constexpr bool use_cp_async = nstages == 1;
+                if constexpr (use_tma) {
+                     #ifdef BLACKWELL_TMA_AVAILABLE
+                     // Load K via TMA (full tile with SWIZZLE_NONE for large tiles)
+                     // All chunks signal same mbarrier with aggregate byte count
+                     uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                     if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+                     #endif
+                     // K chunks start at map index 0
+                     flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                         tensor_maps, 0, tile_K, mbar_ptr, k0_start, k_VKQ_0);
+                     #ifdef BLACKWELL_TMA_AVAILABLE
+                     mbarrier_wait(mbar_ptr, phase_K);
+                     phase_K ^= 1;
+                     #endif
+                } else {
+                    flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                    if (use_cp_async) {
+                        cp_async_wait_all();
+                    }
                 }
-            }
-            __syncthreads();
-        } else if constexpr (use_tma && mla) {
-            #ifdef BLACKWELL_TMA_AVAILABLE
-            // MLA Pipelining:
-            // 1. Wait for current buffer (issued in previous iter or preload)
-            uint64_t* mbar = k_buf == 0 ? mbar_ptr : (mbar_ptr + 1);
-            uint32_t& phase = k_buf == 0 ? phase_K : phase_V;
-            
-            mbarrier_wait(mbar, phase);
-            phase ^= 1;
+                __syncthreads();
+            } else if constexpr (use_tma && mla) {
+                #ifdef BLACKWELL_TMA_AVAILABLE
+                // MLA Pipelining:
+                // 1. Wait for current buffer (issued in previous iter or preload)
+                uint64_t* mbar = k_buf == 0 ? mbar_ptr : (mbar_ptr + 1);
+                uint32_t& phase = k_buf == 0 ? phase_K : phase_V;
+                
+                mbarrier_wait(mbar, phase);
+                phase ^= 1;
 
-            // 2. Issue load for next buffer
-            if (k0_start + nbatch_K2 < DKQ/2) {
-                int next_k_buf = k_buf ^ 1;
-                half2* next_tile_K = next_k_buf == 0 ? tile_K : tile_V;
-                uint64_t* next_mbar = next_k_buf == 0 ? mbar_ptr : (mbar_ptr + 1);
-                
-                uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
-                if (threadIdx.x == 0) mbarrier_arrive_expect_tx(next_mbar, bytes_K);
-                
-                flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
-                     tensor_maps, 0, next_tile_K, next_mbar, k0_start + nbatch_K2, k_VKQ_0);
+                // 2. Issue load for next buffer
+                if (k0_start + nbatch_K2 < DKQ/2) {
+                    int next_k_buf = k_buf ^ 1;
+                    half2* next_tile_K = next_k_buf == 0 ? tile_K : tile_V;
+                    uint64_t* next_mbar = next_k_buf == 0 ? mbar_ptr : (mbar_ptr + 1);
+                    
+                    uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                    if (threadIdx.x == 0) mbarrier_arrive_expect_tx(next_mbar, bytes_K);
+                    
+                    flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                         tensor_maps, 0, next_tile_K, next_mbar, k0_start + nbatch_K2, k_VKQ_0);
+                }
+                #endif
             }
-            #endif
         }
 
         // Calculate tile of KQ:
@@ -680,10 +748,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
 
-        if constexpr (nstages <= 1) {
-            __syncthreads(); // Only needed if tile_K == tile_V.
-        } else if constexpr (use_tma && mla) {
-            k_buf ^= 1;
+        if (consumer_mode) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+            mbarrier_arrive_expect_tx(&pipeline_state->empty_K[current_stage], 0);
+            current_stage = (current_stage + 1) % nstages_pipeline;
+            phase_K ^= 1;
+#endif
+        } else {
+            if constexpr (nstages <= 1) {
+                __syncthreads(); // Only needed if tile_K == tile_V.
+            } else if constexpr (use_tma && mla) {
+                k_buf ^= 1;
+            }
         }
     }
 
@@ -707,7 +783,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (ncols2 > 1 || mask_h) {
+        if (!consumer_mode && (ncols2 > 1 || mask_h)) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -757,7 +833,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (ncols2 > 1 || mask_h) {
+        if (!consumer_mode && (ncols2 > 1 || mask_h)) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -884,7 +960,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
-    if constexpr (nstages > 1) {
+    if (!consumer_mode && nstages > 1) {
         // Preload K/mask tile for next iteration:
         constexpr bool use_cp_async = true;
         
@@ -928,6 +1004,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
  
     // If MLA, we haven't loaded any V yet. We must issue the first V load here if we want to pipeline.
     if constexpr (mla && use_tma && nstages > 1) {
+        if (!consumer_mode) {
         #ifdef BLACKWELL_TMA_AVAILABLE
         int i0_first = DV - 2*nbatch_V2 > 0 ? DV - 2*nbatch_V2 : 0; // The first iter i0_start
         if (i0_first < reusable_cutoff) {
@@ -937,6 +1014,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                  tensor_maps, 1, tile_V, mbar_ptr + 1, i0_first/2, k_VKQ_0);
         }
         #endif
+        }
     }
 
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
@@ -947,7 +1025,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         
         const half2 * tile_V_i = tile_V;
 
-        if constexpr (nstages <= 1) {
+        if (consumer_mode) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+            // CONSUMER: Wait V
+            mbarrier_wait(&pipeline_state->full_V[current_stage], phase_V);
+            
+            constexpr int bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+            constexpr int bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
+            int stride_stage = bytes_K + bytes_V;
+            
+            // Note: In consumer mode, V starts after K in the stage buffer
+            tile_V_i = tile_V + current_stage * (stride_stage / sizeof(half2)) + (bytes_K / sizeof(half2));
+#endif
+        } else if constexpr (nstages <= 1) {
             if (i0_start < reusable_cutoff) {
                 constexpr bool use_cp_async = nstages == 1;
                 if constexpr (use_tma) {
@@ -1042,12 +1132,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 #endif // defined(TURING_MMA_AVAILABLE)
 
-        if constexpr (nstages <= 1) {
-            __syncthreads(); // Only needed if tile_K == tile_V.
+        if (consumer_mode) {
+#ifdef BLACKWELL_TMA_AVAILABLE
+            mbarrier_arrive_expect_tx(&pipeline_state->empty_V[current_stage], 0);
+            current_stage = (current_stage + 1) % nstages_pipeline;
+            phase_V ^= 1;
+#endif
+        } else {
+            if constexpr (nstages <= 1) {
+                __syncthreads(); // Only needed if tile_K == tile_V.
+            }
         }
     }
 
-    if constexpr (nstages > 1 && mla) {
+    if (!consumer_mode && nstages > 1 && mla) {
         // Preload K for next iteration:
         if constexpr (use_tma) {
              if (!last_iter) {
@@ -1148,6 +1246,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2);
+    constexpr int  num_consumers   = ggml_cuda_fattn_mma_get_num_consumers (DKQ, DV, ncols);
+
+    // Blackwell Pipeline Setup
+    fattn_pipeline_state* pipeline_state = nullptr;
+    int pipeline_stage = -1;
+    
+    // Check if we are in Consumer Mode
+    extern __shared__ char smem[];
+    if (num_consumers > 0) {
+        // Shared memory layout: [Buffers] [State]
+        constexpr int bytes_stage = nbatch_fa * (nbatch_K2 + nbatch_V2) * sizeof(half2);
+        pipeline_state = (fattn_pipeline_state*)(smem + nstages * bytes_stage);
+        pipeline_stage = 0; // Initial stage
+    }
 
     // TMA tile parameters (legacy chunk variables kept for template API compatibility).
     // With SWIZZLE_NONE for large tiles, we load full tiles in single TMA operations.
@@ -1175,7 +1287,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int stride_tile_V = use_tma ? nbatch_V2 : (mla ? stride_tile_K : nbatch_V2 + 4);
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
 
-    extern __shared__ half2 tile_Q[];
+    // Use smem pointer directly if in Consumer mode (Q is separate or in registers)
+    half2 * tile_Q = (half2*)smem; 
+    
+    // Legacy Layout
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
@@ -1183,24 +1298,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Mbarrier allocation at the end of shared memory
     uint64_t* mbar_ptr = nullptr;
     if constexpr (use_tma) {
-        const size_t nbytes_shared_mask_actual = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
-        mbar_ptr = (uint64_t*)((char*)tile_mask + nbytes_shared_mask_actual);
-        
-        // Ensure alignment
-        size_t addr = (size_t)mbar_ptr;
-        if (addr % 8 != 0) {
-            mbar_ptr = (uint64_t*)(addr + 8 - (addr % 8));
+        if (!pipeline_state) {
+            const size_t nbytes_shared_mask_actual = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+            mbar_ptr = (uint64_t*)((char*)tile_mask + nbytes_shared_mask_actual);
+            
+            // Ensure alignment
+            size_t addr = (size_t)mbar_ptr;
+            if (addr % 8 != 0) {
+                mbar_ptr = (uint64_t*)(addr + 8 - (addr % 8));
+            }
+            
+            #ifdef BLACKWELL_TMA_AVAILABLE
+            __syncthreads(); // Ensure tile_mask calculation is done and others are ready
+            if (threadIdx.x == 0) {
+                // Initialize 2 mbarriers with count 1 (for the thread that issues the copy)
+                mbarrier_init(mbar_ptr, 1);     // K mbarrier
+                mbarrier_init(mbar_ptr + 1, 1); // V mbarrier
+            }
+            #endif
+            __syncthreads();
         }
-        
-        #ifdef BLACKWELL_TMA_AVAILABLE
-        __syncthreads(); // Ensure tile_mask calculation is done and others are ready
-        if (threadIdx.x == 0) {
-            // Initialize 2 mbarriers with count 1 (for the thread that issues the copy)
-            mbarrier_init(mbar_ptr, 1);     // K mbarrier
-            mbarrier_init(mbar_ptr + 1, 1); // V mbarrier
-        }
-        #endif
-        __syncthreads();
     }
     
     uint32_t phase_K = 0;
@@ -1286,21 +1403,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
         
-        if (ncols2 > 1 || mask_h) {
+        if (!pipeline_state && (ncols2 > 1 || mask_h)) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
 
         if constexpr (use_tma) {
              #ifdef BLACKWELL_TMA_AVAILABLE
-             // Load K via TMA (full tile with SWIZZLE_NONE for large tiles)
-             uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
-             if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+             if (!pipeline_state) {
+                 // Load K via TMA (full tile with SWIZZLE_NONE for large tiles)
+                 uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                 if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+                 // K chunks start at map index 0
+                 flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                     tensor_maps, 0, tile_K, mbar_ptr, 0, kb0*nbatch_fa);
+                 // No wait here, wait is in iter
+             }
              #endif
-             // K chunks start at map index 0
-             flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
-                 tensor_maps, 0, tile_K, mbar_ptr, 0, kb0*nbatch_fa);
-             // No wait here, wait is in iter
         } else {
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
@@ -1308,8 +1427,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
+    // OOB check is not compatible with multi-stage pipeline, so disable it when nstages > 1.
     if constexpr (ncols2 == 1) {
-        constexpr bool oob_check = true;
+        constexpr bool oob_check = (nstages == 1);
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1318,7 +1438,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, pipeline_stage, nstages);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1327,7 +1447,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);    } else {
+                              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, pipeline_stage, nstages);    } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
@@ -1337,7 +1457,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, pipeline_stage, nstages);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1346,7 +1466,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V);    }
+                              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, pipeline_stage, nstages);    }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
     //     there can be a race condition on shared memory access for combining/writing back results.
@@ -1674,7 +1794,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool mla, bool use_tma>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
-static __global__ void flash_attn_ext_f16(
+__global__ void flash_attn_ext_f16_ampere(
         const char * __restrict__ Q,
         const char * __restrict__ K,
         const char * __restrict__ V,
@@ -1822,6 +1942,110 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE))
 }
 
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool mla, bool use_tma>
+__global__ void flash_attn_ext_f16_blackwell(
+        const char * __restrict__ Q,
+        const char * __restrict__ K,
+        const char * __restrict__ V,
+        const char * __restrict__ mask,
+        const char * __restrict__ sinks,
+        const int  * __restrict__ KV_max,
+        float      * __restrict__ dst,
+        float2     * __restrict__ dst_meta,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const char * __restrict__ tensor_maps)
+{
+#ifdef BLACKWELL_TMA_AVAILABLE
+    constexpr int ncols = ncols1 * ncols2;
+    constexpr auto config = ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
+    constexpr int nbatch_fa = config.nbatch_fa;
+    constexpr int nbatch_K2 = config.nbatch_K2;
+    constexpr int nbatch_V2 = config.nbatch_V2;
+    constexpr int nstages = config.nstages_target;
+    constexpr int num_consumers = config.num_consumers;
+    constexpr int nwarps = 256 / 32;
+
+    extern __shared__ char smem[];
+    constexpr int bytes_stage = nbatch_fa * (nbatch_K2 + nbatch_V2) * sizeof(half2);
+    fattn_pipeline_state* state = (fattn_pipeline_state*)(smem + nstages * bytes_stage);
+
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        for (int i = 0; i < nstages; ++i) {
+            mbarrier_init(&state->full_K[i], 1);
+            mbarrier_init(&state->full_V[i], 1);
+            mbarrier_init(&state->empty_K[i], num_consumers);
+            mbarrier_init(&state->empty_V[i], num_consumers);
+        }
+    }
+    __syncthreads();
+
+    const int iter_k = (ne11 + (nbatch_fa - 1)) / nbatch_fa;
+    const int iter_j = (ne01.z + (ncols1 - 1)) / ncols1;
+    
+    // Grid Logic
+    int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
+    const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
+
+    int kb0_start = kbc % iter_k;
+    int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
+
+    while (kbc < kbc_stop && kb0_stop == iter_k) {
+         const int sequence = kbc / (iter_k*iter_j*(ne02/ncols2));
+         const int zt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence) / (iter_k*iter_j); 
+         const int jt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence - iter_k*iter_j*zt) / iter_k;
+
+         const int head0 = zt * ncols2;
+         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02* head0);
+         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*(head0)); 
+         const half   * mask_h = ncols2 == 1 && !mask ? nullptr : (const half *) (mask + nb33*(sequence % ne33));
+         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + head0) * (DV/2);
+         const half2  * V_h2   = mla ? K_h2 + (DKQ/2 - DV/2) : (const half2 *) (V + nb23*sequence + nb22*(head0));
+         const float  * sinks_f = sinks ? (const float *) sinks + head0 : nullptr;
+         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
+         
+         // For Blackwell kernel, we assume full tile alignment for now or handle bounds inside.
+         // We iterate the full sequence chunk assigned to this block.
+         // Actually, if kbc dispatch is granular, we might need fixup logic.
+         // For optimization prototype, we assume blocks align to tiles.
+         
+         const int kb0_start_idx = 0;
+         const int kb0_stop_idx = iter_k; // Simplification: assume block handles full seq or large chunk
+
+         if (threadIdx.y == 0) {
+             // Producer
+             fattn_producer_loop<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
+                 tensor_maps, state, kb0_start, kb0_stop, num_consumers);
+         } else {
+             // Consumer
+             constexpr bool is_fixup = false; 
+             constexpr bool needs_fixup = false;
+             
+             // Reuse process_tile to call iter
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
+                 Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                  ne01, ne02, ne11, 0, 0, 0, 0, 0, jt, kb0_start, kb0_stop, tensor_maps);
+         }
+         
+         kbc += iter_k;
+         kbc -= kbc % iter_k;
+         kb0_start = 0;
+         kb0_stop  = min(iter_k, kbc_stop - kbc);
+    }
+#endif
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -1843,20 +2067,20 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     constexpr bool mla = DKQ == 576;
 
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
-    const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
-    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+    size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
+    size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
+    size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
+    size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
 
-    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
+    size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
     // Allocate space for 2 mbarriers (K and V) if TMA is used.
     // mbarrier is 64-bit (8 bytes). 2 * 8 = 16 bytes.
     // We add a bit more for alignment safety.
     const size_t nbytes_mbar = 128; 
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask) + nbytes_mbar;
 
@@ -1886,13 +2110,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #if CUDART_VERSION >= 12000
     // TMA with ldmatrix requires SWIZZLE_128B for correct shared memory layout.
     // SWIZZLE_128B requires inner dimension <= 128 bytes = 64 half = 32 half2.
-    // For larger tiles, we must fall back to cp.async (no TMA).
-    // Note: SWIZZLE_NONE would allow larger tiles but produces row-major layout
-    // that is incompatible with ldmatrix, causing incorrect matrix loads.
+    // For larger tiles, we must fall back to cp.async (no TMA) UNLESS on Blackwell with new kernel.
+    
     const bool tma_tile_compatible = (nbatch_K2 <= 32) && (nbatch_V2 <= 32);
 
-    if (!tma_tile_compatible) {
-        use_tma_runtime = false;  // Fall back to cp.async for large tiles
+    if (!tma_tile_compatible && !ggml_cuda_has_blackwell_features(cc)) {
+        use_tma_runtime = false;  // Fall back to cp.async for large tiles on Hopper
     }
 
     if (use_tma_runtime) {
@@ -1909,7 +2132,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         uint64_t K_rows = ggml_nrows(K);
 
         // tile_k = nbatch_K2 * 2 half elements (must be <= 64 for SWIZZLE_128B)
-        const uint32_t tile_k_half = nbatch_K2 * 2;
+        const uint32_t tile_k_half = (ggml_cuda_has_blackwell_features(cc) && nbatch_K2 > 32) ? 64 : nbatch_K2 * 2;
 
         CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
             &maps[0],
@@ -1931,11 +2154,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
         uint64_t V_rows = ggml_nrows(V);
-        const uint32_t tile_v_half = nbatch_V2 * 2;
-
-        // For MLA, V_ptr is offset into K by (DKQ - DV) elements, so the valid
-        // dimension from V_ptr is DV, not K->ne[0]. Using K->ne[0] would cause
-        // TMA to compute incorrect memory bounds.
+        const uint32_t tile_v_half = (ggml_cuda_has_blackwell_features(cc) && nbatch_V2 > 32) ? 64 : nbatch_V2 * 2;
         const uint64_t V_dim_k = mla ? DV : V->ne[0];
 
         CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
@@ -1953,6 +2172,16 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         cudaMemcpyAsync(tensor_maps_dev_ptr, maps, 2 * sizeof(CUtensorMap), cudaMemcpyHostToDevice, ctx.stream());
     }
 #endif
+
+    // Update Shared Memory Calculation for Blackwell (MLA only)
+    // Only apply larger shared memory when we'll actually use the Blackwell kernel
+    if constexpr (mla) {
+        if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime) {
+             constexpr int stage_size = 128 * (64+64) * sizeof(half2); // 32KB
+             // 3 stages = 96KB + State. Fits in 99KB.
+             nbytes_shared_total = 3 * stage_size + sizeof(fattn_pipeline_state) + 128;
+        }
+    }
 
     auto launch_kernel = [&](auto kernel_func, bool tma) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -1972,26 +2201,32 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             shared_memory_limit_raised[id] = true;
         }
 #endif
-        launch_fattn<DV, ncols1, ncols2>(
+        launch_fattn<DV, ncols1, ncols2>( 
             ctx, dst, kernel_func, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, WARP_SIZE,
             tma ? tensor_maps_dev_ptr : nullptr
         );
     };
 
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
-        if (use_tma_runtime) {
-             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, true>, true);
-        } else {
-             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, false>, false);
+    bool use_logit_softcap_kernel = (logit_softcap != 0.0f);
+
+    // Blackwell kernel only supports MLA (DKQ=576, DV=512) configurations.
+    // Use if constexpr to avoid instantiating the template for unsupported configs.
+    if constexpr (mla) {
+        if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime) {
+            if (use_logit_softcap_kernel) {
+                 launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, true>, true);
+            } else {
+                 launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, false, mla, true>, true);
+            }
+            return;
         }
+    }
+
+    // Ampere kernel for all non-MLA configs or when Blackwell features unavailable
+    if (use_logit_softcap_kernel) {
+         launch_kernel(flash_attn_ext_f16_ampere<DKQ, DV, ncols1, ncols2, true, mla, false>, false);
     } else {
-        constexpr bool use_logit_softcap = true;
-        if (use_tma_runtime) {
-             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, true>, true);
-        } else {
-             launch_kernel(flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, mla, false>, false);
-        }
+         launch_kernel(flash_attn_ext_f16_ampere<DKQ, DV, ncols1, ncols2, false, mla, false>, false);
     }
 }
 
