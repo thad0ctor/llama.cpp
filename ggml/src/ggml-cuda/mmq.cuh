@@ -126,7 +126,13 @@ static int get_mmq_y_host(const int cc) {
 
 static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    return type == GGML_TYPE_MXFP4 ? MMQ_ITER_K_MXFP4_FP4 : MMQ_ITER_K;
+    if (type == GGML_TYPE_MXFP4) {
+        return MMQ_ITER_K_MXFP4_FP4;
+    }
+    if (type == GGML_TYPE_Q8_0) {
+        return MMQ_ITER_K_Q8_0_BLACKWELL;
+    }
+    return MMQ_ITER_K;
 #else
     return MMQ_ITER_K;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -182,19 +188,21 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
     }
 }
 
-#define MMQ_MMA_TILE_X_K_Q8_0 (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0                   + 4)
-#define MMQ_MMA_TILE_X_K_FP4  (2*MMQ_TILE_NE_K + 8                                       + 4)
-#define MMQ_MMA_TILE_X_K_Q8_1 (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0                   + 4)
+#define MMQ_MMA_TILE_X_K_Q8_0           (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4)
+#define MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL (4*MMQ_TILE_NE_K + 4*MMQ_TILE_NE_K/QI8_0 + 4) // 2x for Blackwell 512 K iteration
+#define MMQ_MMA_TILE_X_K_FP4            (2*MMQ_TILE_NE_K + 8                     + 4)
+#define MMQ_MMA_TILE_X_K_Q8_1           (2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4)
 #define MMQ_MMA_TILE_X_K_Q2_K (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K                           + 4)
 #define MMQ_MMA_TILE_X_K_Q3_K (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2                         + 4)
 #define MMQ_MMA_TILE_X_K_Q6_K (2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K   + MMQ_TILE_NE_K/8 + 7)
 
-static_assert(MMQ_MMA_TILE_X_K_Q8_0 % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q8_1 % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q2_K % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q3_K % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_Q6_K % 8 == 4, "Wrong padding.");
-static_assert(MMQ_MMA_TILE_X_K_FP4  % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_0           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q8_1           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q2_K           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q3_K           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q6_K           % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_FP4            % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_FP4 == MMQ_MMA_TILE_X_K_Q8_1, "Wrong tile size for MXFP4");
 
 static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
@@ -203,7 +211,11 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q4_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q5_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
+#ifdef BLACKWELL_MMA_AVAILABLE
+        case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL;
+#else
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
+#endif // BLACKWELL_MMA_AVAILABLE
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q2_K:    return MMQ_MMA_TILE_X_K_Q2_K;
@@ -675,6 +687,60 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+#ifdef BLACKWELL_MMA_AVAILABLE
+// Blackwell-optimized Q8_0 load_tiles with 512 K iteration (16 blocks instead of 8)
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0_blackwell(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 4*MMQ_TILE_NE_K);  // 4x for Blackwell
+
+    // Load quantized data: 16 blocks = 512 Q8_0 values = 128 int32s
+    // Use 32 threads per row, each thread loads one int32 per block group
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI8_0;   // kbx = 0..3 (4 blocks per group)
+    const int kqsx = txi % QI8_0;   // kqsx = 0..7 (8 ints per block)
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
+
+        // Load 4 groups of 4 blocks each (16 blocks total = 512 values)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 0*MMQ_TILE_NE_K + txi] = get_int_b2(bxi[0].qs,  kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 1*MMQ_TILE_NE_K + txi] = get_int_b2(bxi[4].qs,  kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 2*MMQ_TILE_NE_K + txi] = get_int_b2(bxi[8].qs,  kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + 3*MMQ_TILE_NE_K + txi] = get_int_b2(bxi[12].qs, kqsx);
+    }
+
+    // Load scales: 16 blocks = 16 float scales
+    constexpr int blocks_per_tile_x_row = 4*MMQ_TILE_NE_K / QI8_0;  // 16 blocks
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;  // 32/16 = 2
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbxd;
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + kbxd] = bxi->d;
+    }
+}
+#endif // BLACKWELL_MMA_AVAILABLE
+
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -955,8 +1021,9 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
 }
 
 #ifdef BLACKWELL_MMA_AVAILABLE
-// Blackwell-optimized Q8_0 vec_dot using m16n8k32 with larger K iteration
-// Takes advantage of Blackwell's 228KB shared memory and higher SM count
+// Blackwell-optimized Q8_0 vec_dot using m16n8k32
+// Each call processes MMQ_TILE_NE_K = 32 int32 elements (128 Q8_0 values)
+// With 4 calls in main loop, processes all 512 Q8_0 values per iteration
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_blackwell(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -972,24 +1039,23 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_blackwell(
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
     const int   * x_qs = (const int   *) x;
-    const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+    const float * x_df = (const float *) x_qs + 4*MMQ_TILE_NE_K;  // 4x for Blackwell 512 K
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-    // Blackwell: prefetch more tiles to hide memory latency
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
 
     const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
-    // Load A tiles with prefetching
+    // Load A tiles
 #pragma unroll
     for (int n = 0; n < ntx; ++n) {
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
             const int k0 = k00 + k01;
 
-            load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
+            load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + k0, MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL);
         }
 
 #pragma unroll
@@ -1000,7 +1066,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_blackwell(
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
                 const int k0 = k00 + k01;
 
-                dA[n][l][k01/QI8_0] = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI8_0];
+                dA[n][l][k01/QI8_0] = x_df[i*MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL + k0/QI8_0];
             }
         }
     }
@@ -3278,10 +3344,11 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q5_1> {
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
     static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ;
-    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q8_0<mmq_y, need_check>;
 #ifdef BLACKWELL_MMA_AVAILABLE
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q8_0_blackwell<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma_blackwell<mmq_x, mmq_y>;
 #else
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q8_0<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
 #endif // BLACKWELL_MMA_AVAILABLE
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
@@ -3430,8 +3497,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    // FP4 tile stores 8 blocks
-    constexpr int ne_block = (type == GGML_TYPE_MXFP4) ? 8 * QK_MXFP4 : 4 * QK8_1;
+    // FP4 tiles store 8 blocks (256 elements) on Blackwell for 512 K iteration
+    // Q8_0 uses 4 block_q8_1_mmq per 512 K iteration (each stores 128 Q8 values)
+    constexpr int ne_block = (type == GGML_TYPE_MXFP4) ? 8 * QK_MXFP4
+                           : 4 * QK8_1;
 #else
     constexpr int ne_block = 4 * QK8_1;
 #endif  // defined(BLACKWELL_MMA_AVAILABLE)
@@ -3476,6 +3545,43 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+        // Q8_0 on Blackwell: 2 additional vec_dot calls for 512 K iteration (128 int32 elements)
+        if constexpr (type == GGML_TYPE_Q8_0) {
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + 2*sz);
+#pragma unroll
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, 2*MMQ_TILE_NE_K);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + 3*sz);
+#pragma unroll
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, 3*MMQ_TILE_NE_K);
+
+            __syncthreads();
+        }
+#endif // BLACKWELL_MMA_AVAILABLE
     }
 
     if (fixup) {
@@ -3842,7 +3948,11 @@ struct mmq_args {
 template<ggml_type type>
 static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
-    const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
+    // For Q8_0 on Blackwell, use the larger tile size for 512 K iteration
+    int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
+    if (type == GGML_TYPE_Q8_0 && blackwell_mma_available(cc)) {
+        mmq_tile_x_k = MMQ_MMA_TILE_X_K_Q8_0_BLACKWELL;
+    }
     const size_t nbs_ids = mmq_x*sizeof(int);
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
