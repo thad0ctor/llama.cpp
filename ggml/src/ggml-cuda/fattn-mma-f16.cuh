@@ -758,10 +758,10 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
 
     extern __shared__ char smem_base[];
     // Double-buffered chunk storage: 2 chunk buffers for K, 2 for V
+    // Layout: [K_chunk_0][K_chunk_1][V_chunk_0][V_chunk_1]
+    // Chunks are REUSED each kb0 iteration - no stage-level offset needed
     constexpr int bytes_K_chunk = nbatch_fa * nbatch_K2 * sizeof(half2);
     constexpr int bytes_V_chunk = nbatch_fa * nbatch_V2 * sizeof(half2);
-    // Stage layout: [K_chunk_0][K_chunk_1][V_chunk_0][V_chunk_1]
-    constexpr int stride_stage = 2 * bytes_K_chunk + 2 * bytes_V_chunk;
 
     constexpr int num_K_chunks = (DKQ/2 + nbatch_K2 - 1) / nbatch_K2;
     constexpr int num_V_chunks = (DV/2 + nbatch_V2 - 1) / nbatch_V2;
@@ -771,10 +771,6 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
 
     // Iterate over tile indices (kb0 is a tile index, not a row offset)
     for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
-        // Compute current stage based on iteration count from start
-        const int iter = kb0 - kb0_start;
-        const int stage = iter % nstages;
-
         // Compute row offset for TMA coordinates
         const int row_offset = kb0 * nbatch_fa;
 
@@ -783,7 +779,8 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
         chunk_phase_V = 0;
 
         // --- K Phase: Load K chunks with per-chunk synchronization ---
-        half2* tile_K_base = (half2*)(smem_base + stage * stride_stage);
+        // NOTE: No stage offset - chunk buffers are reused each kb0 iteration
+        half2* tile_K_base = (half2*)(smem_base);
 
         for (int chunk = 0; chunk < num_K_chunks; ++chunk) {
             const int chunk_stage = chunk % 2;
@@ -806,7 +803,8 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
         }
 
         // --- V Phase: Load V chunks with per-chunk synchronization ---
-        half2* tile_V_base = (half2*)(smem_base + stage * stride_stage + 2 * bytes_K_chunk);
+        // NOTE: No stage offset - chunk buffers are reused each kb0 iteration
+        half2* tile_V_base = (half2*)(smem_base + 2 * bytes_K_chunk);
 
         for (int chunk = 0; chunk < num_V_chunks; ++chunk) {
             const int chunk_stage = chunk % 2;
@@ -1704,13 +1702,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Blackwell Pipeline Setup
     fattn_pipeline_state* pipeline_state = nullptr;
     int pipeline_stage = -1;
-    
+
     // Check if we are in Consumer Mode
     extern __shared__ char smem[];
     if (num_consumers > 0) {
-        // Shared memory layout: [Buffers] [State]
-        constexpr int bytes_stage = nbatch_fa * (nbatch_K2 + nbatch_V2) * sizeof(half2);
-        pipeline_state = (fattn_pipeline_state*)(smem + nstages * bytes_stage);
+        // Shared memory layout for chunk pipelining:
+        // [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask][pipeline_state]
+        constexpr int bytes_K_chunk = nbatch_fa * nbatch_K2 * sizeof(half2);
+        constexpr int bytes_V_chunk = nbatch_fa * nbatch_V2 * sizeof(half2);
+        constexpr int bytes_KV_total = 2 * bytes_K_chunk + 2 * bytes_V_chunk;
+        constexpr int stride_tile_Q_local = DKQ/2 + 4;
+        constexpr int bytes_Q = ncols * stride_tile_Q_local * sizeof(half2);
+        constexpr int bytes_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+        pipeline_state = (fattn_pipeline_state*)(smem + bytes_KV_total + bytes_Q + bytes_mask);
         pipeline_stage = 0; // Initial stage
     }
 
