@@ -979,6 +979,13 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    // L2 cache persistence for K/V cache on Blackwell (RTX 5090 has 96MB L2)
+    // Persists K tensor in L2 during decode for faster repeated access
+#if CUDART_VERSION >= 11000
+    const size_t kv_cache_size = K->ne[0] * K->ne[1] * sizeof(half);
+    ggml_cuda_l2_persist_guard l2_guard(main_stream, const_cast<char *>(K_data), kv_cache_size, cc);
+#endif
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,

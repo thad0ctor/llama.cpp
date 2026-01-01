@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include <type_traits>
 
 struct rope_corr_dims {
     float v[2];
@@ -107,7 +108,7 @@ static __global__ void rope_norm(const T *            x,
     store_coaelsced(x0 * cos_theta - x1 * sin_theta, x0 * sin_theta + x1 * cos_theta);
 }
 
-template <bool forward, bool has_ff, typename T, typename D>
+template <bool forward, bool has_ff, typename T, typename D, int vec_elem>
 static __global__ void rope_neox(const T *            x,
                                  D *                  dst,
                                  const int            ne0,
@@ -124,9 +125,10 @@ static __global__ void rope_neox(const T *            x,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
                                  const int            set_rows_stride) {
-    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+    // vec_elem is either 1 (scalar) or 4/8 (vectorized)
+    const int i0 = vec_elem * (blockDim.y * blockIdx.y + threadIdx.y);
 
-    if (i0 >= ne0) {
+    if (i0 >= ne0/2) {
         return;
     }
 
@@ -135,37 +137,121 @@ static __global__ void rope_neox(const T *            x,
     const int row_x     = row_dst % ne1;
     const int channel_x = row_dst / ne1;
 
-    int       idst = row_dst * ne0 + i0 / 2;
-    const int ix   = channel_x*s2 + row_x*s1 + i0/2;
+    int64_t idst_base = (int64_t)row_dst * ne0;
+    int64_t ix_base   = (int64_t)channel_x*s2 + (int64_t)row_x*s1;
 
-    // Fusion optimization: ROPE + VIEW + SET_ROWS.
-    // The rope output is viewed as a 1D tensor and offset based on a row index in row_indices.
     if (set_rows_stride != 0) {
-        idst = row_x * ne0 + i0 / 2;
-        idst += row_indices[channel_x] * set_rows_stride;
+        idst_base = (int64_t)row_x * ne0;
+        idst_base += row_indices[channel_x] * set_rows_stride;
     }
 
-    if (i0 >= n_dims) {
-        dst[idst + i0 / 2 + 0] = ggml_cuda_cast<D>(x[ix + i0 / 2 + 0]);
-        dst[idst + i0 / 2 + 1] = ggml_cuda_cast<D>(x[ix + i0 / 2 + 1]);
+    float x0_vals[vec_elem];
+    float x1_vals[vec_elem];
 
-        return;
+    if constexpr (vec_elem > 1) {
+        // Vectorized load (assumes float4 aligned)
+        if (i0 + vec_elem <= ne0/2) {
+            float4 v_low = *((const float4*)(x + ix_base + i0));
+            if constexpr (std::is_same_v<T, half>) {
+                half2* h2 = (half2*)&v_low;
+                for(int k=0; k<4; ++k) {
+                    float2 f = __half22float2(h2[k]);
+                    x0_vals[2*k] = f.x;
+                    x0_vals[2*k+1] = f.y;
+                }
+            } else {
+                float* f = (float*)&v_low;
+                for(int k=0; k<4; ++k) x0_vals[k] = f[k];
+            }
+            
+            float4 v_high = *((const float4*)(x + ix_base + i0 + n_dims/2));
+            if constexpr (std::is_same_v<T, half>) {
+                half2* h2 = (half2*)&v_high;
+                for(int k=0; k<4; ++k) {
+                    float2 f = __half22float2(h2[k]);
+                    x1_vals[2*k] = f.x;
+                    x1_vals[2*k+1] = f.y;
+                }
+            } else {
+                float* f = (float*)&v_high;
+                for(int k=0; k<4; ++k) x1_vals[k] = f[k];
+            }
+        } else {
+            // Partial last block fallback (scalar)
+            for(int k=0; k<vec_elem; ++k) {
+                if(i0 + k < ne0/2) {
+                    x0_vals[k] = (float)x[ix_base + i0 + k];
+                    x1_vals[k] = (float)x[ix_base + i0 + k + n_dims/2];
+                }
+            }
+        }
+    } else {
+        // Scalar load
+        x0_vals[0] = (float)x[ix_base + i0];
+        x1_vals[0] = (float)x[ix_base + i0 + n_dims/2];
     }
 
-    const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
+    float dst0_vals[vec_elem];
+    float dst1_vals[vec_elem];
+    const float theta_base_val = pos[channel_x];
 
-    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+    for (int k = 0; k < vec_elem; ++k) {
+        int ii = i0 + k;
+        int ii_idx = 2 * ii; 
+        
+        if (ii_idx >= n_dims) {
+            dst0_vals[k] = x0_vals[k];
+            dst1_vals[k] = x1_vals[k];
+            continue;
+        }
 
-    float cos_theta;
-    float sin_theta;
+        const float theta_base = theta_base_val * powf(theta_scale, ii_idx/2.0f);
+        const float freq_factor = has_ff ? freq_factors[ii_idx/2] : 1.0f;
 
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+        float cos_theta, sin_theta;
+        rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, ii_idx, ext_factor, attn_factor, cos_theta, sin_theta);
 
-    const float x0 = x[ix + 0];
-    const float x1 = x[ix + n_dims/2];
+        dst0_vals[k] = x0_vals[k] * cos_theta - x1_vals[k] * sin_theta;
+        dst1_vals[k] = x0_vals[k] * sin_theta + x1_vals[k] * cos_theta;
+    }
 
-    dst[idst + 0]          = ggml_cuda_cast<D>(x0 * cos_theta - x1 * sin_theta);
-    dst[idst + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
+    if constexpr (vec_elem > 1) {
+        if (i0 + vec_elem <= ne0/2) {
+            if constexpr (std::is_same_v<D, half>) {
+                float4 v_out;
+                half2* h2 = (half2*)&v_out;
+                for(int k=0; k<4; ++k) h2[k] = __float22half2_rn(make_float2(dst0_vals[2*k], dst0_vals[2*k+1]));
+                *((float4*)(dst + idst_base + i0)) = v_out;
+            } else {
+                float4 v_out;
+                float* f = (float*)&v_out;
+                for(int k=0; k<4; ++k) f[k] = dst0_vals[k];
+                *((float4*)(dst + idst_base + i0)) = v_out;
+            }
+            
+            if constexpr (std::is_same_v<D, half>) {
+                float4 v_out;
+                half2* h2 = (half2*)&v_out;
+                for(int k=0; k<4; ++k) h2[k] = __float22half2_rn(make_float2(dst1_vals[2*k], dst1_vals[2*k+1]));
+                *((float4*)(dst + idst_base + i0 + n_dims/2)) = v_out;
+            } else {
+                float4 v_out;
+                float* f = (float*)&v_out;
+                for(int k=0; k<4; ++k) f[k] = dst1_vals[k];
+                *((float4*)(dst + idst_base + i0 + n_dims/2)) = v_out;
+            }
+        } else {
+            for(int k=0; k<vec_elem; ++k) {
+                if(i0 + k < ne0/2) {
+                    dst[idst_base + i0 + k] = (D)dst0_vals[k];
+                    dst[idst_base + i0 + k + n_dims/2] = (D)dst1_vals[k];
+                }
+            }
+        }
+    } else {
+        dst[idst_base + i0] = (D)dst0_vals[0];
+        dst[idst_base + i0 + n_dims/2] = (D)dst1_vals[0];
+    }
 }
 
 template<bool forward, bool has_ff, typename T>
@@ -342,20 +428,61 @@ static void rope_neox_cuda(const T *            x,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne0 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int n_blocks_x = (ne0 + 2*CUDA_ROPE_BLOCK_SIZE - 1) / (2*CUDA_ROPE_BLOCK_SIZE);
-    const dim3 block_nums(nr, n_blocks_x, 1);
+    
+    // Check alignment for vectorization
+    // float4 (16 bytes) alignment required for address and strides.
+    constexpr int vec_bytes = 16;
+    constexpr int vec_elem_T = vec_bytes / sizeof(T);
+    
+    // x alignment
+    bool is_aligned = ((uint64_t)x % vec_bytes == 0) &&
+                      ((uint64_t)dst % vec_bytes == 0) &&
+                      (s1 % vec_elem_T == 0) &&
+                      (s2 % vec_elem_T == 0) &&
+                      (n_dims % vec_elem_T == 0) && 
+                      ((n_dims/2) % vec_elem_T == 0) &&
+                      (ne0 == n_dims) &&           // Simplified logic only supports full rotation
+                      (ne0 % vec_elem_T == 0) &&   // Head dim must be multiple of vector size
+                      (set_rows_stride == 0);      // Dynamic offsets cannot be verified for alignment
+
+    // If D is different from T (e.g. float vs half), alignment requirements might differ.
+    // But float4 load/store requires 16 byte alignment regardless.
+    
+    int vec_elem = 1;
+    if (is_aligned) {
+        vec_elem = std::is_same_v<T, half> ? 8 : 4;
+    }
+
+    const int block_size = CUDA_ROPE_BLOCK_SIZE;
+    const int total_threads_x = (ne0/2 + vec_elem - 1) / vec_elem;
+    const int n_blocks_y = (total_threads_x + block_size - 1) / block_size;
+    
+    const dim3 block_dims(1, block_size, 1);
+    const dim3 block_nums(nr, n_blocks_y, 1);
 
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
 
-    if (freq_factors == nullptr) {
-        rope_neox<forward, false><<<block_nums, block_dims, 0, stream>>>(
-            x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-            freq_factors, row_indices, set_rows_stride);
+    if (is_aligned) {
+        constexpr int v_elem = std::is_same_v<T, half> ? 8 : 4;
+        if (freq_factors == nullptr) {
+            rope_neox<forward, false, T, D, v_elem><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+                freq_factors, row_indices, set_rows_stride);
+        } else {
+            rope_neox<forward, true, T, D, v_elem><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+                freq_factors, row_indices, set_rows_stride);
+        }
     } else {
-        rope_neox<forward, true><<<block_nums, block_dims, 0, stream>>>(
-            x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-            freq_factors, row_indices, set_rows_stride);
+        if (freq_factors == nullptr) {
+            rope_neox<forward, false, T, D, 1><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+                freq_factors, row_indices, set_rows_stride);
+        } else {
+            rope_neox<forward, true, T, D, 1><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+                freq_factors, row_indices, set_rows_stride);
+        }
     }
 }
 

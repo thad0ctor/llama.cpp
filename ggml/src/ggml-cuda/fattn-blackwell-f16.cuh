@@ -61,8 +61,12 @@ struct blackwell_config {
     static constexpr int BLOCK_N = 128; // K/V block size
     static constexpr int STAGES  = 2;
     
+    // Dimensions
+    static constexpr int HEAD_SIZE_Q = DKQ;
+    static constexpr int HEAD_SIZE_V = DV;
+    
     // Thread configuration
-    static constexpr int WARPS_CONSUMER = 4;
+    static constexpr int WARPS_CONSUMER = 7;
     static constexpr int WARPS_PRODUCER = 1;
     static constexpr int NUM_WARPS      = WARPS_CONSUMER + WARPS_PRODUCER;
     static constexpr int NUM_THREADS    = NUM_WARPS * WARP_SIZE;
@@ -78,14 +82,14 @@ struct SharedStorage {
     
     // Q tile for loading (Global -> Shared -> Regs)
     // Size: BLOCK_M * DKQ
-    half_t Q[Config::BLOCK_M * 576]; // Max DKQ=576
+    half_t Q[Config::BLOCK_M * Config::HEAD_SIZE_Q];
     
     struct Stage {
         // K and V tiles.
         // We use a flat buffer. For MLA, they might be the same.
         // Size: BLOCK_N * Max(DKQ, DV)
-        half_t K[Config::BLOCK_N * 576]; 
-        half_t V[Config::BLOCK_N * 512];
+        half_t K[Config::BLOCK_N * Config::HEAD_SIZE_Q]; 
+        half_t V[Config::BLOCK_N * Config::HEAD_SIZE_V];
     };
     
     Stage stages[Config::STAGES];
@@ -139,6 +143,7 @@ __device__ __forceinline__ uint64_t make_wgmma_desc(
 // ----------------------------------------------------------------------------
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool mla>
+__launch_bounds__(256, 2)
 __global__ void flash_attn_blackwell_f16(
     const char * __restrict__ Q,
     const char * __restrict__ K,

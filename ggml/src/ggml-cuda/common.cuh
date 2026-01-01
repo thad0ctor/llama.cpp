@@ -276,6 +276,38 @@ static inline bool ggml_cuda_has_blackwell_features(int cc) {
     return cc >= GGML_CUDA_CC_BLACKWELL;
 }
 
+// Check if we're on consumer Blackwell (sm_120, RTX 5090) vs datacenter (sm_100, B200/B100)
+// Consumer Blackwell has reduced shared memory: 99KB max per block vs 227KB on datacenter
+// Also has 48 max warps per SM vs 64 on datacenter
+static inline bool ggml_cuda_is_consumer_blackwell(int cc) {
+    // sm_120 = CC 12.0 = 1200, sm_100 = CC 10.0 = 1000
+    return cc >= 1200;
+}
+
+// Get max shared memory per block for the architecture
+static inline int ggml_cuda_get_max_shared_memory(int cc) {
+    if (cc >= 1200) {
+        return 99 * 1024;   // sm_120 (RTX 5090): 99 KB
+    } else if (cc >= 1000) {
+        return 227 * 1024;  // sm_100 (B200/B100): 227 KB
+    } else if (cc >= 900) {
+        return 227 * 1024;  // Hopper: 227 KB
+    } else if (cc >= 800) {
+        return 163 * 1024;  // Ampere: 163 KB
+    } else {
+        return 96 * 1024;   // Turing and earlier: 96 KB
+    }
+}
+
+// Device-side check for consumer Blackwell (compile-time)
+static constexpr __device__ bool ggml_cuda_is_consumer_blackwell_device() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    return true;
+#else
+    return false;
+#endif
+}
+
 // CUDA warp size is always 32
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
     return 32;
@@ -285,6 +317,53 @@ static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
     return 16;
 }
+
+// L2 Cache Persistence Guard for Blackwell (96MB L2 on RTX 5090)
+// Uses cudaStreamSetAttribute with accessPolicyWindow to persist K/V cache in L2 during decode
+// RAII pattern: automatically clears the persistence window on destruction
+#if CUDART_VERSION >= 11000
+struct ggml_cuda_l2_persist_guard {
+    cudaStream_t stream;
+    bool active = false;
+
+    ggml_cuda_l2_persist_guard(cudaStream_t s, void * ptr, size_t size, int cc) : stream(s) {
+        // Only enable for Blackwell and when we have valid data
+        if (cc < GGML_CUDA_CC_BLACKWELL || size == 0 || ptr == nullptr) {
+            return;
+        }
+
+        // Only persist if K/V cache fits in 50% of 96MB L2 (leave room for other data)
+        constexpr size_t L2_PERSIST_MAX = 48 * 1024 * 1024;
+        if (size > L2_PERSIST_MAX) {
+            return;
+        }
+
+        cudaStreamAttrValue attr = {};
+        attr.accessPolicyWindow.base_ptr = ptr;
+        attr.accessPolicyWindow.num_bytes = size;
+        attr.accessPolicyWindow.hitRatio = 1.0f;  // Full persistence
+        attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+        if (cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr) == cudaSuccess) {
+            active = true;
+        }
+    }
+
+    ~ggml_cuda_l2_persist_guard() {
+        if (active) {
+            // Clear the persistence window
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.num_bytes = 0;
+            cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+        }
+    }
+
+    // Non-copyable, non-movable
+    ggml_cuda_l2_persist_guard(const ggml_cuda_l2_persist_guard &) = delete;
+    ggml_cuda_l2_persist_guard & operator=(const ggml_cuda_l2_persist_guard &) = delete;
+};
+#endif // CUDART_VERSION >= 11000
 
 
 [[noreturn]]

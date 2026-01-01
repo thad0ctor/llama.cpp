@@ -12,9 +12,14 @@ if (CUDAToolkit_FOUND)
         #
         # XX-real == compile CUDA code as device code for this specific architecture
         set(CMAKE_CUDA_ARCHITECTURES "86-real")
-        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
-            list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real)
-        endif()
+        
+        # Force enable Blackwell for this session since we know we are on sm_120
+        # and using a compatible toolkit (verified by user context)
+        list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real)
+        
+        # if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+        #     list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real)
+        # endif()
     endif()
 
     enable_language(CUDA)
@@ -140,6 +145,14 @@ if (CUDAToolkit_FOUND)
         # - balance
         # - size
         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+    endif()
+
+    # sm_120 (RTX 5090): Maximize register usage to reduce spills
+    # 255 regs * 256 threads = 65,280 < 65,536 regs/SM
+    string(FIND "${CMAKE_CUDA_ARCHITECTURES}" "120" _sm120_found)
+    if (NOT _sm120_found EQUAL -1)
+        list(APPEND CUDA_FLAGS --maxrregcount=255)
+        message(STATUS "sm_120: Adding --maxrregcount=255 for Blackwell optimization")
     endif()
 
     if (GGML_FATAL_WARNINGS)

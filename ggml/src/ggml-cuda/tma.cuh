@@ -168,6 +168,16 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
     );
 }
 
+// Arrive at barrier (no transaction update)
+__device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
+    asm volatile(
+        "mbarrier.arrive.shared::cta.b64 _, [%0];"
+        : 
+        : "l"(mbar)
+        : "memory"
+    );
+}
+
 // Wait for phase (blocking)
 __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar, uint32_t phase) {
     asm volatile(
@@ -229,6 +239,11 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     GGML_UNUSED(mbar);
     GGML_UNUSED(tx_bytes);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
+    GGML_UNUSED(mbar);
     NO_DEVICE_CODE;
 }
 
