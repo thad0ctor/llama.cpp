@@ -199,10 +199,10 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
 
-    // DEBUG: print before expect_tx (catch blocks 14, 26-31 that crash first)
+    // DEBUG: print before PTX with alignment check
     if (threadIdx.x == 0 && blockIdx.x < 50) {
-        printf("[MBAR] Block %d: before expect_tx, mbar_addr=0x%x tx_bytes=%u\n",
-               blockIdx.x, mbar_addr, tx_bytes);
+        printf("[MBAR DEBUG] Block %d: mbar=%p mbar_addr=0x%x aligned=%d tx_bytes=%u\n",
+               blockIdx.x, mbar, mbar_addr, (mbar_addr % 8 == 0), tx_bytes);
     }
 
     asm volatile(
