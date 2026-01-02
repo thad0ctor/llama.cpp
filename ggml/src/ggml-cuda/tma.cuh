@@ -144,8 +144,29 @@ __device__ __forceinline__ void tma_load_2d(
 }
 
 // Fence to ensure TMA descriptor reads are visible
-__device__ __forceinline__ void tma_fence_acquire() {
-    asm volatile("fence.proxy.tensormap::generic.acquire.gpu;");
+// On sm_120 (Blackwell), use __threadfence_system() to ensure tensor map descriptors
+// copied via cudaMemcpyAsync from host are visible to the GPU before TMA operations.
+// 
+// Note: The fence.proxy.tensormap::generic.acquire instruction has PTX syntax issues
+// with CUDA 13.1/sm_120. Using __threadfence_system() provides system-wide memory
+// ordering which is appropriate since tensor maps are copied from host memory.
+__device__ __forceinline__ void tma_fence_acquire(const void* tensor_map, uint32_t size_bytes) {
+    (void)tensor_map;
+    (void)size_bytes;
+    __threadfence_system();
+}
+
+// Convenience overload for acquiring visibility of a single CUtensorMap
+__device__ __forceinline__ void tma_fence_acquire(const CUtensorMap* tensor_map) {
+    (void)tensor_map;
+    __threadfence_system();
+}
+
+// Acquire visibility for multiple consecutive tensor maps (e.g., K and V maps)
+__device__ __forceinline__ void tma_fence_acquire_maps(const void* tensor_maps, int num_maps) {
+    (void)tensor_maps;
+    (void)num_maps;
+    __threadfence_system();
 }
 
 // Initialize barrier with expected transaction count
@@ -226,7 +247,20 @@ __device__ __forceinline__ void tma_load_2d(
     NO_DEVICE_CODE;
 }
 
-__device__ __forceinline__ void tma_fence_acquire() {
+__device__ __forceinline__ void tma_fence_acquire(const void* tensor_map, uint32_t size_bytes) {
+    GGML_UNUSED(tensor_map);
+    GGML_UNUSED(size_bytes);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void tma_fence_acquire(const CUtensorMap* tensor_map) {
+    GGML_UNUSED(tensor_map);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void tma_fence_acquire_maps(const void* tensor_maps, int num_maps) {
+    GGML_UNUSED(tensor_maps);
+    GGML_UNUSED(num_maps);
     NO_DEVICE_CODE;
 }
 

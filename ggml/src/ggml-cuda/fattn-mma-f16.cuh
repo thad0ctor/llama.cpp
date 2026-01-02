@@ -791,8 +791,9 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
-    // CRITICAL: TMA fence to ensure tensor map descriptor is visible
-    tma_fence_acquire();
+    // CRITICAL: TMA fence to ensure tensor map descriptors (K and V) are visible
+    // Uses .sys scope since tensor maps are copied from host via cudaMemcpyAsync
+    tma_fence_acquire_maps(tensor_maps, 2);
     
     const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
     const CUtensorMap* map_V = (const CUtensorMap*)(tensor_maps + sizeof(CUtensorMap));
@@ -880,9 +881,9 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
-    // CRITICAL: TMA fence to ensure tensor map descriptor is visible
-    // Must be called before any TMA operations using the tensor map
-    tma_fence_acquire();
+    // CRITICAL: TMA fence to ensure tensor map descriptors (K and V) are visible
+    // Uses .sys scope since tensor maps are copied from host via cudaMemcpyAsync
+    tma_fence_acquire_maps(tensor_maps, 2);
     
     // IMMEDIATE DEBUG - print from ALL blocks
     if (threadIdx.x == 0) {
