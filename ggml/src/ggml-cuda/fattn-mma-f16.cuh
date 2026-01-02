@@ -787,7 +787,8 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     fattn_pipeline_state* __restrict__ state,
     int kb0_start,
     int kb0_stop,
-    int num_consumers)
+    int num_consumers,
+    int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
     const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
@@ -813,7 +814,8 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
         const int iter = kb0 - kb0_start;
         const int stage = iter % nstages;
-        const int row_offset = kb0 * nbatch_fa;
+        // CRITICAL: Add kv_head_row_offset for multi-head TMA access!
+        const int row_offset = kv_head_row_offset + kb0 * nbatch_fa;
 
         // K Phase: use tile-level barriers, Blackwell layout
         mbarrier_wait(&state->empty_K[stage], phase);
@@ -845,6 +847,7 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     GGML_UNUSED(kb0_start);
     GGML_UNUSED(kb0_stop);
     GGML_UNUSED(num_consumers);
+    GGML_UNUSED(kv_head_row_offset);
 #endif
 }
 
@@ -870,12 +873,13 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     fattn_pipeline_state* __restrict__ state,
     int kb0_start,
     int kb0_stop,
-    int num_consumers)
+    int num_consumers,
+    int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
     // IMMEDIATE DEBUG - print from ALL blocks
     if (threadIdx.x == 0) {
-        printf("[PRODUCER CHUNKED] Block %d: ENTERED\n", blockIdx.x);
+        printf("[PRODUCER CHUNKED] Block %d: ENTERED, head_row_offset=%d\n", blockIdx.x, kv_head_row_offset);
     }
     
     const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
@@ -907,7 +911,14 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     // Iterate over tile indices (kb0 is a tile index, not a row offset)
     for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
         // Compute row offset for TMA coordinates
-        const int row_offset = kb0 * nbatch_fa;
+        // CRITICAL: Add kv_head_row_offset for multi-head TMA access!
+        const int row_offset = kv_head_row_offset + kb0 * nbatch_fa;
+        
+        // DEBUG: Check row bounds
+        if (threadIdx.x == 0) {
+            printf("[ROW CHECK] Block %d: kb0=%d row_offset=%d (head_base=%d + kb0*%d)\n",
+                   blockIdx.x, kb0, row_offset, kv_head_row_offset, nbatch_fa);
+        }
 
         // NOTE: Do NOT reset phases here. The phases track the barrier's state
         // across kb0 iterations. The phase flips happen in the chunk loop below.
@@ -1016,6 +1027,7 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     GGML_UNUSED(kb0_start);
     GGML_UNUSED(kb0_stop);
     GGML_UNUSED(num_consumers);
+    GGML_UNUSED(kv_head_row_offset);
 #endif
 }
 
@@ -1030,7 +1042,8 @@ static __device__ __forceinline__ void fattn_producer_loop(
     fattn_pipeline_state* __restrict__ state,
     int kb0_start,
     int kb0_stop,
-    int num_consumers)
+    int num_consumers,
+    int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
     constexpr bool needs_K_chunking = (DKQ/2 > nbatch_K2);
     constexpr bool needs_V_chunking = (DV/2 > nbatch_V2);
@@ -1038,10 +1051,10 @@ static __device__ __forceinline__ void fattn_producer_loop(
 
     if constexpr (needs_chunking) {
         fattn_producer_loop_chunked<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
-            tensor_maps, state, kb0_start, kb0_stop, num_consumers);
+            tensor_maps, state, kb0_start, kb0_stop, num_consumers, kv_head_row_offset);
     } else {
         fattn_producer_loop_legacy<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
-            tensor_maps, state, kb0_start, kb0_stop, num_consumers);
+            tensor_maps, state, kb0_start, kb0_stop, num_consumers, kv_head_row_offset);
     }
 }
 
@@ -2775,6 +2788,7 @@ __global__ void flash_attn_ext_f16_blackwell(
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
         printf("[KERNEL DEBUG] Blackwell kernel ENTRY - block=(%d,%d,%d) thread=(%d,%d)\n",
                blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y);
+        printf("[KERNEL DEBUG] ne11=%d (K seq len), ne12=%d, ne13=%d\n", ne11, ne12, ne13);
     }
     __syncthreads();
 
@@ -2909,6 +2923,8 @@ __global__ void flash_attn_ext_f16_blackwell(
                blockIdx.x, iter_k, iter_j, ne02, ncols2);
         printf("[KERNEL DEBUG] Block %d: kbc=%d, kbc_stop=%d, kb0_start=%d, kb0_stop=%d\n",
                blockIdx.x, kbc, kbc_stop, kb0_start, kb0_stop);
+        printf("[KERNEL DEBUG] Block %d: ne11=%d, max_row=%d (nbatch_fa=%d)\n",
+               blockIdx.x, ne11, (iter_k-1)*nbatch_fa, nbatch_fa);
     }
     
     // Debug ALL blocks to find which one crashes
@@ -3018,8 +3034,13 @@ __global__ void flash_attn_ext_f16_blackwell(
          // Now diverge: Producer does K/V loading, Consumers do computation
          if (threadIdx.y == 0) {
              // Producer: K/V loading loop
+             // Calculate KV head row offset for TMA coordinates
+             // zt is the KV head group index, ne11 is rows per KV head
+             const int kv_head_row_offset = zt * ne11;
+             
              if (threadIdx.x == 0) {
-                 printf("[PRODUCER] Block %d: Waiting Q_loaded phase=%d\n", blockIdx.x, q_phase);
+                 printf("[PRODUCER] Block %d: Waiting Q_loaded phase=%d, kv_head_row_offset=%d (zt=%d * ne11=%d)\n", 
+                        blockIdx.x, q_phase, kv_head_row_offset, zt, ne11);
              }
              mbarrier_wait(&state->Q_loaded, q_phase);
              if (threadIdx.x == 0) {
@@ -3027,7 +3048,7 @@ __global__ void flash_attn_ext_f16_blackwell(
              }
              q_phase ^= 1;
              fattn_producer_loop<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
-                 tensor_maps, state, kb0_start, kb0_stop, num_consumers);
+                 tensor_maps, state, kb0_start, kb0_stop, num_consumers, kv_head_row_offset);
              if (threadIdx.x == 0) {
                  printf("[PRODUCER] Block %d: producer_loop returned\n", blockIdx.x);
              }
