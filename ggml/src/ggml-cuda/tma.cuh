@@ -194,8 +194,8 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
     );
 }
 
-// Arrive and expect N bytes of async transactions
-// PTX requires .sem.scope qualifiers (.release.cta) for sm_90+
+// Set expected TX bytes AND arrive at barrier (combined operation)
+// Uses NVIDIA's exact PTX syntax from CCCL headers
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
 
@@ -205,39 +205,29 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
                blockIdx.x, mbar, mbar_addr, (mbar_addr % 8 == 0), tx_bytes);
     }
 
+    // Use NVIDIA's exact PTX syntax from CCCL headers
+    uint64_t state;
     asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
+        : "=l"(state)
         : "r"(mbar_addr), "r"(tx_bytes)
         : "memory"
     );
 
-    // DEBUG: print after expect_tx, before arrive
+    // DEBUG: print after PTX
     if (threadIdx.x == 0 && blockIdx.x < 50) {
-        printf("[MBAR] Block %d: after expect_tx, before arrive\n", blockIdx.x);
-    }
-
-    // Step 2: Arrive at the barrier (required for barrier completion)
-    asm volatile(
-        "mbarrier.arrive.shared::cta.b64 _, [%0];"
-        :
-        : "r"(mbar_addr)
-        : "memory"
-    );
-
-    // DEBUG: print after arrive
-    if (threadIdx.x == 0 && blockIdx.x < 50) {
-        printf("[MBAR] Block %d: after arrive\n", blockIdx.x);
+        printf("[MBAR] Block %d: arrive_expect_tx DONE\n", blockIdx.x);
     }
 }
 
 // Arrive at barrier (no transaction update)
-// PTX requires .sem.scope qualifiers (.release.cta) for sm_90+
+// Uses NVIDIA's exact PTX syntax from CCCL headers
 __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
+    uint64_t state;
     asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :
+        "mbarrier.arrive.release.cta.shared::cta.b64 %0, [%1];"
+        : "=l"(state)
         : "r"(mbar_addr)
         : "memory"
     );
