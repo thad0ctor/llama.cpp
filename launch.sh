@@ -3,6 +3,17 @@
 # Stop on error
 set -e
 
+# Setup logging
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs/server"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/llama-server_$(date '+%Y-%m-%d_%H-%M-%S').log"
+
+echo "Logging to: $LOG_FILE"
+
+# Start logging (output to both terminal and log file)
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 # Activate the specified virtual environment
 VENV_PATH="/home/rgilbreth/Desktop/AI-Software/Venvs/unsloth-xformers/venv/bin/activate"
 if [ -f "$VENV_PATH" ]; then
