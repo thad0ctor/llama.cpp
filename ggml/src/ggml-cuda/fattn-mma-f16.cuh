@@ -122,12 +122,14 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
         if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 16, 2, true, 4);
     }
     if (DKQ == 80 && DV == 80) {
-        // nbatch_K2 >= 40, nbatch_V2 >= 40 to avoid chunking
-        // Shared mem: 64 × (40 + 40) × 4 × 2 = 40KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 40, 40, 20, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 40, 40, 20, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 40, 40, 20, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 40, 40, 20, 2, true, 4);
+        // nbatch_K2=32 to fit SWIZZLE_128B, enables 2-chunk pipelining
+        // num_K_chunks = ceil(40/32) = 2
+        // nbatch_combine=20 to satisfy (DV/2) % nbatch_combine == 0 → 40 % 20 = 0
+        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
+        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
+        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
+        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
+        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
     }
     
     // ========== TIER 2: Medium heads - 4 consumers (160 threads) ==========
@@ -135,29 +137,34 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // Chunking constraint: nbatch_K2 >= DKQ/2, nbatch_V2 >= DV/2
     
     if (DKQ == 96 && DV == 96) {
-        // nbatch_K2 >= 48, nbatch_V2 >= 48 to avoid chunking
-        // Shared mem: 64 × (48 + 48) × 4 × 2 = 48KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 48, 48, 24, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 48, 48, 24, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 48, 48, 24, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 48, 48, 24, 2, true, 4);
+        // nbatch_K2=32 to fit SWIZZLE_128B, enables 2-chunk pipelining
+        // num_K_chunks = ceil(48/32) = 2
+        // nbatch_combine=24 to satisfy (DV/2) % nbatch_combine == 0 → 48 % 24 = 0
+        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
+        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
+        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
+        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
+        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
     }
     if (DKQ == 112 && DV == 112) {
-        // nbatch_K2 >= 56, nbatch_V2 >= 56 to avoid chunking
-        // Shared mem: 64 × (56 + 56) × 4 × 2 = 56KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 56, 56, 28, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 56, 56, 28, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 56, 56, 28, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 56, 56, 28, 2, true, 4);
+        // nbatch_K2=32 to fit SWIZZLE_128B, enables 2-chunk pipelining
+        // num_K_chunks = ceil(56/32) = 2
+        // nbatch_combine=28 to satisfy (DV/2) % nbatch_combine == 0 → 56 % 28 = 0
+        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
+        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
+        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
+        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
+        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
     }
     if (DKQ == 128 && DV == 128) {
         // Most common: Llama, Mistral, Qwen, etc.
-        // nbatch_K2 >= 64, nbatch_V2 >= 64 to avoid chunking
-        // Shared mem: 64 × (64 + 64) × 4 × 2 = 64KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, false, 4);
+        // nbatch_K2=32 to fit SWIZZLE_128B (max 32 half2 = 64 half = 128 bytes)
+        // This enables 2-chunk pipelining: num_K_chunks = 64/32 = 2
+        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
+        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
+        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
+        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
+        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, false, 4);
     }
     
     // ========== Large heads - Fall back to Ampere ==========
@@ -3143,18 +3150,23 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // Use if constexpr to prevent template instantiation for unsupported DKQ/DV/ncols combinations
     if constexpr (ggml_cuda_fattn_has_blackwell_config(DKQ, DV, ncols)) {
         if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime && config_bw.num_consumers > 0) {
-            // Check if chunk pipelining is needed - currently has bugs for DKQ > 2*nbatch_K2
-            // Fall back to Ampere kernel which is more stable
-            const bool needs_K_chunking = (DKQ/2 > config_bw.nbatch_K2);
-            const bool needs_V_chunking = (DV/2 > config_bw.nbatch_V2);
-            if (needs_K_chunking || needs_V_chunking) {
+            // Check chunk count - double-buffering supports exactly 2 chunks per dimension
+            // num_K_chunks = ceil(DKQ/2 / nbatch_K2), num_V_chunks = ceil(DV/2 / nbatch_V2)
+            // With nbatch_K2=32 for DKQ=128: num_K_chunks = 64/32 = 2 (perfect for double-buffer)
+            const int num_K_chunks = (DKQ/2 + config_bw.nbatch_K2 - 1) / config_bw.nbatch_K2;
+            const int num_V_chunks = (DV/2 + config_bw.nbatch_V2 - 1) / config_bw.nbatch_V2;
+            const bool too_many_chunks = (num_K_chunks > 2) || (num_V_chunks > 2);
+            
+            if (too_many_chunks) {
                 if (!debug_printed && DKQ == 128 && DV == 128) {
-                    fprintf(stderr, "[FATTN DEBUG]   ==> SKIP Blackwell: chunking required\n");
+                    fprintf(stderr, "[FATTN DEBUG]   ==> SKIP Blackwell: too many chunks (K=%d, V=%d, max=2)\n", 
+                            num_K_chunks, num_V_chunks);
                 }
                 // Skip Blackwell kernel, use Ampere fallback below
             } else {
                 if (!debug_printed && DKQ == 128 && DV == 128) {
-                    fprintf(stderr, "[FATTN DEBUG]   ==> LAUNCHING BLACKWELL KERNEL!\n");
+                    fprintf(stderr, "[FATTN DEBUG]   ==> LAUNCHING BLACKWELL KERNEL (chunks: K=%d, V=%d)!\n",
+                            num_K_chunks, num_V_chunks);
                     fprintf(stderr, "[FATTN DEBUG] ===================================\n\n");
                     debug_printed = true;
                 }
