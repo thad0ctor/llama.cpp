@@ -136,6 +136,12 @@ __device__ __forceinline__ void tma_load_2d(
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar_ptr);
     uint64_t tmap_addr = reinterpret_cast<uint64_t>(tensor_map);
 
+    // DEBUG: print before PTX (wider filter to catch active blocks)
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
+        printf("[TMA_LOAD_2D] Block %d: coord_x=%d coord_y=%d smem=0x%x mbar=0x%x\n",
+               blockIdx.x, coord_x, coord_y, smem_addr, mbar_addr);
+    }
+
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes "
         "[%0], [%1, {%2, %3}], [%4] ;"
@@ -144,6 +150,11 @@ __device__ __forceinline__ void tma_load_2d(
           "r"(mbar_addr)
         : "memory"
     );
+
+    // DEBUG: print after PTX
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
+        printf("[TMA_LOAD_2D] Block %d: PTX issued\n", blockIdx.x);
+    }
 }
 
 // Fence to ensure TMA descriptor reads are visible
@@ -187,12 +198,24 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
 // PTX requires .sem.scope qualifiers (.release.cta) for sm_90+
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
+
+    // DEBUG: print before PTX (wider filter to catch active blocks)
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
+        printf("[MBAR_ARRIVE_TX] Block %d: mbar=%p mbar_addr=0x%x tx_bytes=%u\n",
+               blockIdx.x, mbar, mbar_addr, tx_bytes);
+    }
+
     asm volatile(
         "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :
         : "r"(mbar_addr), "r"(tx_bytes)
         : "memory"
     );
+
+    // DEBUG: print after PTX
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
+        printf("[MBAR_ARRIVE_TX] Block %d: PTX done\n", blockIdx.x);
+    }
 }
 
 // Arrive at barrier (no transaction update)

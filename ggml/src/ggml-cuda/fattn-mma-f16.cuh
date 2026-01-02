@@ -592,8 +592,20 @@ static __device__ __forceinline__ void load_tile_tma_multistrip(
         bool arrive) 
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    // DEBUG: Very first line in function
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
+        printf("[MULTISTRIP ENTRY] Block %d: smem=%p mbar=%p coord_x_h2=%d coord_y=%d arrive=%d\n",
+               blockIdx.x, smem_buffer, mbar, coord_x_base_h2, coord_y, arrive);
+    }
+
     if (arrive) {
         uint32_t bytes = nbatch_fa * nbatch_K2 * sizeof(half2);
+
+        if (threadIdx.x == 0 && blockIdx.x < 50) {
+            printf("[MULTISTRIP] Block %d: about to call mbarrier_arrive_expect_tx bytes=%u\n",
+                   blockIdx.x, bytes);
+        }
+
         mbarrier_arrive_expect_tx(mbar, bytes);
     }
     
@@ -1050,6 +1062,12 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
             if (threadIdx.x == 0 && kb0 == kb0_start) {
                 printf("[K CHUNK] Block %d: chunk=%d TMA k0=%d row=%d coord_x=%d smem=%p\n",
                        blockIdx.x, chunk, k0, row_offset, k0 * 2, tile_K_chunk);
+            }
+
+            // DEBUG: Right before load_tile_tma_multistrip call
+            if (threadIdx.x == 0 && blockIdx.x < 50) {
+                printf("[K CHUNK PRE-CALL] Block %d: chunk_stage=%d mbar=%p\n",
+                       blockIdx.x, chunk_stage, &state->full_K_chunk[chunk_stage]);
             }
 
             // Load this K chunk via TMA
