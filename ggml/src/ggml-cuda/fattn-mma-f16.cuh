@@ -873,8 +873,18 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     int num_consumers)
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    // IMMEDIATE DEBUG
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("[PRODUCER CHUNKED] ENTERED fattn_producer_loop_chunked\n");
+    }
+    
     const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
     const CUtensorMap* map_V = (const CUtensorMap*)(tensor_maps + sizeof(CUtensorMap));
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("[PRODUCER CHUNKED] tensor_maps=%p, map_K=%p, map_V=%p\n",
+               tensor_maps, map_K, map_V);
+    }
 
     extern __shared__ char smem_base[];
     // Double-buffered chunk storage: 2 chunk buffers for K, 2 for V
@@ -920,23 +930,28 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
             const int k0 = chunk * nbatch_K2;
 
             // DEBUG: Print K chunk info
-            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
-                printf("[PRODUCER DEBUG] K chunk %d: waiting on empty_K_chunk[%d] phase=%d\n",
+            if (threadIdx.x == 0 && blockIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: about to wait on empty_K_chunk[%d] phase=%d\n",
                        chunk, chunk_stage, chunk_phase_K);
+                printf("[PRODUCER DEBUG]   barrier addr=%p\n", &state->empty_K_chunk[chunk_stage]);
             }
 
             // Wait for consumer to finish with this chunk buffer
             mbarrier_wait(&state->empty_K_chunk[chunk_stage], chunk_phase_K);
+            
+            if (threadIdx.x == 0 && blockIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: empty_K_chunk wait COMPLETE\n", chunk);
+            }
 
             // Load chunk to the correct buffer (alternating between 0 and 1)
             half2* tile_K_chunk = tile_K_base + chunk_stage * (bytes_K_chunk / sizeof(half2));
 
             // DEBUG: Print TMA load info
-            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
-                printf("[PRODUCER DEBUG] K chunk %d: loading k0=%d row_offset=%d -> smem offset=%ld bytes\n",
+            if (threadIdx.x == 0 && blockIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: BEFORE TMA - k0=%d row_offset=%d smem_offset=%ld\n",
                        chunk, k0, row_offset, (long)((char*)tile_K_chunk - smem_base));
-                printf("[PRODUCER DEBUG] K chunk %d: TMA coord_x=%d (k0*2) coord_y=%d\n",
-                       chunk, k0 * 2, row_offset);
+                printf("[PRODUCER DEBUG] K chunk %d: TMA coord_x=%d coord_y=%d, dest=%p, barrier=%p\n",
+                       chunk, k0 * 2, row_offset, tile_K_chunk, &state->full_K_chunk[chunk_stage]);
             }
 
             // Load this K chunk via TMA
@@ -944,9 +959,8 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
                 map_K, tile_K_chunk, &state->full_K_chunk[chunk_stage], k0, row_offset, true);
 
             // DEBUG: Print after load
-            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
-                printf("[PRODUCER DEBUG] K chunk %d: TMA issued to full_K_chunk[%d]\n",
-                       chunk, chunk_stage);
+            if (threadIdx.x == 0 && blockIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: TMA ISSUED OK\n", chunk);
             }
 
             // Flip chunk phase after every 2 chunks (when chunk_stage goes from 1 back to 0)
@@ -2884,6 +2898,11 @@ __global__ void flash_attn_ext_f16_blackwell(
     const int iter_k = (ne11 + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j = (ne01.z + (ncols1 - 1)) / ncols1;
     
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[KERNEL DEBUG] iter_k=%d, iter_j=%d, ne02=%d, ncols2=%d, ne03=%d\n",
+               iter_k, iter_j, ne02, ncols2, ne03);
+    }
+    
     // Grid Logic
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
     const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
@@ -2891,9 +2910,19 @@ __global__ void flash_attn_ext_f16_blackwell(
     int kb0_start = kbc % iter_k;
     int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
 
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[KERNEL DEBUG] kbc=%d, kbc_stop=%d, kb0_start=%d, kb0_stop=%d\n",
+               kbc, kbc_stop, kb0_start, kb0_stop);
+        printf("[KERNEL DEBUG] Loop condition: kbc < kbc_stop = %d, kb0_stop == iter_k = %d\n",
+               kbc < kbc_stop, kb0_stop == iter_k);
+    }
+
     uint32_t q_phase = 0;
 
     while (kbc < kbc_stop && kb0_stop == iter_k) {
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[KERNEL DEBUG] Entered while loop, kbc=%d\n", kbc);
+        }
          const int sequence = kbc / (iter_k*iter_j*(ne02/ncols2));
          const int zt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence) / (iter_k*iter_j); 
          const int jt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence - iter_k*iter_j*zt) / iter_k;
@@ -2929,9 +2958,18 @@ __global__ void flash_attn_ext_f16_blackwell(
          // For Q loading, we use threadIdx.y directly (0-8) instead of consumer warp_id.
          // =====================================================================
 
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[Q LOAD DEBUG] Starting Q loading phase\n");
+        }
+
         constexpr int stride_tile_Q_local = DKQ/2 + 4;
         // Q tiles are after the KV chunk buffers in the new layout
         half2 * tile_Q = (half2*)(smem + bytes_KV_total);
+
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[Q LOAD DEBUG] tile_Q=%p, Q_f2=%p, stride_Q1=%d, stride_Q2=%d\n",
+                   tile_Q, Q_f2, stride_Q1, stride_Q2);
+        }
 
         // Lightweight Q loading: cooperative across all warps, single stride to keep
         // register footprint down. Each warp handles strided columns, each lane
@@ -2952,21 +2990,50 @@ __global__ void flash_attn_ext_f16_blackwell(
                 tile_Q[jc*stride_tile_Q_local + k] = val;
             }
         }
+        
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[Q LOAD DEBUG] Q loading loop done, about to syncthreads\n");
+        }
          __syncthreads();  // All warps hit this barrier
+
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[Q LOAD DEBUG] First syncthreads done\n");
+        }
 
          // Load Q into registers for consumers (producer skips this but still syncs)
          // This is done inside process_tile for consumers
          __syncthreads();  // Second barrier matching process_tile's Q register loading sync
+         
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[Q LOAD DEBUG] Second syncthreads done, heading to divergence\n");
+        }
 
          // Now diverge: Producer does K/V loading, Consumers do computation
+         if (threadIdx.x == 0 && blockIdx.x == 0) {
+             printf("[LOOP DEBUG] Divergence point: threadIdx.y=%d, kb0_start=%d, kb0_stop=%d\n",
+                    threadIdx.y, kb0_start, kb0_stop);
+         }
+         
          if (threadIdx.y == 0) {
              // Producer: K/V loading loop
+             if (threadIdx.x == 0 && blockIdx.x == 0) {
+                 printf("[PRODUCER DEBUG] About to wait on Q_loaded barrier, phase=%d\n", q_phase);
+             }
              mbarrier_wait(&state->Q_loaded, q_phase);
+             if (threadIdx.x == 0 && blockIdx.x == 0) {
+                 printf("[PRODUCER DEBUG] Q_loaded wait complete, calling producer_loop\n");
+             }
              q_phase ^= 1;
              fattn_producer_loop<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
                  tensor_maps, state, kb0_start, kb0_stop, num_consumers);
+             if (threadIdx.x == 0 && blockIdx.x == 0) {
+                 printf("[PRODUCER DEBUG] producer_loop returned\n");
+             }
          } else {
              // Consumer: Main computation (Q already loaded into shared memory)
+             if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0) {
+                 printf("[CONSUMER DEBUG] Consumer warp %d entering process_tile\n", threadIdx.y);
+             }
              constexpr bool is_fixup = false;
              constexpr bool needs_fixup = false;
 
@@ -2975,6 +3042,9 @@ __global__ void flash_attn_ext_f16_blackwell(
              flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
                  Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                   ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0) {
+                 printf("[CONSUMER DEBUG] Consumer warp %d returned from process_tile\n", threadIdx.y);
+             }
          }
          
          kbc += iter_k;
