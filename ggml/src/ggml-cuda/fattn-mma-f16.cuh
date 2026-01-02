@@ -791,6 +791,9 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    // CRITICAL: TMA fence to ensure tensor map descriptor is visible
+    tma_fence_acquire();
+    
     const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
     const CUtensorMap* map_V = (const CUtensorMap*)(tensor_maps + sizeof(CUtensorMap));
 
@@ -877,6 +880,10 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    // CRITICAL: TMA fence to ensure tensor map descriptor is visible
+    // Must be called before any TMA operations using the tensor map
+    tma_fence_acquire();
+    
     // IMMEDIATE DEBUG - print from ALL blocks
     if (threadIdx.x == 0) {
         printf("[PRODUCER CHUNKED] Block %d: ENTERED, head_row_offset=%d\n", blockIdx.x, kv_head_row_offset);
@@ -949,8 +956,8 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
 
             // DEBUG: Print TMA load info (ALL blocks)
             if (threadIdx.x == 0 && kb0 == kb0_start) {
-                printf("[K CHUNK] Block %d: chunk=%d TMA k0=%d row=%d coord_x=%d\n",
-                       blockIdx.x, chunk, k0, row_offset, k0 * 2);
+                printf("[K CHUNK] Block %d: chunk=%d TMA k0=%d row=%d coord_x=%d smem=%p\n",
+                       blockIdx.x, chunk, k0, row_offset, k0 * 2, tile_K_chunk);
             }
 
             // Load this K chunk via TMA
@@ -2788,7 +2795,9 @@ __global__ void flash_attn_ext_f16_blackwell(
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
         printf("[KERNEL DEBUG] Blackwell kernel ENTRY - block=(%d,%d,%d) thread=(%d,%d)\n",
                blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y);
-        printf("[KERNEL DEBUG] ne11=%d (K seq len), ne12=%d, ne13=%d\n", ne11, ne12, ne13);
+        printf("[KERNEL DEBUG] K dims: ne10=%d (head_dim), ne11=%d (K_seq_len), ne12=%d (kv_heads), ne13=%d\n", 
+               ne10, ne11, ne12, ne13);
+        printf("[KERNEL DEBUG] K_total_rows = ne11 * ne12 = %d * %d = %d\n", ne11, ne12, ne11 * ne12);
     }
     __syncthreads();
 
@@ -3037,10 +3046,15 @@ __global__ void flash_attn_ext_f16_blackwell(
              // Calculate KV head row offset for TMA coordinates
              // zt is the KV head group index, ne11 is rows per KV head
              const int kv_head_row_offset = zt * ne11;
+             const int K_total_rows = ne11 * ne12;  // Total rows in K tensor
              
              if (threadIdx.x == 0) {
-                 printf("[PRODUCER] Block %d: Waiting Q_loaded phase=%d, kv_head_row_offset=%d (zt=%d * ne11=%d)\n", 
-                        blockIdx.x, q_phase, kv_head_row_offset, zt, ne11);
+                 printf("[PRODUCER] Block %d: kv_head_row_offset=%d (zt=%d * ne11=%d), K_total_rows=%d\n", 
+                        blockIdx.x, kv_head_row_offset, zt, ne11, K_total_rows);
+                 if (kv_head_row_offset >= K_total_rows) {
+                     printf("[PRODUCER] Block %d: !!! ERROR: kv_head_row_offset=%d >= K_total_rows=%d !!!\n",
+                            blockIdx.x, kv_head_row_offset, K_total_rows);
+                 }
              }
              mbarrier_wait(&state->Q_loaded, q_phase);
              if (threadIdx.x == 0) {
@@ -3270,6 +3284,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         const CUtensorMapSwizzle swizzle_k = use_swizzle_none ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B;
 
         fprintf(stderr, "[TMA DEBUG] K tensor map creation:\n");
+        fprintf(stderr, "[TMA DEBUG]   K->ne[1]=%ld (K seq per head), K->ne[2]=%ld (kv_heads)\n",
+                (long)K->ne[1], (long)K->ne[2]);
+        fprintf(stderr, "[TMA DEBUG]   K_rows=%lu (should be ne[1]*ne[2]=%ld)\n", 
+                (unsigned long)K_rows, (long)(K->ne[1] * K->ne[2]));
+        fprintf(stderr, "[TMA DEBUG]   Max valid row per head = %ld-1 = %ld\n",
+                (long)K->ne[1], (long)(K->ne[1]-1));
         fprintf(stderr, "[TMA DEBUG]   is_consumer_blackwell=%d, nbatch_K2=%d\n", 
                 ggml_cuda_is_consumer_blackwell(cc), nbatch_K2);
         fprintf(stderr, "[TMA DEBUG]   use_swizzle_none=%d, swizzle=%s\n", 
