@@ -151,8 +151,9 @@ if (CUDAToolkit_FOUND)
     # 255 regs * 256 threads = 65,280 < 65,536 regs/SM
     string(FIND "${CMAKE_CUDA_ARCHITECTURES}" "120" _sm120_found)
     if (NOT _sm120_found EQUAL -1)
-        list(APPEND CUDA_FLAGS --maxrregcount=255)
-        message(STATUS "sm_120: Adding --maxrregcount=255 for Blackwell optimization")
+        # Lower max registers to keep occupancy non-zero on Blackwell (sm_120)
+        list(APPEND CUDA_FLAGS --maxrregcount=224)
+        message(STATUS "sm_120: Adding --maxrregcount=224 for Blackwell occupancy")
     endif()
 
     if (GGML_FATAL_WARNINGS)

@@ -77,86 +77,45 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_blackwell(const int DKQ, const int DV, const int ncols) {
-    // Blackwell sm_120 (RTX 5090) optimized configurations.
-    // Warp Specialization: 1 Producer + 8 Consumers (288 threads = 9 warps)
-    //
-    // Block geometry: blockDim = (32, 9) = 288 threads
-    //   - Warp 0 (threadIdx.y=0): Producer only - loads K/V via TMA
-    //   - Warps 1-8 (threadIdx.y=1-8): Consumers - compute attention
-    //
-    // This preserves the original 8-warp tiling math (np calculations) while
-    // having a dedicated producer warp for the pipeline.
-    //
-    // NOTE: sm_120 (RTX 5090) has max 99KB shared memory per block, NOT 227KB like B200 (sm_100).
-    // However, register pressure limits practical shared memory to ~48KB per kernel.
-    // Using nstages_target=2 with smaller tiles to fit in this limit.
-    //
-    // Shared memory calculation: nstages * nbatch_fa * (nbatch_K2 + nbatch_V2) * 4 bytes
-    // Target: ~48KB = 49152 bytes per block
-    //   - With nbatch_fa=128, nbatch_K2=32, nbatch_V2=16: 2 * 128 * (32+16) * 4 = 49152 bytes
-    //   - With nbatch_fa=64, nbatch_K2=32, nbatch_V2=16: 2 * 64 * (32+16) * 4 = 24576 bytes
-    //
-    // Occupancy tuning:
-    // - occupancy=1: For larger configs (~48KB shared memory)
-    // - Higher occupancy possible with smaller configs
-    //
-    // Array size constraints (from flash_attn_ext_f16_iter):
-    //   KQ_C[nbatch_fa/(np * T_C_KQ::J)] must be >= 1
-    //   where np = nwarps_consumer * (cols_per_warp/ncols2) / ncols1
-    //
-    // With nwarps_consumer=8:
-    //   ncols=8:  np=8, need nbatch_fa >= 128
-    //   ncols=16: np=8, need nbatch_fa >= 128
-    //   ncols=32: np=4, need nbatch_fa >= 64
-    //   ncols=64: np=2, need nbatch_fa >= 32
+    // Blackwell sm_120 configurations (NOT USED on RTX 5090 - see ggml_cuda_fattn_has_blackwell_config)
+    // These configs use 288 threads (9 warps) with warp specialization.
+    // RTX 5090 falls back to Ampere kernel due to register limits (288×255 > 65536).
 
     if (DKQ == 576 && DV == 512) {
-        // MLA configuration (576 = 64*9, 512 = 64*8)
-        // Smaller tiles for shared memory: 2 * 128 * (32+16) * 4 = 49152 bytes
         return fattn_mma_config(288, 1, 128, 32, 32, 16, 2, true, 8);
     }
 
-    // Per-ncols configurations to satisfy array size constraints
-    // All use nstages_target=2 for proper producer-consumer pipeline
-    // Reduced tile sizes to fit ~48KB shared memory limit
-
     if (DKQ == 64 && DV == 64) {
-        // 2 * 128 * (16+16) * 4 = 32768 bytes (32KB)
         if (ncols <=  8) return fattn_mma_config(288, 1, 128, 16, 16, 16, 2, true, 8);
         if (ncols <= 16) return fattn_mma_config(288, 1, 128, 16, 16, 16, 2, true, 8);
         if (ncols <= 32) return fattn_mma_config(288, 1,  64, 16, 16, 16, 2, true, 8);
         if (ncols <= 64) return fattn_mma_config(288, 1,  64, 16, 16, 16, 2, true, 8);
     }
     if (DKQ == 80 && DV == 80) {
-        // 2 * 128 * (20+20) * 4 = 40960 bytes (40KB)
         if (ncols <=  8) return fattn_mma_config(288, 1, 128, 20, 20, 20, 2, true, 8);
         if (ncols <= 16) return fattn_mma_config(288, 1, 128, 20, 20, 20, 2, true, 8);
         if (ncols <= 32) return fattn_mma_config(288, 1,  64, 20, 20, 20, 2, true, 8);
         if (ncols <= 64) return fattn_mma_config(288, 1,  64, 20, 20, 20, 2, true, 8);
     }
     if (DKQ == 96 && DV == 96) {
-        // 2 * 128 * (24+24) * 4 = 49152 bytes (48KB)
         if (ncols <=  8) return fattn_mma_config(288, 1, 128, 24, 24, 24, 2, true, 8);
         if (ncols <= 16) return fattn_mma_config(288, 1, 128, 24, 24, 24, 2, true, 8);
         if (ncols <= 32) return fattn_mma_config(288, 1,  64, 24, 24, 24, 2, true, 8);
         if (ncols <= 64) return fattn_mma_config(288, 1,  64, 24, 24, 24, 2, true, 8);
     }
     if (DKQ == 112 && DV == 112) {
-        // 2 * 128 * (28+14) * 4 = 43008 bytes (42KB)
         if (ncols <=  8) return fattn_mma_config(288, 1, 128, 28, 28, 14, 2, true, 8);
         if (ncols <= 16) return fattn_mma_config(288, 1, 128, 28, 28, 14, 2, true, 8);
         if (ncols <= 32) return fattn_mma_config(288, 1,  64, 28, 28, 14, 2, true, 8);
         if (ncols <= 64) return fattn_mma_config(288, 1,  64, 28, 28, 14, 2, true, 8);
     }
     if (DKQ == 128 && DV == 128) {
-        // 2 * 128 * (32+16) * 4 = 49152 bytes (48KB)
         if (ncols <=  8) return fattn_mma_config(288, 1, 128, 32, 32, 16, 2, true, 8);
         if (ncols <= 16) return fattn_mma_config(288, 1, 128, 32, 32, 16, 2, true, 8);
-        if (ncols <= 32) return fattn_mma_config(288, 1,  64, 32, 32, 16, 2, true, 8);
-        if (ncols <= 64) return fattn_mma_config(288, 1,  64, 32, 32, 16, 2, true, 8);
+        if (ncols <= 32) return fattn_mma_config(288, 1,  64, 32, 32, 16, 2, false, 8);
+        if (ncols <= 64) return fattn_mma_config(288, 1,  32, 32, 32, 16, 2, false, 8);
     }
     if (DKQ == 256 && DV == 256) {
-        // 2 * 128 * (32+16) * 4 = 49152 bytes (48KB)
         if (ncols <=  8) return fattn_mma_config(288, 1, 128, 32, 32, 16, 2, true, 8);
         if (ncols <= 16) return fattn_mma_config(288, 1, 128, 32, 32, 16, 2, true, 8);
         if (ncols <= 32) return fattn_mma_config(288, 1,  64, 32, 32, 16, 2, true, 8);
@@ -168,11 +127,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 // Compile-time check for native Blackwell support (not falling back to Ampere)
+// DISABLED for RTX 5090 (sm_120): Blackwell kernel requires warp specialization (288 threads)
+// but 288 threads × 255 registers = 73,440 > 65,536 max registers/SM.
+// The Ampere fallback kernel uses 128 threads (32,640 regs) and works correctly.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_has_blackwell_config(const int DKQ, const int DV, const int ncols) {
-    (void)ncols;  // ncols checked at runtime via config.num_consumers
-    if (DKQ == 576 && DV == 512) return true;  // MLA
-    if (DKQ == DV && (DKQ == 64 || DKQ == 80 || DKQ == 96 || DKQ == 112 || DKQ == 128 || DKQ == 256)) return true;  // Standard attention
-    return false;
+    (void)DKQ; (void)DV; (void)ncols;
+    return false;  // Force Ampere fallback - Blackwell kernel needs warp specialization which exceeds register limits
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_turing(const int DKQ, const int DV, const int ncols) {
@@ -199,8 +159,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
+    // FIXED: Blackwell kernel disabled (288×255 > 65536), use Ampere config instead
+    // The Blackwell kernel is disabled via ggml_cuda_fattn_has_blackwell_config() returning false
+    // but we must also use Ampere CONFIG values to get 128 threads instead of 288
     if (ggml_cuda_has_blackwell_features(cc)) {
-        return ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
+        return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);  // Use Ampere config on Blackwell
     }
     if (ampere_mma_available(cc)) {
         return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
@@ -214,7 +177,7 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    return ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
+    return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);  // Use Ampere config on Blackwell
 #elif defined(AMPERE_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 #elif defined(TURING_MMA_AVAILABLE)
@@ -766,17 +729,20 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     constexpr int num_K_chunks = (DKQ/2 + nbatch_K2 - 1) / nbatch_K2;
     constexpr int num_V_chunks = (DV/2 + nbatch_V2 - 1) / nbatch_V2;
 
-    uint32_t chunk_phase_K = 0;   // Chunk-level phase for K (flips every 2 chunks)
-    uint32_t chunk_phase_V = 0;   // Chunk-level phase for V (flips every 2 chunks)
+    // Chunk-level phases for K and V barriers.
+    // After pre-arrival, phase 0 is "completed" so wait(phase=0) returns immediately.
+    // The phase tracks which phase we're expecting to wait for.
+    // It flips after processing 2 chunks (when chunk_stage goes from 1 back to 0).
+    uint32_t chunk_phase_K = 0;
+    uint32_t chunk_phase_V = 0;
 
     // Iterate over tile indices (kb0 is a tile index, not a row offset)
     for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
         // Compute row offset for TMA coordinates
         const int row_offset = kb0 * nbatch_fa;
 
-        // Reset chunk phases at start of each tile (consumer does the same)
-        chunk_phase_K = 0;
-        chunk_phase_V = 0;
+        // NOTE: Do NOT reset phases here. The phases track the barrier's state
+        // across kb0 iterations. The phase flips happen in the chunk loop below.
 
         // --- K Phase: Load K chunks with per-chunk synchronization ---
         // NOTE: No stage offset - chunk buffers are reused each kb0 iteration
@@ -897,6 +863,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         uint64_t* __restrict__ mbar_ptr,
         uint32_t& phase_K,
         uint32_t& phase_V,
+        uint32_t& consumer_chunk_phase_K,
+        uint32_t& consumer_chunk_phase_V,
         fattn_pipeline_state* pipeline_state = nullptr,
         int pipeline_stage = -1,
         int nstages_pipeline = 0) {
@@ -1010,14 +978,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool needs_V_chunking = (DV/2 > nbatch_V2);
     constexpr bool needs_chunking = needs_K_chunking || needs_V_chunking;
 
-    // Consumer mode: chunk-level phase tracking (reset per tile)
-    uint32_t consumer_chunk_phase_K = 0;
-
-    // Consumer mode: base pointer for this stage's K buffers
+    // Consumer mode: base pointer for K buffers
+    // NOTE: No stage offset - chunk buffers are reused each kb0 iteration (matches producer)
     half2 * consumer_tile_K_base = nullptr;
     if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
-        consumer_tile_K_base = tile_K + current_stage * (stride_stage_consumer / sizeof(half2));
+        consumer_tile_K_base = tile_K;
 #endif
     }
 
@@ -1423,15 +1389,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     // Consumer mode V chunk pipelining
     constexpr int num_V_chunks = (DV/2 + nbatch_V2 - 1) / nbatch_V2;
-    uint32_t consumer_chunk_phase_V = 0;
 
-    // Consumer mode: base pointer for this stage's V buffers
-    // V buffers are after K buffers: [K_chunk_0][K_chunk_1][V_chunk_0][V_chunk_1]
+    // Consumer mode: base pointer for V buffers
+    // NOTE: No stage offset - chunk buffers are reused each kb0 iteration (matches producer)
+    // tile_V already points to V chunk base (after K chunks), so no additional offset needed
     const half2 * consumer_tile_V_base = nullptr;
     if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
-        consumer_tile_V_base = tile_V + current_stage * (stride_stage_consumer / sizeof(half2))
-                             + 2 * (bytes_K_chunk / sizeof(half2));
+        consumer_tile_V_base = tile_V;
 #endif
     }
 
@@ -1803,6 +1768,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     uint32_t phase_K = 0;
     uint32_t phase_V = 0;
 
+    // Chunk-level phase tracking for consumer mode (persists across kb0 iterations).
+    // These must be defined here (not in flash_attn_ext_f16_iter) so they persist
+    // across the kb0 loop, matching the producer's chunk_phase_K/V variables.
+    uint32_t consumer_chunk_phase_K = 0;
+    uint32_t consumer_chunk_phase_V = 0;
+
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
@@ -1938,7 +1909,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, current_stage, nstages);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
             // Flip phase when stage wraps (consumer mode only)
             if (pipeline_state && current_stage == nstages - 1) {
                 phase_K ^= 1;
@@ -1954,7 +1925,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, current_stage, nstages);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -1967,7 +1938,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, current_stage, nstages);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
             // Flip phase when stage wraps (consumer mode only)
             if (pipeline_state && current_stage == nstages - 1) {
                 phase_K ^= 1;
@@ -1983,7 +1954,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, pipeline_state, current_stage, nstages);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
@@ -2481,7 +2452,7 @@ __global__ void flash_attn_ext_f16_ampere(
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool mla, bool use_tma>
-__launch_bounds__(288, 1)  // Occupancy 1 needed for ~98KB shared memory (2-stage pipeline)
+__launch_bounds__(288, 1) // Blackwell kernel with warp specialization (disabled on RTX 5090 due to register limits)
 __global__ void flash_attn_ext_f16_blackwell(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -2621,45 +2592,27 @@ __global__ void flash_attn_ext_f16_blackwell(
          // For Q loading, we use threadIdx.y directly (0-8) instead of consumer warp_id.
          // =====================================================================
 
-         constexpr int stride_tile_Q_local = DKQ/2 + 4;
-         // Q tiles are after the KV chunk buffers in the new layout
-         half2 * tile_Q = (half2*)(smem + bytes_KV_total);
+        constexpr int stride_tile_Q_local = DKQ/2 + 4;
+        // Q tiles are after the KV chunk buffers in the new layout
+        half2 * tile_Q = (half2*)(smem + bytes_KV_total);
 
-         // Q loading uses all 9 warps. Each warp loads a portion of Q.
-         // This replaces the Q loading in process_tile for the Blackwell kernel.
-         const half2 scale_h2 = make_half2(scale, scale);
-         constexpr int stride_ncols_q = 1;
-         for (int stride_k : {WARP_SIZE, WARP_SIZE/2, WARP_SIZE/4}) {
-             const int jc0_max = stride_k < WARP_SIZE ? ncols * stride_k / WARP_SIZE : ncols;
-             // Use 9 warps for Q loading (all threads participate)
-             constexpr int nwarps_total = 9;
-             for (int jc0 = 0; jc0 < jc0_max; jc0 += nwarps_total*stride_ncols_q) {
-                 const int jc = jc0 + threadIdx.y*stride_ncols_q;
-                 if (jc >= jc0_max) break;
-                 for (int k0 = 0; k0 < DKQ/2; k0 += stride_k) {
-                     const int k = k0 + (stride_k == WARP_SIZE ? threadIdx.x : threadIdx.x % stride_k);
-                     const int j = jc;
-                     const int j1 = j / ncols2;
-                     const int j2 = j % ncols2;
-                     const half2 Q_scaled = Q_f2 ?
-                         make_half2(__float2half(Q_f2[j1*stride_Q1 + j2*stride_Q2 + k].x * scale),
-                                    __float2half(Q_f2[j1*stride_Q1 + j2*stride_Q2 + k].y * scale)) :
-                         make_half2(0.0f, 0.0f);
-                     tile_Q[jc*stride_tile_Q_local + k] = Q_scaled;
-                 }
-             }
-         }
-         // Zero out excess Q columns if any
-         constexpr int nwarps_total = 9;
-         for (int jc0 = 0; jc0 < ncols; jc0 += nwarps_total*stride_ncols_q) {
-             const int jc = jc0 + threadIdx.y*stride_ncols_q;
-             if (jc >= ncols) continue;
-             if (jt*ncols1 + jc/ncols2 >= ne01.z) {
-                 for (int k = threadIdx.x; k < DKQ/2; k += WARP_SIZE) {
-                     tile_Q[jc*stride_tile_Q_local + k] = make_half2(0.0f, 0.0f);
-                 }
-             }
-         }
+        // Lightweight Q loading: cooperative across 9 warps, single stride to keep
+        // register footprint down. Each warp handles strided columns, each lane
+        // walks DKQ/2 in WARP_SIZE steps.
+        const float2 *Q_base = Q_f2;
+        for (int jc = threadIdx.y; jc < ncols; jc += 9) {
+            const int j1 = jc / ncols2;
+            const int j2 = jc % ncols2;
+            const bool in_bounds = Q_base && (jt*ncols1 + j1) < int(ne01.z);
+            for (int k = threadIdx.x; k < DKQ/2; k += WARP_SIZE) {
+                half2 val = make_half2(0.0f, 0.0f);
+                if (in_bounds) {
+                    const float2 tmp = Q_base[j1*stride_Q1 + j2*stride_Q2 + k];
+                    val = make_half2(__float2half(tmp.x * scale), __float2half(tmp.y * scale));
+                }
+                tile_Q[jc*stride_tile_Q_local + k] = val;
+            }
+        }
          __syncthreads();  // All 9 warps hit this barrier
 
          // Load Q into registers for consumers (producer skips this but still syncs)
@@ -2915,15 +2868,24 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     bool use_logit_softcap_kernel = (logit_softcap != 0.0f);
 
     // Blackwell kernel optimized for sm_120+ with Warp Specialization and TMA
+    // NOTE: Disabled for RTX 5090 - see ggml_cuda_fattn_has_blackwell_config()
     // Use if constexpr to prevent template instantiation for unsupported DKQ/DV/ncols combinations
     if constexpr (ggml_cuda_fattn_has_blackwell_config(DKQ, DV, ncols)) {
         if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime && config_bw.num_consumers > 0) {
-            if (use_logit_softcap_kernel) {
-                 launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, true>, true);
+            // Check if chunk pipelining is needed - currently has bugs for DKQ > 2*nbatch_K2
+            // Fall back to Ampere kernel which is more stable
+            const bool needs_K_chunking = (DKQ/2 > config_bw.nbatch_K2);
+            const bool needs_V_chunking = (DV/2 > config_bw.nbatch_V2);
+            if (needs_K_chunking || needs_V_chunking) {
+                // Skip Blackwell kernel, use Ampere fallback below
             } else {
-                 launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, false, mla, true>, true);
+                if (use_logit_softcap_kernel) {
+                     launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, true>, true);
+                } else {
+                     launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, false, mla, true>, true);
+                }
+                return;
             }
-            return;
         }
     }
 

@@ -901,6 +901,26 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    if (max_blocks_per_sm <= 0) {
+        fprintf(stderr, "FATTN ERROR: max_blocks_per_sm = %d\n", max_blocks_per_sm);
+        fprintf(stderr, "  nbytes_shared = %lu\n", nbytes_shared);
+        fprintf(stderr, "  block_dim = %d, %d, %d (total %d)\n", block_dim.x, block_dim.y, block_dim.z, block_dim.x * block_dim.y * block_dim.z);
+        int dev_id;
+        cudaGetDevice(&dev_id);
+        int max_shmem = 0;
+        cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id);
+        fprintf(stderr, "  max_shmem_optin = %d\n", max_shmem);
+        int max_regs = 0;
+        cudaDeviceGetAttribute(&max_regs, cudaDevAttrMaxRegistersPerBlock, dev_id);
+        fprintf(stderr, "  max_regs_per_block = %d\n", max_regs);
+        
+        cudaFuncAttributes attrs;
+        if (cudaFuncGetAttributes(&attrs, fattn_kernel) == cudaSuccess) {
+            fprintf(stderr, "  kernel regs = %d\n", attrs.numRegs);
+            fprintf(stderr, "  kernel shmem (static) = %lu\n", attrs.sharedSizeBytes);
+            fprintf(stderr, "  kernel local = %lu\n", attrs.localSizeBytes);
+        }
+    }
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
