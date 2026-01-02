@@ -130,7 +130,10 @@ __device__ __forceinline__ void tma_load_2d(
     int32_t coord_x,
     int32_t coord_y)
 {
+    // Convert both shared memory addresses to 32-bit shared address space format
+    // TMA requires shared memory addresses in the shared address space, not generic pointers
     uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    uint32_t mbar_addr = __cvta_generic_to_shared(mbar_ptr);
     uint64_t tmap_addr = reinterpret_cast<uint64_t>(tensor_map);
 
     asm volatile(
@@ -138,7 +141,7 @@ __device__ __forceinline__ void tma_load_2d(
         "[%0], [%1, {%2, %3}], [%4] ;"
         :
         : "r"(smem_addr), "l"(tmap_addr), "r"(coord_x), "r"(coord_y),
-          "l"(mbar_ptr)
+          "r"(mbar_addr)
         : "memory"
     );
 }
@@ -171,36 +174,40 @@ __device__ __forceinline__ void tma_fence_acquire_maps(const void* tensor_maps, 
 
 // Initialize barrier with expected transaction count
 __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
+    uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     asm volatile(
         "mbarrier.init.shared::cta.b64 [%0], %1;"
         : 
-        : "l"(mbar), "r"(count)
+        : "r"(mbar_addr), "r"(count)
         : "memory"
     );
 }
 
 // Arrive and expect N bytes of async transactions
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
+    uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     asm volatile(
         "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
         : 
-        : "l"(mbar), "r"(tx_bytes)
+        : "r"(mbar_addr), "r"(tx_bytes)
         : "memory"
     );
 }
 
 // Arrive at barrier (no transaction update)
 __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
+    uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     asm volatile(
         "mbarrier.arrive.shared::cta.b64 _, [%0];"
         : 
-        : "l"(mbar)
+        : "r"(mbar_addr)
         : "memory"
     );
 }
 
 // Wait for phase (blocking)
 __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar, uint32_t phase) {
+    uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"
@@ -209,13 +216,14 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar, uint32_t phase) {
         "@!p bra WAIT_LOOP;\n\t"
         "}\n"
         : 
-        : "l"(mbar), "r"(phase)
+        : "r"(mbar_addr), "r"(phase)
         : "memory"
     );
 }
 
 // Non-blocking try-wait
 __device__ __forceinline__ bool mbarrier_try_wait(uint64_t* mbar, uint32_t phase) {
+    uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     uint32_t ready;
     asm volatile(
         "{\n\t"
@@ -224,7 +232,7 @@ __device__ __forceinline__ bool mbarrier_try_wait(uint64_t* mbar, uint32_t phase
         "selp.u32 %2, 1, 0, p;\n\t"
         "}\n"
         : "=r"(ready)
-        : "l"(mbar), "r"(phase)
+        : "r"(mbar_addr), "r"(phase)
         : "memory"
     );
     return ready != 0;
