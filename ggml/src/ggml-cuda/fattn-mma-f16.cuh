@@ -2898,30 +2898,47 @@ __global__ void flash_attn_ext_f16_blackwell(
     const int iter_k = (ne11 + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j = (ne01.z + (ncols1 - 1)) / ncols1;
     
-    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-        printf("[KERNEL DEBUG] iter_k=%d, iter_j=%d, ne02=%d, ncols2=%d, ne03=%d\n",
-               iter_k, iter_j, ne02, ncols2, ne03);
-    }
-    
     // Grid Logic
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
     const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
 
     int kb0_start = kbc % iter_k;
     int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
-
-    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-        printf("[KERNEL DEBUG] kbc=%d, kbc_stop=%d, kb0_start=%d, kb0_stop=%d\n",
-               kbc, kbc_stop, kb0_start, kb0_stop);
-        printf("[KERNEL DEBUG] Loop condition: kbc < kbc_stop = %d, kb0_stop == iter_k = %d\n",
-               kbc < kbc_stop, kb0_stop == iter_k);
+    
+    // Debug from a block that HAS work (kbc < kbc_stop)
+    const bool has_work = (kbc < kbc_stop);
+    const bool debug_this_block = (threadIdx.x == 0 && threadIdx.y == 0 && has_work && blockIdx.x < 3);
+    
+    if (debug_this_block) {
+        printf("[KERNEL DEBUG] Block %d HAS WORK: iter_k=%d, iter_j=%d, ne02=%d, ncols2=%d\n",
+               blockIdx.x, iter_k, iter_j, ne02, ncols2);
+        printf("[KERNEL DEBUG] Block %d: kbc=%d, kbc_stop=%d, kb0_start=%d, kb0_stop=%d\n",
+               blockIdx.x, kbc, kbc_stop, kb0_start, kb0_stop);
+    }
+    
+    // Debug ALL blocks to find which one crashes
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("[ALL BLOCKS] Block %d: kbc=%d, kbc_stop=%d, has_work=%d\n", 
+               blockIdx.x, kbc, kbc_stop, has_work);
+    }
+    __syncthreads();
+    
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("[ALL BLOCKS] Block %d: SYNC DONE, checking loop condition\n", blockIdx.x);
     }
 
     uint32_t q_phase = 0;
+    
+    // Check loop condition
+    const bool loop_cond = (kbc < kbc_stop && kb0_stop == iter_k);
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("[ALL BLOCKS] Block %d: loop_cond=%d (kbc<kbc_stop=%d, kb0_stop==iter_k=%d)\n", 
+               blockIdx.x, loop_cond, kbc < kbc_stop, kb0_stop == iter_k);
+    }
 
     while (kbc < kbc_stop && kb0_stop == iter_k) {
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-            printf("[KERNEL DEBUG] Entered while loop, kbc=%d\n", kbc);
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            printf("[LOOP] Block %d: ENTERED while loop, kbc=%d\n", blockIdx.x, kbc);
         }
          const int sequence = kbc / (iter_k*iter_j*(ne02/ncols2));
          const int zt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence) / (iter_k*iter_j); 
@@ -2958,18 +2975,13 @@ __global__ void flash_attn_ext_f16_blackwell(
          // For Q loading, we use threadIdx.y directly (0-8) instead of consumer warp_id.
          // =====================================================================
 
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-            printf("[Q LOAD DEBUG] Starting Q loading phase\n");
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            printf("[Q LOAD] Block %d: Starting Q loading\n", blockIdx.x);
         }
 
         constexpr int stride_tile_Q_local = DKQ/2 + 4;
         // Q tiles are after the KV chunk buffers in the new layout
         half2 * tile_Q = (half2*)(smem + bytes_KV_total);
-
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-            printf("[Q LOAD DEBUG] tile_Q=%p, Q_f2=%p, stride_Q1=%d, stride_Q2=%d\n",
-                   tile_Q, Q_f2, stride_Q1, stride_Q2);
-        }
 
         // Lightweight Q loading: cooperative across all warps, single stride to keep
         // register footprint down. Each warp handles strided columns, each lane
@@ -2991,48 +3003,43 @@ __global__ void flash_attn_ext_f16_blackwell(
             }
         }
         
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-            printf("[Q LOAD DEBUG] Q loading loop done, about to syncthreads\n");
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            printf("[Q LOAD] Block %d: Q loop done, syncing\n", blockIdx.x);
         }
          __syncthreads();  // All warps hit this barrier
 
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-            printf("[Q LOAD DEBUG] First syncthreads done\n");
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            printf("[Q LOAD] Block %d: Sync 1 done\n", blockIdx.x);
         }
 
          // Load Q into registers for consumers (producer skips this but still syncs)
          // This is done inside process_tile for consumers
          __syncthreads();  // Second barrier matching process_tile's Q register loading sync
          
-        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-            printf("[Q LOAD DEBUG] Second syncthreads done, heading to divergence\n");
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            printf("[Q LOAD] Block %d: Sync 2 done, diverging\n", blockIdx.x);
         }
 
          // Now diverge: Producer does K/V loading, Consumers do computation
-         if (threadIdx.x == 0 && blockIdx.x == 0) {
-             printf("[LOOP DEBUG] Divergence point: threadIdx.y=%d, kb0_start=%d, kb0_stop=%d\n",
-                    threadIdx.y, kb0_start, kb0_stop);
-         }
-         
          if (threadIdx.y == 0) {
              // Producer: K/V loading loop
-             if (threadIdx.x == 0 && blockIdx.x == 0) {
-                 printf("[PRODUCER DEBUG] About to wait on Q_loaded barrier, phase=%d\n", q_phase);
+             if (threadIdx.x == 0) {
+                 printf("[PRODUCER] Block %d: Waiting Q_loaded phase=%d\n", blockIdx.x, q_phase);
              }
              mbarrier_wait(&state->Q_loaded, q_phase);
-             if (threadIdx.x == 0 && blockIdx.x == 0) {
-                 printf("[PRODUCER DEBUG] Q_loaded wait complete, calling producer_loop\n");
+             if (threadIdx.x == 0) {
+                 printf("[PRODUCER] Block %d: Q_loaded done, calling producer_loop\n", blockIdx.x);
              }
              q_phase ^= 1;
              fattn_producer_loop<DKQ, DV, ncols, nstages, nbatch_fa, nbatch_K2, nbatch_V2, mla>(
                  tensor_maps, state, kb0_start, kb0_stop, num_consumers);
-             if (threadIdx.x == 0 && blockIdx.x == 0) {
-                 printf("[PRODUCER DEBUG] producer_loop returned\n");
+             if (threadIdx.x == 0) {
+                 printf("[PRODUCER] Block %d: producer_loop returned\n", blockIdx.x);
              }
          } else {
              // Consumer: Main computation (Q already loaded into shared memory)
-             if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0) {
-                 printf("[CONSUMER DEBUG] Consumer warp %d entering process_tile\n", threadIdx.y);
+             if (threadIdx.x == 0 && threadIdx.y == 1) {
+                 printf("[CONSUMER] Block %d: Consumer warp %d entering\n", blockIdx.x, threadIdx.y);
              }
              constexpr bool is_fixup = false;
              constexpr bool needs_fixup = false;
@@ -3042,8 +3049,8 @@ __global__ void flash_attn_ext_f16_blackwell(
              flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
                  Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                   ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
-             if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0) {
-                 printf("[CONSUMER DEBUG] Consumer warp %d returned from process_tile\n", threadIdx.y);
+             if (threadIdx.x == 0 && threadIdx.y == 1) {
+                 printf("[CONSUMER] Block %d: process_tile returned\n", blockIdx.x);
              }
          }
          
