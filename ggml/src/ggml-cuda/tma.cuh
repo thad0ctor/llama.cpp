@@ -199,10 +199,10 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
 
-    // DEBUG: print before PTX (wider filter to catch active blocks)
-    if (threadIdx.x == 0 && blockIdx.x < 50) {
-        printf("[MBAR_ARRIVE_TX] Block %d: mbar=%p mbar_addr=0x%x tx_bytes=%u\n",
-               blockIdx.x, mbar, mbar_addr, tx_bytes);
+    // DEBUG: print before expect_tx
+    if (threadIdx.x == 0 && blockIdx.x < 3) {
+        printf("[MBAR] Block %d: before expect_tx, mbar_addr=0x%x tx_bytes=%u\n",
+               blockIdx.x, mbar_addr, tx_bytes);
     }
 
     asm volatile(
@@ -212,9 +212,22 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
         : "memory"
     );
 
-    // DEBUG: print after PTX
-    if (threadIdx.x == 0 && blockIdx.x < 50) {
-        printf("[MBAR_ARRIVE_TX] Block %d: PTX done\n", blockIdx.x);
+    // DEBUG: print after expect_tx, before arrive
+    if (threadIdx.x == 0 && blockIdx.x < 3) {
+        printf("[MBAR] Block %d: after expect_tx, before arrive\n", blockIdx.x);
+    }
+
+    // Step 2: Arrive at the barrier (required for barrier completion)
+    asm volatile(
+        "mbarrier.arrive.shared::cta.b64 _, [%0];"
+        :
+        : "r"(mbar_addr)
+        : "memory"
+    );
+
+    // DEBUG: print after arrive
+    if (threadIdx.x == 0 && blockIdx.x < 3) {
+        printf("[MBAR] Block %d: after arrive\n", blockIdx.x);
     }
 }
 
