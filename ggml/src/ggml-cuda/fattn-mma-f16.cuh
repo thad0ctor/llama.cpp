@@ -886,6 +886,16 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
     constexpr int num_K_chunks = (DKQ/2 + nbatch_K2 - 1) / nbatch_K2;
     constexpr int num_V_chunks = (DV/2 + nbatch_V2 - 1) / nbatch_V2;
 
+    // DEBUG: Print producer startup info (once per block)
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+        printf("[PRODUCER DEBUG] block=(%d,%d,%d) kb0_start=%d kb0_stop=%d\n",
+               blockIdx.x, blockIdx.y, blockIdx.z, kb0_start, kb0_stop);
+        printf("[PRODUCER DEBUG] num_K_chunks=%d num_V_chunks=%d bytes_K_chunk=%d bytes_V_chunk=%d\n",
+               num_K_chunks, num_V_chunks, bytes_K_chunk, bytes_V_chunk);
+        printf("[PRODUCER DEBUG] smem_base=%p tile_K_base=%p tile_V_base=%p\n",
+               smem_base, smem_base, smem_base + 2 * bytes_K_chunk);
+    }
+
     // Chunk-level phases for K and V barriers.
     // After pre-arrival, phase 0 is "completed" so wait(phase=0) returns immediately.
     // The phase tracks which phase we're expecting to wait for.
@@ -909,15 +919,35 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
             const int chunk_stage = chunk % 2;
             const int k0 = chunk * nbatch_K2;
 
+            // DEBUG: Print K chunk info
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: waiting on empty_K_chunk[%d] phase=%d\n",
+                       chunk, chunk_stage, chunk_phase_K);
+            }
+
             // Wait for consumer to finish with this chunk buffer
             mbarrier_wait(&state->empty_K_chunk[chunk_stage], chunk_phase_K);
 
             // Load chunk to the correct buffer (alternating between 0 and 1)
             half2* tile_K_chunk = tile_K_base + chunk_stage * (bytes_K_chunk / sizeof(half2));
 
+            // DEBUG: Print TMA load info
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: loading k0=%d row_offset=%d -> smem offset=%ld bytes\n",
+                       chunk, k0, row_offset, (long)((char*)tile_K_chunk - smem_base));
+                printf("[PRODUCER DEBUG] K chunk %d: TMA coord_x=%d (k0*2) coord_y=%d\n",
+                       chunk, k0 * 2, row_offset);
+            }
+
             // Load this K chunk via TMA
             load_tile_tma_multistrip<nbatch_fa, nbatch_K2>(
                 map_K, tile_K_chunk, &state->full_K_chunk[chunk_stage], k0, row_offset, true);
+
+            // DEBUG: Print after load
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] K chunk %d: TMA issued to full_K_chunk[%d]\n",
+                       chunk, chunk_stage);
+            }
 
             // Flip chunk phase after every 2 chunks (when chunk_stage goes from 1 back to 0)
             if (chunk_stage == 1) {
@@ -933,11 +963,25 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
             const int chunk_stage = chunk % 2;
             const int i0 = chunk * nbatch_V2;
 
+            // DEBUG: Print V chunk info
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] V chunk %d: waiting on empty_V_chunk[%d] phase=%d\n",
+                       chunk, chunk_stage, chunk_phase_V);
+            }
+
             // Wait for consumer to finish with this chunk buffer
             mbarrier_wait(&state->empty_V_chunk[chunk_stage], chunk_phase_V);
 
             // Load chunk to the correct buffer (alternating between 0 and 1)
             half2* tile_V_chunk = tile_V_base + chunk_stage * (bytes_V_chunk / sizeof(half2));
+
+            // DEBUG: Print TMA load info
+            if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER DEBUG] V chunk %d: loading i0=%d row_offset=%d -> smem offset=%ld bytes\n",
+                       chunk, i0, row_offset, (long)((char*)tile_V_chunk - smem_base));
+                printf("[PRODUCER DEBUG] V chunk %d: TMA coord_x=%d (i0*2) coord_y=%d\n",
+                       chunk, i0 * 2, row_offset);
+            }
 
             // Load this V chunk via TMA
             load_tile_tma_multistrip<nbatch_fa, nbatch_V2>(
@@ -948,6 +992,11 @@ static __device__ __forceinline__ void fattn_producer_loop_chunked(
                 chunk_phase_V ^= 1;
             }
         }
+    }
+
+    // DEBUG: Print producer complete
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+        printf("[PRODUCER DEBUG] Producer loop complete\n");
     }
 
     GGML_UNUSED(num_consumers);
@@ -1141,6 +1190,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
         consumer_tile_K_base = tile_K;
+        // DEBUG: Print consumer K base setup (once per warp per block)
+        if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0) {
+            extern __shared__ char smem_debug[];
+            printf("[CONSUMER DEBUG] block=(%d,%d,%d) warp=%d consumer_tile_K_base=%p (offset from smem=%ld)\n",
+                   blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.y,
+                   consumer_tile_K_base, (long)((char*)consumer_tile_K_base - smem_debug));
+            printf("[CONSUMER DEBUG] needs_chunking=%d num_K_chunks=%d bytes_K_chunk=%d\n",
+                   needs_chunking, num_K_chunks, bytes_K_chunk);
+        }
 #endif
     }
 
@@ -1155,11 +1213,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
             if constexpr (needs_chunking) {
+                // DEBUG: Print before wait
+                if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    printf("[CONSUMER DEBUG] K chunk %d: waiting on full_K_chunk[%d] phase=%d\n",
+                           chunk, chunk_stage, consumer_chunk_phase_K);
+                }
+
                 // Wait for producer to signal this chunk is ready
                 mbarrier_wait(&pipeline_state->full_K_chunk[chunk_stage], consumer_chunk_phase_K);
 
                 // Point to the correct double-buffered chunk
                 current_tile_K = consumer_tile_K_base + chunk_stage * (bytes_K_chunk / sizeof(half2));
+
+                // DEBUG: Print after wait
+                if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    extern __shared__ char smem_debug2[];
+                    printf("[CONSUMER DEBUG] K chunk %d: got data, current_tile_K=%p (offset=%ld) k0_range=[%d,%d)\n",
+                           chunk, current_tile_K, (long)((char*)current_tile_K - smem_debug2), k0_start, k0_stop);
+                }
             } else {
                 // Legacy mode: wait once at the start (chunk 0 only)
                 // Add stage offset to match producer's Blackwell layout:
@@ -1269,17 +1340,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
             if constexpr (needs_chunking) {
+                // DEBUG: Print before signaling completion
+                if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    printf("[CONSUMER DEBUG] K chunk %d: processing complete, signaling empty_K_chunk[%d]\n",
+                           chunk, chunk_stage);
+                }
+
                 // Signal we're done with this chunk
-                mbarrier_arrive_expect_tx(&pipeline_state->empty_K_chunk[chunk_stage], 0);
+                // NOTE: Using mbarrier_arrive instead of mbarrier_arrive_expect_tx(0) 
+                // since we're not setting TMA byte expectations
+                mbarrier_arrive(&pipeline_state->empty_K_chunk[chunk_stage]);
 
                 // Flip chunk phase after every 2 chunks
                 if (chunk_stage == 1) {
                     consumer_chunk_phase_K ^= 1;
+                    if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                        printf("[CONSUMER DEBUG] K phase flip -> %d\n", consumer_chunk_phase_K);
+                    }
                 }
             } else {
                 // Legacy mode: signal once at the end (last chunk only)
                 if (chunk == num_K_chunks - 1) {
-                    mbarrier_arrive_expect_tx(&pipeline_state->empty_K[current_stage], 0);
+                    mbarrier_arrive(&pipeline_state->empty_K[current_stage]);
                 }
             }
 #endif
@@ -1290,6 +1372,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 k_buf ^= 1;
             }
         }
+    }
+
+    // DEBUG: Print after K loop completes
+    if (consumer_mode && threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+        printf("[CONSUMER DEBUG] K loop complete, starting softmax/V processing\n");
     }
 
     if (use_logit_softcap) {
@@ -1574,11 +1661,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
             if constexpr (needs_chunking) {
+                // DEBUG: Print before V wait
+                if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    printf("[CONSUMER DEBUG] V chunk %d: waiting on full_V_chunk[%d] phase=%d\n",
+                           v_chunk, v_chunk_stage, consumer_chunk_phase_V);
+                }
+
                 // Wait for producer to signal this V chunk is ready
                 mbarrier_wait(&pipeline_state->full_V_chunk[v_chunk_stage], consumer_chunk_phase_V);
 
                 // Point to the correct double-buffered chunk
                 tile_V_i = consumer_tile_V_base + v_chunk_stage * (bytes_V_chunk / sizeof(half2));
+
+                // DEBUG: Print after V wait
+                if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    extern __shared__ char smem_debug3[];
+                    printf("[CONSUMER DEBUG] V chunk %d: got data, tile_V_i=%p (offset=%ld) i0_range=[%d,%d)\n",
+                           v_chunk, tile_V_i, (long)((char*)tile_V_i - smem_debug3), i0_start, i0_stop);
+                }
             } else {
                 // Legacy mode: wait once at the start (chunk 0 only)
                 // Add stage offset to match producer's Blackwell layout:
@@ -1693,8 +1793,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (consumer_mode) {
 #ifdef BLACKWELL_TMA_AVAILABLE
             if constexpr (needs_chunking) {
+                // DEBUG: Print before signaling V completion
+                if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    printf("[CONSUMER DEBUG] V chunk %d: processing complete, signaling empty_V_chunk[%d]\n",
+                           v_chunk, v_chunk_stage);
+                }
+
                 // Signal we're done with this V chunk
-                mbarrier_arrive_expect_tx(&pipeline_state->empty_V_chunk[v_chunk_stage], 0);
+                // NOTE: Using mbarrier_arrive instead of mbarrier_arrive_expect_tx(0)
+                mbarrier_arrive(&pipeline_state->empty_V_chunk[v_chunk_stage]);
 
                 // Flip chunk phase after every 2 chunks
                 if (v_chunk_stage == 1) {
@@ -1703,7 +1810,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             } else {
                 // Legacy mode: signal once at the end (last chunk only)
                 if (v_chunk == num_V_chunks - 1) {
-                    mbarrier_arrive_expect_tx(&pipeline_state->empty_V[current_stage], 0);
+                    mbarrier_arrive(&pipeline_state->empty_V[current_stage]);
                 }
             }
 #endif
@@ -2732,17 +2839,20 @@ __global__ void flash_attn_ext_f16_blackwell(
     // but the producer waits on empty_K/V before loading. Without pre-arrival,
     // producer blocks waiting for consumer arrivals that never come (deadlock).
     // Consumer warps signal readiness here; producer warp skips this.
+    //
+    // IMPORTANT: Use mbarrier_arrive() not mbarrier_arrive_expect_tx(0) since these
+    // are arrival-count barriers, not TMA byte-count barriers.
     if (threadIdx.y != 0) {
         if constexpr (needs_chunking) {
             constexpr int nchunk_buffers = 2;
             for (int i = 0; i < nchunk_buffers; ++i) {
-                mbarrier_arrive_expect_tx(&state->empty_K_chunk[i], 0);
-                mbarrier_arrive_expect_tx(&state->empty_V_chunk[i], 0);
+                mbarrier_arrive(&state->empty_K_chunk[i]);
+                mbarrier_arrive(&state->empty_V_chunk[i]);
             }
         } else {
             for (int i = 0; i < nstages; ++i) {
-                mbarrier_arrive_expect_tx(&state->empty_K[i], 0);
-                mbarrier_arrive_expect_tx(&state->empty_V[i], 0);
+                mbarrier_arrive(&state->empty_K[i]);
+                mbarrier_arrive(&state->empty_V[i]);
             }
         }
     }
