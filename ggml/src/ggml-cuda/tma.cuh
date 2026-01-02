@@ -208,7 +208,7 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
     // Use NVIDIA's exact PTX syntax from CCCL headers
     uint64_t state;
     asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
+        "mbarrier.arrive.expect_tx.shared::cta.b64 %0, [%1], %2;"
         : "=l"(state)
         : "r"(mbar_addr), "r"(tx_bytes)
         : "memory"
@@ -226,7 +226,7 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     uint64_t state;
     asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 %0, [%1];"
+        "mbarrier.arrive.shared::cta.b64 %0, [%1];"
         : "=l"(state)
         : "r"(mbar_addr)
         : "memory"
