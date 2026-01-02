@@ -791,15 +791,29 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     int kv_head_row_offset)  // Row offset for current KV head in flattened tensor
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    if (threadIdx.x == 0) {
+        printf("[PRODUCER LEGACY] Block %d: ENTERED, kb0=[%d,%d), head_offset=%d\n",
+               blockIdx.x, kb0_start, kb0_stop, kv_head_row_offset);
+        // Extra warning for non-zero head offsets
+        if (kv_head_row_offset > 0) {
+            printf("[PRODUCER LEGACY] Block %d: *** NON-ZERO HEAD OFFSET %d ***\n",
+                   blockIdx.x, kv_head_row_offset);
+        }
+    }
+
     // CRITICAL: TMA fence to ensure tensor map descriptors (K and V) are visible
     // Uses .sys scope since tensor maps are copied from host via cudaMemcpyAsync
     tma_fence_acquire_maps(tensor_maps, 2);
-    
+
+    if (threadIdx.x == 0) {
+        printf("[PRODUCER LEGACY] Block %d: TMA fence done\n", blockIdx.x);
+    }
+
     const CUtensorMap* map_K = (const CUtensorMap*)(tensor_maps);
     const CUtensorMap* map_V = (const CUtensorMap*)(tensor_maps + sizeof(CUtensorMap));
 
     extern __shared__ char smem_base[];
-    
+
     // Use Blackwell memory layout: [K stage 0][K stage 1][V stage 0][V stage 1]
     // This matches what the consumer in process_tile expects:
     //   tile_K = smem (offset 0)
@@ -807,11 +821,16 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
     // Each stage's K/V is at a fixed offset within the K or V region.
     constexpr int bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
     constexpr int bytes_V = nbatch_fa * nbatch_V2 * sizeof(half2);
-    
+
     // K tiles: stages 0 and 1 are at offsets 0 and bytes_K
     // V tiles: stages 0 and 1 are at offsets 2*bytes_K and 2*bytes_K + bytes_V
     constexpr int offset_K_base = 0;
     constexpr int offset_V_base = 2 * bytes_K;  // After both K stages
+
+    if (threadIdx.x == 0) {
+        printf("[PRODUCER LEGACY] Block %d: bytes_K=%d, bytes_V=%d, offset_V_base=%d\n",
+               blockIdx.x, bytes_K, bytes_V, offset_V_base);
+    }
 
     uint32_t phase = 0;
 
@@ -821,27 +840,99 @@ static __device__ __forceinline__ void fattn_producer_loop_legacy(
         // CRITICAL: Add kv_head_row_offset for multi-head TMA access!
         const int row_offset = kv_head_row_offset + kb0 * nbatch_fa;
 
+        if (threadIdx.x == 0 && kb0 == kb0_start) {
+            printf("[PRODUCER LEGACY] Block %d: First iter kb0=%d stage=%d row_offset=%d\n",
+                   blockIdx.x, kb0, stage, row_offset);
+        }
+
         // K Phase: use tile-level barriers, Blackwell layout
+        if (threadIdx.x == 0 && kb0 == kb0_start) {
+            printf("[PRODUCER LEGACY] Block %d: Waiting empty_K[%d] phase=%d\n",
+                   blockIdx.x, stage, phase);
+        }
         mbarrier_wait(&state->empty_K[stage], phase);
+        if (threadIdx.x == 0 && kb0 == kb0_start) {
+            printf("[PRODUCER LEGACY] Block %d: empty_K wait DONE\n", blockIdx.x);
+        }
+
         half2* tile_K = (half2*)(smem_base + offset_K_base + stage * bytes_K);
         for (int k0 = 0; k0 < DKQ/2; k0 += nbatch_K2) {
             bool first_chunk = (k0 == 0);
-            load_tile_tma_multistrip<nbatch_fa, nbatch_K2>(
-                map_K, tile_K, &state->full_K[stage], k0, row_offset, first_chunk);
+            if (threadIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER LEGACY] Block %d: K TMA ABOUT TO ISSUE k0=%d row=%d (head=%d+kb0=%d*%d) smem=%p\n",
+                       blockIdx.x, k0, row_offset, kv_head_row_offset, kb0, nbatch_fa, tile_K);
+            }
+
+            // Inline the TMA call with surrounding debug
+            if (first_chunk) {
+                constexpr uint32_t bytes_tma = nbatch_fa * nbatch_K2 * sizeof(half2);
+                if (threadIdx.x == 0 && kb0 == kb0_start) {
+                    printf("[PRODUCER LEGACY] Block %d: calling mbarrier_arrive_expect_tx bytes=%u\n",
+                           blockIdx.x, bytes_tma);
+                }
+                mbarrier_arrive_expect_tx(&state->full_K[stage], bytes_tma);
+                if (threadIdx.x == 0 && kb0 == kb0_start) {
+                    printf("[PRODUCER LEGACY] Block %d: mbarrier_arrive_expect_tx DONE\n", blockIdx.x);
+                }
+            }
+
+            if (threadIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER LEGACY] Block %d: calling tma_load_2d coord_x=%d coord_y=%d\n",
+                       blockIdx.x, k0 * 2, row_offset);
+            }
+            tma_load_2d(tile_K, map_K, &state->full_K[stage], k0 * 2, row_offset);
+            if (threadIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER LEGACY] Block %d: tma_load_2d RETURNED\n", blockIdx.x);
+            }
         }
 
         // V Phase: use tile-level barriers, Blackwell layout
+        if (threadIdx.x == 0 && kb0 == kb0_start) {
+            printf("[PRODUCER LEGACY] Block %d: Waiting empty_V[%d]\n", blockIdx.x, stage);
+        }
         mbarrier_wait(&state->empty_V[stage], phase);
+        if (threadIdx.x == 0 && kb0 == kb0_start) {
+            printf("[PRODUCER LEGACY] Block %d: empty_V wait DONE\n", blockIdx.x);
+        }
+
         half2* tile_V = (half2*)(smem_base + offset_V_base + stage * bytes_V);
         for (int i0 = 0; i0 < DV/2; i0 += nbatch_V2) {
             bool first_chunk = (i0 == 0);
-            load_tile_tma_multistrip<nbatch_fa, nbatch_V2>(
-                map_V, tile_V, &state->full_V[stage], i0, row_offset, first_chunk);
+            if (threadIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER LEGACY] Block %d: V TMA ABOUT TO ISSUE i0=%d row=%d (head=%d) smem=%p\n",
+                       blockIdx.x, i0, row_offset, kv_head_row_offset, tile_V);
+            }
+
+            // Inline the TMA call with surrounding debug
+            if (first_chunk) {
+                constexpr uint32_t bytes_tma = nbatch_fa * nbatch_V2 * sizeof(half2);
+                if (threadIdx.x == 0 && kb0 == kb0_start) {
+                    printf("[PRODUCER LEGACY] Block %d: V mbarrier_arrive_expect_tx bytes=%u\n",
+                           blockIdx.x, bytes_tma);
+                }
+                mbarrier_arrive_expect_tx(&state->full_V[stage], bytes_tma);
+                if (threadIdx.x == 0 && kb0 == kb0_start) {
+                    printf("[PRODUCER LEGACY] Block %d: V mbarrier DONE\n", blockIdx.x);
+                }
+            }
+
+            if (threadIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER LEGACY] Block %d: V calling tma_load_2d coord_x=%d coord_y=%d\n",
+                       blockIdx.x, i0 * 2, row_offset);
+            }
+            tma_load_2d(tile_V, map_V, &state->full_V[stage], i0 * 2, row_offset);
+            if (threadIdx.x == 0 && kb0 == kb0_start) {
+                printf("[PRODUCER LEGACY] Block %d: V tma_load_2d RETURNED\n", blockIdx.x);
+            }
         }
 
         if (stage == nstages - 1) {
             phase ^= 1;
         }
+    }
+
+    if (threadIdx.x == 0) {
+        printf("[PRODUCER LEGACY] Block %d: Loop COMPLETE\n", blockIdx.x);
     }
 
     GGML_UNUSED(num_consumers);
@@ -3299,6 +3390,16 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 K->data, (long)K->ne[0], (unsigned long)K_rows);
         fprintf(stderr, "[TMA DEBUG]   K->nb[1]=%ld (stride), tile_k_half=%u, nbatch_fa=%d\n", 
                 (long)K->nb[1], tile_k_half, nbatch_fa);
+        
+        // TMA alignment checks
+        uintptr_t k_addr = reinterpret_cast<uintptr_t>(K->data);
+        fprintf(stderr, "[TMA DEBUG]   K address alignment: %lu-byte aligned (need 16-byte min)\n",
+                k_addr % 256 == 0 ? 256 : (k_addr % 128 == 0 ? 128 : (k_addr % 64 == 0 ? 64 : 
+                (k_addr % 32 == 0 ? 32 : (k_addr % 16 == 0 ? 16 : k_addr % 8)))));
+        fprintf(stderr, "[TMA DEBUG]   K->nb[0]=%ld (element size), expected sizeof(half)=%lu\n",
+                (long)K->nb[0], sizeof(half));
+        fprintf(stderr, "[TMA DEBUG]   Tile bytes: %u (inner) x %d (rows) = %u bytes/tile\n",
+                tile_k_half * (uint32_t)sizeof(half), nbatch_fa, tile_k_half * (uint32_t)sizeof(half) * nbatch_fa);
 
         CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
             &maps[0],
