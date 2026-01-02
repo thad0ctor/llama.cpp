@@ -199,8 +199,8 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
 
-    // DEBUG: print before expect_tx
-    if (threadIdx.x == 0 && blockIdx.x < 3) {
+    // DEBUG: print before expect_tx (catch blocks 14, 26-31 that crash first)
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
         printf("[MBAR] Block %d: before expect_tx, mbar_addr=0x%x tx_bytes=%u\n",
                blockIdx.x, mbar_addr, tx_bytes);
     }
@@ -213,7 +213,7 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
     );
 
     // DEBUG: print after expect_tx, before arrive
-    if (threadIdx.x == 0 && blockIdx.x < 3) {
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
         printf("[MBAR] Block %d: after expect_tx, before arrive\n", blockIdx.x);
     }
 
@@ -226,7 +226,7 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
     );
 
     // DEBUG: print after arrive
-    if (threadIdx.x == 0 && blockIdx.x < 3) {
+    if (threadIdx.x == 0 && blockIdx.x < 50) {
         printf("[MBAR] Block %d: after arrive\n", blockIdx.x);
     }
 }
