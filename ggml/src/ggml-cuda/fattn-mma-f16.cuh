@@ -598,10 +598,10 @@ static __device__ __forceinline__ void load_tile_tma_multistrip(
     }
     
     // sm_120 with large tiles (nbatch_K2 > 32) uses SWIZZLE_NONE, allowing single TMA load
-    // of the full tile. Multi-strip loading would cause out-of-bounds access because
-    // the tensor map specifies tile_k_half = nbatch_K2 * 2, so each TMA fetches the full row.
+    // of the full tile. For nbatch_K2 <= 32, uses SWIZZLE_128B which is compatible with ldmatrix.
+    // Multi-strip loading only needed for sm_100 with SWIZZLE_128B and large tiles.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // sm_120: Always single TMA load (tensor map created with SWIZZLE_NONE for large tiles)
+    // sm_120: Always single TMA load (SWIZZLE_128B for small tiles, SWIZZLE_NONE for large)
     tma_load_2d(smem_buffer, tensor_map, mbar, coord_x_base_h2 * 2, coord_y);
 #else
     // sm_100 and earlier: Use multi-strip for large tiles (SWIZZLE_128B)
@@ -2762,6 +2762,13 @@ __global__ void flash_attn_ext_f16_blackwell(
                             const char * __restrict__ tensor_maps)
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    // EARLY DEBUG: Check if kernel even starts
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[KERNEL DEBUG] Blackwell kernel ENTRY - block=(%d,%d,%d) thread=(%d,%d)\n",
+               blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y);
+    }
+    __syncthreads();
+
     constexpr int ncols = ncols1 * ncols2;
     constexpr auto config = ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
     constexpr int nbatch_fa = config.nbatch_fa;
@@ -2803,6 +2810,14 @@ __global__ void flash_attn_ext_f16_blackwell(
     // - Chunked mode: use chunk-level barriers (empty_K_chunk, full_K_chunk, etc.)
     // - Legacy mode: use tile-level barriers (empty_K, full_K, etc.)
     // - Q_loaded: Always needed for Q synchronization
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[KERNEL DEBUG] Before barrier init: state=%p, needs_chunking=%d\n", 
+               state, needs_chunking);
+        printf("[KERNEL DEBUG] State offset from smem: %ld bytes\n",
+               (long)((char*)state - smem));
+    }
+    __syncthreads();
+    
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         mbarrier_init(&state->Q_loaded, num_consumers * WARP_SIZE);
         
@@ -2833,6 +2848,10 @@ __global__ void flash_attn_ext_f16_blackwell(
         }
     }
     __syncthreads();
+    
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[KERNEL DEBUG] Barrier init COMPLETE\n");
+    }
 
     // Pre-arrive on empty barriers so producer can load first data.
     // For the first iteration, buffers are already "empty" (nothing loaded yet),
@@ -2857,6 +2876,10 @@ __global__ void flash_attn_ext_f16_blackwell(
         }
     }
     __syncthreads();
+    
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[KERNEL DEBUG] Pre-arrive COMPLETE, starting main loop\n");
+    }
 
     const int iter_k = (ne11 + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j = (ne01.z + (ncols1 - 1)) / ncols1;
@@ -3146,12 +3169,22 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         const ggml_tensor * K = dst->src[1];
         uint64_t K_rows = ggml_nrows(K);
 
-        // For sm_120 with large tiles (nbatch_K2 > 32), use SWIZZLE_NONE to load full tiles
-        // SWIZZLE_128B limits tile dimension to 64 half elements (128 bytes)
-        // SWIZZLE_NONE allows full nbatch_K2 * 2 half elements per tile
+        // Use SWIZZLE_128B for tiles <= 32 half2 (compatible with ldmatrix)
+        // Use SWIZZLE_NONE only for larger tiles (> 32 half2) which exceed SWIZZLE_128B's 128-byte limit
+        // With nbatch_K2=32: use_swizzle_none=false → SWIZZLE_128B (correct for 2-chunk pipelining)
         const bool use_swizzle_none = ggml_cuda_is_consumer_blackwell(cc) && nbatch_K2 > 32;
-        const uint32_t tile_k_half = use_swizzle_none ? (nbatch_K2 * 2) : (nbatch_K2 * 2);
+        const uint32_t tile_k_half = nbatch_K2 * 2;
         const CUtensorMapSwizzle swizzle_k = use_swizzle_none ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B;
+
+        fprintf(stderr, "[TMA DEBUG] K tensor map creation:\n");
+        fprintf(stderr, "[TMA DEBUG]   is_consumer_blackwell=%d, nbatch_K2=%d\n", 
+                ggml_cuda_is_consumer_blackwell(cc), nbatch_K2);
+        fprintf(stderr, "[TMA DEBUG]   use_swizzle_none=%d, swizzle=%s\n", 
+                use_swizzle_none, use_swizzle_none ? "NONE" : "128B");
+        fprintf(stderr, "[TMA DEBUG]   K->data=%p, K->ne[0]=%ld, K_rows=%lu\n", 
+                K->data, (long)K->ne[0], (unsigned long)K_rows);
+        fprintf(stderr, "[TMA DEBUG]   K->nb[1]=%ld (stride), tile_k_half=%u, nbatch_fa=%d\n", 
+                (long)K->nb[1], tile_k_half, nbatch_fa);
 
         CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
             &maps[0],
@@ -3164,6 +3197,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             nbatch_fa,          // Tile size in N dimension (rows)
             swizzle_k,
             CU_TENSOR_MAP_L2_PROMOTION_L2_256B));
+        fprintf(stderr, "[TMA DEBUG]   K tensor map created OK\n");
 
         // V tensor map
         const ggml_tensor * V = mla ? K : dst->src[2];
@@ -3173,10 +3207,17 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
         uint64_t V_rows = ggml_nrows(V);
+        // Match K's swizzle logic: SWIZZLE_128B for tiles <= 32 half2, SWIZZLE_NONE for larger
         const bool use_swizzle_none_v = ggml_cuda_is_consumer_blackwell(cc) && nbatch_V2 > 32;
-        const uint32_t tile_v_half = use_swizzle_none_v ? (nbatch_V2 * 2) : (nbatch_V2 * 2);
+        const uint32_t tile_v_half = nbatch_V2 * 2;
         const CUtensorMapSwizzle swizzle_v = use_swizzle_none_v ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B;
         const uint64_t V_dim_k = mla ? DV : V->ne[0];
+
+        fprintf(stderr, "[TMA DEBUG] V tensor map creation:\n");
+        fprintf(stderr, "[TMA DEBUG]   V_ptr=%p, V_dim_k=%lu, V_rows=%lu\n", 
+                V_ptr, (unsigned long)V_dim_k, (unsigned long)V_rows);
+        fprintf(stderr, "[TMA DEBUG]   V->nb[1]=%ld, tile_v_half=%u, nbatch_fa=%d\n", 
+                (long)V->nb[1], tile_v_half, nbatch_fa);
 
         CU_CHECK(ggml_cuda_create_tensor_map_2d_ex(
             &maps[1],
@@ -3189,8 +3230,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             nbatch_fa,          // Rows per tile
             swizzle_v,
             CU_TENSOR_MAP_L2_PROMOTION_L2_256B));
+        fprintf(stderr, "[TMA DEBUG]   V tensor map created OK\n");
 
         cudaMemcpyAsync(tensor_maps_dev_ptr, maps, 2 * sizeof(CUtensorMap), cudaMemcpyHostToDevice, ctx.stream());
+        fprintf(stderr, "[TMA DEBUG] Tensor maps copied to device at %p\n", tensor_maps_dev_ptr);
     }
 #endif
 
@@ -3212,6 +3255,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         size_t bytes_mask = ncols1 * (config_bw.nbatch_fa/2 + 4) * sizeof(half2);
         // Total: KV buffers + Q + mask + pipeline state + alignment padding
         nbytes_shared_total = bytes_K_total + bytes_V_total + bytes_Q + bytes_mask + sizeof(fattn_pipeline_state) + 128;
+        
+        fprintf(stderr, "[SHMEM DEBUG] Blackwell shared memory calculation:\n");
+        fprintf(stderr, "[SHMEM DEBUG]   bytes_K_chunk=%zu, bytes_K_total=%zu\n", bytes_K_chunk, bytes_K_total);
+        fprintf(stderr, "[SHMEM DEBUG]   bytes_V_chunk=%zu, bytes_V_total=%zu\n", bytes_V_chunk, bytes_V_total);
+        fprintf(stderr, "[SHMEM DEBUG]   bytes_Q=%zu, bytes_mask=%zu\n", bytes_Q, bytes_mask);
+        fprintf(stderr, "[SHMEM DEBUG]   sizeof(fattn_pipeline_state)=%zu\n", sizeof(fattn_pipeline_state));
+        fprintf(stderr, "[SHMEM DEBUG]   TOTAL nbytes_shared=%zu (%.1f KB)\n", nbytes_shared_total, nbytes_shared_total/1024.0);
     }
 
     auto launch_kernel = [&](auto kernel_func, bool tma) {
@@ -3221,8 +3271,16 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             // Only set shared memory limit if we're NOT on Blackwell running the Ampere kernel
             // On Blackwell with Ampere kernel, use the default shared memory settings
             const bool using_blackwell_kernel = tma && ggml_cuda_has_blackwell_features(cc);
+            
+            fprintf(stderr, "[FUNC DEBUG] Setting kernel attributes:\n");
+            fprintf(stderr, "[FUNC DEBUG]   tma=%d, using_blackwell_kernel=%d\n", tma, using_blackwell_kernel);
+            fprintf(stderr, "[FUNC DEBUG]   nbytes_shared_total=%zu (%.1f KB)\n", nbytes_shared_total, nbytes_shared_total/1024.0);
+            
             if (using_blackwell_kernel || !ggml_cuda_has_blackwell_features(cc)) {
-                CUDA_CHECK(cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+                cudaError_t attr_err = cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+                fprintf(stderr, "[FUNC DEBUG]   cudaFuncSetAttribute(MaxDynamicSharedMemorySize, %zu) = %s\n", 
+                        nbytes_shared_total, cudaGetErrorString(attr_err));
+                CUDA_CHECK(attr_err);
             }
 
             // On Blackwell (sm_120), set preferred shared memory carveout to maximum.
@@ -3231,12 +3289,17 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             // Value 100 = cudaSharedmemCarveoutMaxShared (prefer shared over L1).
             // This setting only affects scheduling and doesn't guarantee allocation.
             if (using_blackwell_kernel) {
-                CUDA_CHECK(cudaFuncSetAttribute(kernel_func, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+                cudaError_t carve_err = cudaFuncSetAttribute(kernel_func, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+                fprintf(stderr, "[FUNC DEBUG]   cudaFuncSetAttribute(PreferredSharedMemoryCarveout, 100) = %s\n",
+                        cudaGetErrorString(carve_err));
+                CUDA_CHECK(carve_err);
             }
 
             shared_memory_limit_raised[id] = true;
         }
 #endif
+        fprintf(stderr, "[FUNC DEBUG] Calling launch_fattn with nwarps=%d, nbytes_shared=%zu, tensor_maps=%p\n",
+                nwarps, nbytes_shared_total, tma ? tensor_maps_dev_ptr : nullptr);
         launch_fattn<DV, ncols1, ncols2>( 
             ctx, dst, kernel_func, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, WARP_SIZE,
             tma ? tensor_maps_dev_ptr : nullptr

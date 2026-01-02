@@ -1007,6 +1007,39 @@ void launch_fattn(
 #endif
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+    
+    // Debug: Print kernel launch parameters
+    {
+        static bool launch_debug_printed = false;
+        if (!launch_debug_printed) {
+            fprintf(stderr, "\n[LAUNCH DEBUG] ===== Flash Attention Kernel Launch =====\n");
+            fprintf(stderr, "[LAUNCH DEBUG] Grid: (%u, %u, %u)\n", blocks_num.x, blocks_num.y, blocks_num.z);
+            fprintf(stderr, "[LAUNCH DEBUG] Block: (%u, %u, %u) = %u threads\n", 
+                    block_dim.x, block_dim.y, block_dim.z, 
+                    block_dim.x * block_dim.y * block_dim.z);
+            fprintf(stderr, "[LAUNCH DEBUG] Shared memory: %zu bytes (%.1f KB)\n", 
+                    nbytes_shared, nbytes_shared / 1024.0);
+            fprintf(stderr, "[LAUNCH DEBUG] Q->data=%p, K_data=%p, V_data=%p\n", 
+                    Q->data, K_data, V_data);
+            fprintf(stderr, "[LAUNCH DEBUG] Q dims: ne0=%ld, ne1=%ld, ne2=%ld, ne3=%ld\n",
+                    (long)Q->ne[0], (long)Q->ne[1], (long)Q->ne[2], (long)Q->ne[3]);
+            fprintf(stderr, "[LAUNCH DEBUG] K dims: ne0=%ld, ne1=%ld, ne2=%ld, ne3=%ld\n",
+                    (long)K->ne[0], (long)K->ne[1], (long)K->ne[2], (long)K->ne[3]);
+            
+            // Check device shared memory limits
+            int dev_id;
+            cudaGetDevice(&dev_id);
+            int max_shmem = 0;
+            cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id);
+            fprintf(stderr, "[LAUNCH DEBUG] Device %d max shared mem (optin): %d bytes (%.1f KB)\n", 
+                    dev_id, max_shmem, max_shmem / 1024.0);
+            fprintf(stderr, "[LAUNCH DEBUG] Shared mem OK: %s\n", 
+                    nbytes_shared <= (size_t)max_shmem ? "YES" : "NO - TOO LARGE!");
+            fprintf(stderr, "[LAUNCH DEBUG] ==========================================\n\n");
+            launch_debug_printed = true;
+        }
+    }
+    
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,
         K_data,
@@ -1023,7 +1056,14 @@ void launch_fattn(
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         args...
     );
-    CUDA_CHECK(cudaGetLastError());
+    
+    // Sync and check error immediately for debugging
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "[LAUNCH DEBUG] !!! KERNEL LAUNCH FAILED !!!\n");
+        fprintf(stderr, "[LAUNCH DEBUG] Error: %s\n", cudaGetErrorString(launch_err));
+    }
+    CUDA_CHECK(launch_err);
 
     if (stream_k) {
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
