@@ -184,22 +184,24 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
 }
 
 // Arrive and expect N bytes of async transactions
+// PTX requires .sem.scope qualifiers (.release.cta) for sm_90+
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     asm volatile(
-        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
-        : 
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :
         : "r"(mbar_addr), "r"(tx_bytes)
         : "memory"
     );
 }
 
 // Arrive at barrier (no transaction update)
+// PTX requires .sem.scope qualifiers (.release.cta) for sm_90+
 __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
     uint32_t mbar_addr = __cvta_generic_to_shared(mbar);
     asm volatile(
-        "mbarrier.arrive.shared::cta.b64 _, [%0];"
-        : 
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+        :
         : "r"(mbar_addr)
         : "memory"
     );

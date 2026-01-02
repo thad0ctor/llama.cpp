@@ -158,13 +158,13 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     }
     if (DKQ == 128 && DV == 128) {
         // Most common: Llama, Mistral, Qwen, etc.
-        // nbatch_K2=32 to fit SWIZZLE_128B (max 32 half2 = 64 half = 128 bytes)
-        // This enables 2-chunk pipelining: num_K_chunks = 64/32 = 2
-        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, false, 4);
+        // TEST: nbatch_K2=64 to DISABLE chunking (DKQ/2=64 <= 64)
+        // With SWIZZLE_NONE, we can use larger tiles without 128-byte constraint
+        // Shared mem: 64 × (64 + 64) × 4 × 2 = 64KB for KV + Q + mask ≈ 91KB < 99KB ✓
+        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, true, 4);
+        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, true, 4);
+        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, true, 4);
+        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 64, 64, 32, 2, false, 4);
     }
     
     // ========== Large heads - Fall back to Ampere ==========
@@ -3368,10 +3368,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         const ggml_tensor * K = dst->src[1];
         uint64_t K_rows = ggml_nrows(K);
 
-        // Use SWIZZLE_128B for tiles <= 32 half2 (compatible with ldmatrix)
-        // Use SWIZZLE_NONE only for larger tiles (> 32 half2) which exceed SWIZZLE_128B's 128-byte limit
-        // With nbatch_K2=32: use_swizzle_none=false → SWIZZLE_128B (correct for 2-chunk pipelining)
-        const bool use_swizzle_none = ggml_cuda_is_consumer_blackwell(cc) && nbatch_K2 > 32;
+        // For TMA chunking, always use SWIZZLE_NONE to avoid alignment issues
+        // SWIZZLE_128B requires strict 128-byte alignment which may not hold when
+        // loading at non-zero coord_x offsets in chunked mode.
+        // SWIZZLE_NONE has no alignment requirements and works for all tile sizes.
+        constexpr bool needs_K_chunking_check = true;  // DKQ/2 > nbatch_K2 is checked at runtime
+        const bool use_swizzle_none = ggml_cuda_is_consumer_blackwell(cc);  // Always SWIZZLE_NONE for Blackwell TMA
         const uint32_t tile_k_half = nbatch_K2 * 2;
         const CUtensorMapSwizzle swizzle_k = use_swizzle_none ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B;
 
@@ -3422,8 +3424,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
         uint64_t V_rows = ggml_nrows(V);
-        // Match K's swizzle logic: SWIZZLE_128B for tiles <= 32 half2, SWIZZLE_NONE for larger
-        const bool use_swizzle_none_v = ggml_cuda_is_consumer_blackwell(cc) && nbatch_V2 > 32;
+        // Match K's swizzle logic: always use SWIZZLE_NONE on Blackwell to avoid alignment issues
+        const bool use_swizzle_none_v = ggml_cuda_is_consumer_blackwell(cc);  // Always SWIZZLE_NONE for Blackwell TMA
         const uint32_t tile_v_half = nbatch_V2 * 2;
         const CUtensorMapSwizzle swizzle_v = use_swizzle_none_v ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B;
         const uint64_t V_dim_k = mla ? DV : V->ne[0];
