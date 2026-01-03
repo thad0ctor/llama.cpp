@@ -2386,21 +2386,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
 
         // DEBUG: Sync after each expert to catch exactly which one crashes
+        // NOTE: Skip during CUDA graph capture (sync not allowed)
         {
-            cudaError_t expert_err = cudaDeviceSynchronize();
-            if (expert_err != cudaSuccess) {
-                fprintf(stderr, "[MUL_MAT_ID] !!! EXPERT %lld CRASHED !!! error=%s\n",
-                        (long long)i02, cudaGetErrorString(expert_err));
-                fprintf(stderr, "[MUL_MAT_ID] tokens_per_expert[%lld]=%d\n",
-                        (long long)i02, tokens_per_expert[i02]);
-                fprintf(stderr, "[MUL_MAT_ID] src0_slice.data=%p\n", src0_slice.data);
-                fprintf(stderr, "[MUL_MAT_ID] src1_slice: ne=[%lld,%lld], data=%p\n",
-                        (long long)src1_slice.ne[0], (long long)src1_slice.ne[1], src1_slice.data);
-                fprintf(stderr, "[MUL_MAT_ID] dst_slice: ne=[%lld,%lld], data=%p\n",
-                        (long long)dst_slice.ne[0], (long long)dst_slice.ne[1], dst_slice.data);
-                GGML_ABORT("Expert matmul failed");
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(ctx.stream(), &capture_status);
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                cudaError_t expert_err = cudaDeviceSynchronize();
+                if (expert_err != cudaSuccess) {
+                    fprintf(stderr, "[MUL_MAT_ID] !!! EXPERT %lld CRASHED !!! error=%s\n",
+                            (long long)i02, cudaGetErrorString(expert_err));
+                    fprintf(stderr, "[MUL_MAT_ID] tokens_per_expert[%lld]=%d\n",
+                            (long long)i02, tokens_per_expert[i02]);
+                    fprintf(stderr, "[MUL_MAT_ID] src0_slice.data=%p\n", src0_slice.data);
+                    fprintf(stderr, "[MUL_MAT_ID] src1_slice: ne=[%lld,%lld], data=%p\n",
+                            (long long)src1_slice.ne[0], (long long)src1_slice.ne[1], src1_slice.data);
+                    fprintf(stderr, "[MUL_MAT_ID] dst_slice: ne=[%lld,%lld], data=%p\n",
+                            (long long)dst_slice.ne[0], (long long)dst_slice.ne[1], dst_slice.data);
+                    GGML_ABORT("Expert matmul failed");
+                }
+                fprintf(stderr, "[MUL_MAT_ID] Expert %lld OK\n", (long long)i02);
             }
-            fprintf(stderr, "[MUL_MAT_ID] Expert %lld OK\n", (long long)i02);
         }
 
         src1_data_cur += src1_slice.nb[2];
@@ -2413,14 +2418,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 
     // DEBUG: Final sync after MUL_MAT_ID
+    // NOTE: Skip during CUDA graph capture (sync not allowed)
     {
-        cudaError_t final_err = cudaDeviceSynchronize();
-        if (final_err != cudaSuccess) {
-            fprintf(stderr, "[MUL_MAT_ID] !!! FINAL get_rows CRASHED !!! error=%s\n",
-                    cudaGetErrorString(final_err));
-            GGML_ABORT("MUL_MAT_ID final get_rows failed");
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(ctx.stream(), &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            cudaError_t final_err = cudaDeviceSynchronize();
+            if (final_err != cudaSuccess) {
+                fprintf(stderr, "[MUL_MAT_ID] !!! FINAL get_rows CRASHED !!! error=%s\n",
+                        cudaGetErrorString(final_err));
+                GGML_ABORT("MUL_MAT_ID final get_rows failed");
+            }
+            fprintf(stderr, "[MUL_MAT_ID] Completed successfully\n");
         }
-        fprintf(stderr, "[MUL_MAT_ID] Completed successfully\n");
     }
 }
 
@@ -2778,22 +2788,27 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     }
 
     // DEBUG: Check if THIS operation crashed
+    // NOTE: Skip during CUDA graph capture (sync not allowed)
     {
-        static int post_op_count = 0;
-        post_op_count++;
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(ctx.stream(), &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            static int post_op_count = 0;
+            post_op_count++;
 
-        cudaError_t post_err = cudaDeviceSynchronize();
-        if (post_err != cudaSuccess) {
-            const char* op_name = ggml_op_name(dst->op);
-            fprintf(stderr, "[POST-OP #%d] !!! THIS OP CRASHED !!! op=%s error=%s\n",
-                    post_op_count, op_name, cudaGetErrorString(post_err));
-            if (dst->src[0]) {
-                fprintf(stderr, "[POST-OP #%d] src0 ne=[%lld,%lld,%lld,%lld]\n",
-                        post_op_count,
-                        (long long)dst->src[0]->ne[0], (long long)dst->src[0]->ne[1],
-                        (long long)dst->src[0]->ne[2], (long long)dst->src[0]->ne[3]);
+            cudaError_t post_err = cudaDeviceSynchronize();
+            if (post_err != cudaSuccess) {
+                const char* op_name = ggml_op_name(dst->op);
+                fprintf(stderr, "[POST-OP #%d] !!! THIS OP CRASHED !!! op=%s error=%s\n",
+                        post_op_count, op_name, cudaGetErrorString(post_err));
+                if (dst->src[0]) {
+                    fprintf(stderr, "[POST-OP #%d] src0 ne=[%lld,%lld,%lld,%lld]\n",
+                            post_op_count,
+                            (long long)dst->src[0]->ne[0], (long long)dst->src[0]->ne[1],
+                            (long long)dst->src[0]->ne[2], (long long)dst->src[0]->ne[3]);
+                }
+                GGML_ABORT("Operation execution failed");
             }
-            GGML_ABORT("Operation execution failed");
         }
     }
 

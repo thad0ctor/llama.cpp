@@ -404,6 +404,12 @@ void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         static bool add_params_printed = false;
 
         if (add_sync_debug_enabled) {
+            // NOTE: Skip during CUDA graph capture (sync not allowed)
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(ctx.stream(), &capture_status);
+            if (capture_status != cudaStreamCaptureStatusNone) {
+                // Skip sync during graph capture
+            } else {
             const ggml_tensor * src0 = dst->src[0];
             const ggml_tensor * src1 = dst->src[1];
 
@@ -447,6 +453,7 @@ void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 GGML_ABORT("ADD kernel execution failed");
             }
             fprintf(stderr, "[ADD SYNC DEBUG] ADD completed successfully!\n");
+            } // else capture_status == cudaStreamCaptureStatusNone
         }
     }
     // =========================================================================

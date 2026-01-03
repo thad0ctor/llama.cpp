@@ -539,6 +539,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         static bool rms_norm_params_printed = false;
 
         if (rms_norm_sync_debug_enabled) {
+            // NOTE: Skip during CUDA graph capture (sync not allowed)
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(stream, &capture_status);
+            if (capture_status != cudaStreamCaptureStatusNone) {
+                // Skip sync during graph capture
+            } else {
             if (!rms_norm_params_printed) {
                 const int id = ggml_cuda_get_device();
                 const int cc = ggml_cuda_info().devices[id].cc;
@@ -576,6 +582,7 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 GGML_ABORT("RMS_NORM kernel execution failed");
             }
             fprintf(stderr, "[RMS_NORM SYNC DEBUG] RMS_NORM completed successfully!\n");
+            } // else capture_status == cudaStreamCaptureStatusNone
         }
     }
     // =========================================================================

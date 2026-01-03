@@ -1075,6 +1075,12 @@ void launch_fattn(
         static bool params_printed = false;
 
         if (sync_debug_enabled) {
+            // NOTE: Skip during CUDA graph capture (sync not allowed)
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(main_stream, &capture_status);
+            if (capture_status != cudaStreamCaptureStatusNone) {
+                // Skip sync during graph capture
+            } else {
             // Print comprehensive parameters BEFORE sync (in case of crash)
             if (!params_printed) {
                 fprintf(stderr, "\n[FATTN PARAMS] ============ Flash Attention Parameters ============\n");
@@ -1170,6 +1176,7 @@ void launch_fattn(
                 fprintf(stderr, "[FATTN SYNC DEBUG] Post-sync error: %s\n", cudaGetErrorString(post_sync_err));
                 GGML_ABORT("Flash attention post-sync error");
             }
+            } // else capture_status == cudaStreamCaptureStatusNone
         }
     }
     // =========================================================================
