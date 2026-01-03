@@ -2044,6 +2044,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
             // Scale previous KQ_rowsum to account for a potential increase in KQ_max:
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
+
+            // DEBUG: Check for NaN/zero in KQ_rowsum (division by this causes NaN later)
+            if ((isnan(KQ_rowsum[col]) || KQ_rowsum[col] == 0.0f || isinf(KQ_rowsum[col])) &&
+                threadIdx.x == 0 && blockIdx.x == 0) {
+                printf("[FA SOFTMAX NaN] warp %d col %d: KQ_rowsum=%f KQ_max_scale=%f KQ_rowsum_add=%f\n",
+                       warp_id, col, KQ_rowsum[col], KQ_max_scale[col], KQ_rowsum_add[col]);
+            }
         }
 
 #if defined(TURING_MMA_AVAILABLE)
@@ -2600,6 +2607,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     const int      warp_id          = threadIdx.y - 1;  // Skip warp 0, use warps 1-4 as compute
     if (threadIdx.y == 0) {
         return;  // Producer warp exits early for SM_120 - only consumer warps compute
+    }
+    // DEBUG: Confirm process_tile is executing for consumer warps
+    if (threadIdx.x == 0 && warp_id == 0 && blockIdx.x == 0) {
+        printf("[PROCESS_TILE SM120] Entered! warp_id=%d, effective_nwarps=%d\n", warp_id, effective_nwarps);
     }
 #else
     constexpr int  effective_nwarps = (num_consumers > 0) ? num_consumers : nwarps;
@@ -3314,6 +3325,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             dstk_val.y /= KQ_rowsum_j;
                         }
 
+                        // DEBUG: Check for NaN before writing output
+                        if (isnan(dstk_val.x) || isnan(dstk_val.y) || isinf(dstk_val.x) || isinf(dstk_val.y)) {
+                            if (threadIdx.x == 0) {
+                                printf("[FA KERNEL NaN] Block %d warp %d: NaN in dstk_val! x=%f y=%f\n",
+                                       blockIdx.x, warp_id, dstk_val.x, dstk_val.y);
+                                printf("[FA KERNEL NaN] jc_dst=%d k=%d j_dst=%d c_dst=%d\n",
+                                       jc_dst, k, j_dst, c_dst);
+                                if constexpr (!needs_fixup && !is_fixup) {
+                                    const float KQ_rowsum_j = meta_j[1];
+                                    printf("[FA KERNEL NaN] KQ_rowsum_j=%f (division by this)\n", KQ_rowsum_j);
+                                }
+                            }
+                        }
+
                         if (is_fixup) {
                             dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
                         } else {
@@ -3548,6 +3573,19 @@ __global__ void flash_attn_ext_f16_blackwell(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
                             const char * __restrict__ tensor_maps)
 {
+    // DEBUG: UNCONDITIONAL - outside any #ifdef - confirm kernel entry
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[BLACKWELL KERNEL ENTRY] flash_attn_ext_f16_blackwell called!\n");
+        printf("[BLACKWELL KERNEL ENTRY] blockDim=(%d,%d,%d), DKQ=%d, DV=%d\n",
+               blockDim.x, blockDim.y, blockDim.z, DKQ, DV);
+#ifdef BLACKWELL_TMA_AVAILABLE
+        printf("[BLACKWELL KERNEL ENTRY] BLACKWELL_TMA_AVAILABLE=YES\n");
+#else
+        printf("[BLACKWELL KERNEL ENTRY] BLACKWELL_TMA_AVAILABLE=NO (kernel body skipped!)\n");
+#endif
+    }
+    __syncthreads();
+
 #ifdef BLACKWELL_TMA_AVAILABLE
     // EARLY DEBUG: Check if kernel even starts
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
@@ -3826,8 +3864,14 @@ __global__ void flash_attn_ext_f16_blackwell(
          // =====================================================================
          // SM_120 PATH: Consumer warps compute (producer warp idles)
          // =====================================================================
+         // DEBUG: Unconditional print to confirm SM_120 path is taken
+         if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0) {
+             printf("[SM120 PATH] Block 0 entering SM_120 consumer path, calling process_tile\n");
+             printf("[SM120 PATH] kv_head_row_offset=%d, K_total_rows=%d\n", kv_head_row_offset, K_total_rows);
+             printf("[SM120 PATH] kb0_start=%d, kb0_stop=%d, jt=%d\n", kb0_start, kb0_stop, jt);
+         }
          // On SM_120 (RTX 5090), TMA mbarrier.arrive crashes at runtime.
-         // 
+         //
          // The Blackwell kernel is structured for 1 producer + N consumer warps.
          // For SM_120, we:
          //   - Have producer warp (threadIdx.y=0) idle

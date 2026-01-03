@@ -1200,4 +1200,32 @@ void launch_fattn(
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    // =========================================================================
+    // DEBUG: UNCONDITIONALLY check FA output - will ALWAYS print
+    // =========================================================================
+    {
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(main_stream, &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamSynchronize(main_stream));
+
+            float debug_vals[8];
+            CUDA_CHECK(cudaMemcpy(debug_vals, KQV->data, sizeof(debug_vals), cudaMemcpyDeviceToHost));
+
+            bool has_nan = false;
+            for (int i = 0; i < 8; i++) {
+                if (isnan(debug_vals[i]) || isinf(debug_vals[i])) {
+                    has_nan = true;
+                    break;
+                }
+            }
+
+            fprintf(stderr, "[FA OUTPUT CHECK] KQV->data=%p vals[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %s\n",
+                    KQV->data,
+                    debug_vals[0], debug_vals[1], debug_vals[2], debug_vals[3],
+                    debug_vals[4], debug_vals[5], debug_vals[6], debug_vals[7],
+                    has_nan ? "*** HAS NaN ***" : "(OK)");
+        }
+    }
 }
