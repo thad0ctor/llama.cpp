@@ -66,6 +66,82 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             GGML_ABORT("fatal error");
             break;
     }
+
+    // =========================================================================
+    // DEBUG: Synchronize and check for runtime errors in MMQ kernel
+    // This isolates whether MMQ itself crashes or reads corrupted data from FA.
+    // REMOVE THIS BLOCK AFTER DEBUGGING - it kills performance!
+    // =========================================================================
+    {
+        static bool mmq_sync_debug_enabled = true;  // Set to false to disable sync
+        static bool mmq_params_printed = false;
+
+        if (mmq_sync_debug_enabled) {
+            // Print comprehensive parameters BEFORE sync (in case of crash)
+            if (!mmq_params_printed) {
+                const int id = ggml_cuda_get_device();
+                const int cc = ggml_cuda_info().devices[id].cc;
+
+                fprintf(stderr, "\n[MMQ PARAMS] ============ MMQ Kernel Parameters ============\n");
+                fprintf(stderr, "[MMQ PARAMS] Device info:\n");
+                fprintf(stderr, "[MMQ PARAMS]   device: %d, cc: %d\n", id, cc);
+                fprintf(stderr, "[MMQ PARAMS]   is_consumer_blackwell (sm_120): %d\n", ggml_cuda_is_consumer_blackwell(cc));
+
+                fprintf(stderr, "[MMQ PARAMS] Matrix dimensions:\n");
+                fprintf(stderr, "[MMQ PARAMS]   type_x: %d (quantized weight type)\n", args.type_x);
+                fprintf(stderr, "[MMQ PARAMS]   nrows_x: %d, ncols_x: %d\n", args.nrows_x, args.ncols_x);
+                fprintf(stderr, "[MMQ PARAMS]   ncols_y: %d, nrows_dst: %d, ncols_dst: %d\n",
+                        args.ncols_y, args.nrows_dst, args.ncols_dst);
+                fprintf(stderr, "[MMQ PARAMS]   ncols_max: %d\n", args.ncols_max);
+
+                fprintf(stderr, "[MMQ PARAMS] Strides:\n");
+                fprintf(stderr, "[MMQ PARAMS]   stride_row_x: %d\n", args.stride_row_x);
+                fprintf(stderr, "[MMQ PARAMS]   stride_channel_x: %d, stride_channel_y: %d, stride_channel_dst: %d\n",
+                        args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst);
+                fprintf(stderr, "[MMQ PARAMS]   stride_sample_x: %d, stride_sample_y: %d, stride_sample_dst: %d\n",
+                        args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst);
+
+                fprintf(stderr, "[MMQ PARAMS] Channel/Sample info:\n");
+                fprintf(stderr, "[MMQ PARAMS]   nchannels_x: %d, nchannels_y: %d\n",
+                        args.nchannels_x, args.nchannels_y);
+                fprintf(stderr, "[MMQ PARAMS]   nsamples_x: %d, nsamples_y: %d\n",
+                        args.nsamples_x, args.nsamples_y);
+
+                fprintf(stderr, "[MMQ PARAMS] Pointers:\n");
+                fprintf(stderr, "[MMQ PARAMS]   x (weights): %p\n", args.x);
+                fprintf(stderr, "[MMQ PARAMS]   y (activations): %p\n", (void*)args.y);
+                fprintf(stderr, "[MMQ PARAMS]   dst: %p\n", (void*)args.dst);
+                fprintf(stderr, "[MMQ PARAMS]   ids_dst: %p, expert_bounds: %p\n",
+                        (void*)args.ids_dst, (void*)args.expert_bounds);
+
+                fprintf(stderr, "[MMQ PARAMS] Flags:\n");
+                fprintf(stderr, "[MMQ PARAMS]   use_stream_k: %d\n", args.use_stream_k);
+
+                fprintf(stderr, "[MMQ PARAMS] =========================================================\n\n");
+                mmq_params_printed = true;
+            }
+
+            cudaError_t launch_err = cudaGetLastError();
+            if (launch_err != cudaSuccess) {
+                fprintf(stderr, "[MMQ SYNC DEBUG] !!! MMQ KERNEL LAUNCH FAILED !!!\n");
+                fprintf(stderr, "[MMQ SYNC DEBUG] Error: %s\n", cudaGetErrorString(launch_err));
+                fprintf(stderr, "[MMQ SYNC DEBUG] See [MMQ PARAMS] above for full parameter dump\n");
+            }
+
+            fprintf(stderr, "[MMQ SYNC DEBUG] Waiting for MMQ kernel to complete...\n");
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[MMQ SYNC DEBUG] !!! MMQ KERNEL CRASHED !!!\n");
+                fprintf(stderr, "[MMQ SYNC DEBUG] Error: %s\n", cudaGetErrorString(sync_err));
+                fprintf(stderr, "[MMQ SYNC DEBUG] type_x=%d, nrows_x=%d, ncols_x=%d\n",
+                        args.type_x, args.nrows_x, args.ncols_x);
+                fprintf(stderr, "[MMQ SYNC DEBUG] See [MMQ PARAMS] above for full parameter dump\n");
+                GGML_ABORT("MMQ kernel execution failed");
+            }
+            fprintf(stderr, "[MMQ SYNC DEBUG] MMQ completed successfully!\n");
+        }
+    }
+    // =========================================================================
 }
 
 void ggml_cuda_mul_mat_q(

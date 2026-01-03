@@ -2378,6 +2378,35 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         // SM_120 OPTIMIZED: Use swizzled ldmatrix_trans to read from swizzled V
         constexpr int STRIDE_BYTES_V_iter = stride_tile_V * sizeof(half2);
         const uint32_t tile_V_i_base = ggml_cuda_cvta_generic_to_shared((void*)tile_V_i);
+
+        // =========================================================================
+        // DEBUG: V ldmatrix swizzle address validation (first V chunk only)
+        // =========================================================================
+        {
+            static bool v_ldmatrix_debug_done = false;
+            if (!v_ldmatrix_debug_done && threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && v_chunk == 0) {
+                extern __shared__ char smem_v_debug[];
+                printf("\n[V LDMATRIX DEBUG] ========== V MMA Setup ==========\n");
+                printf("[V LDMATRIX DEBUG] tile_V_i=%p (smem offset=%ld)\n",
+                       (void*)tile_V_i, (long)((char*)tile_V_i - smem_v_debug));
+                printf("[V LDMATRIX DEBUG] tile_V_i_base (smem addr)=0x%x\n", tile_V_i_base);
+                printf("[V LDMATRIX DEBUG] STRIDE_BYTES_V_iter=%d, stride_tile_V=%d\n",
+                       STRIDE_BYTES_V_iter, stride_tile_V);
+                printf("[V LDMATRIX DEBUG] i0_start=%d, i0_stop=%d, i0_stride=%d\n",
+                       i0_start, i0_stop, i0_stride);
+                printf("[V LDMATRIX DEBUG] nbatch_fa=%d, np=%d, warp_id=%d\n",
+                       nbatch_fa, np, warp_id);
+                // Calculate max address that will be accessed
+                const int max_k0 = (nbatch_fa/2 - 1) / (np*T_A_VKQ::J) * (np*T_A_VKQ::J) + (warp_id % np)*T_A_VKQ::J;
+                const int max_i_offset = (i0_stop - i0_start - i0_stride)/2;
+                const uint32_t max_smem_offset = 2*max_k0 * STRIDE_BYTES_V_iter + max_i_offset * sizeof(half2);
+                printf("[V LDMATRIX DEBUG] max_k0=%d, max_i_offset=%d\n", max_k0, max_i_offset);
+                printf("[V LDMATRIX DEBUG] max_smem_offset=0x%x (%u bytes)\n",
+                       tile_V_i_base + max_smem_offset, max_smem_offset);
+                printf("[V LDMATRIX DEBUG] =============================================\n\n");
+                v_ldmatrix_debug_done = true;
+            }
+        }
 #endif
 #pragma unroll
         for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
@@ -2615,6 +2644,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int bytes_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
         pipeline_state = (fattn_pipeline_state*)(smem + bytes_KV_total + bytes_Q + bytes_mask);
         pipeline_stage = 0; // Initial stage
+
+        // =========================================================================
+        // DEBUG: Shared memory bounds validation at process_tile entry
+        // =========================================================================
+        if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0) {
+            // Calculate actual shared memory size (from launch config)
+            // We use the local calculation to verify consistency
+            const size_t expected_smem_size = bytes_KV_total + bytes_Q + bytes_mask + sizeof(fattn_pipeline_state) + 128;
+
+            printf("\n[SMEM BOUNDS] ========== Process Tile Entry ==========\n");
+            printf("[SMEM BOUNDS] smem_base=%p\n", smem);
+            printf("[SMEM BOUNDS] Layout (chunked mode):\n");
+            printf("[SMEM BOUNDS]   bytes_K_chunk=%d, 2x=%d\n", bytes_K_chunk, 2*bytes_K_chunk);
+            printf("[SMEM BOUNDS]   bytes_V_chunk=%d, 2x=%d\n", bytes_V_chunk, 2*bytes_V_chunk);
+            printf("[SMEM BOUNDS]   bytes_KV_total=%d\n", bytes_KV_total);
+            printf("[SMEM BOUNDS]   bytes_Q=%d, bytes_mask=%d\n", bytes_Q, bytes_mask);
+            printf("[SMEM BOUNDS]   sizeof(fattn_pipeline_state)=%d\n", (int)sizeof(fattn_pipeline_state));
+            printf("[SMEM BOUNDS]   expected_total=%zu (%.1f KB)\n", expected_smem_size, expected_smem_size/1024.0);
+            printf("[SMEM BOUNDS] Pointer layout:\n");
+            printf("[SMEM BOUNDS]   K_chunk[0] = smem+0 = %p\n", smem);
+            printf("[SMEM BOUNDS]   K_chunk[1] = smem+%d = %p\n", bytes_K_chunk, smem + bytes_K_chunk);
+            printf("[SMEM BOUNDS]   V_chunk[0] = smem+%d = %p\n", 2*bytes_K_chunk, smem + 2*bytes_K_chunk);
+            printf("[SMEM BOUNDS]   V_chunk[1] = smem+%d = %p\n", 2*bytes_K_chunk + bytes_V_chunk, smem + 2*bytes_K_chunk + bytes_V_chunk);
+            printf("[SMEM BOUNDS]   Q_tiles    = smem+%d = %p\n", bytes_KV_total, smem + bytes_KV_total);
+            printf("[SMEM BOUNDS]   mask       = smem+%d = %p\n", bytes_KV_total + bytes_Q, smem + bytes_KV_total + bytes_Q);
+            printf("[SMEM BOUNDS]   pipeline   = smem+%d = %p\n", bytes_KV_total + bytes_Q + bytes_mask, (void*)pipeline_state);
+            printf("[SMEM BOUNDS] Config: nbatch_fa=%d, nbatch_K2=%d, nbatch_V2=%d\n", nbatch_fa, nbatch_K2, nbatch_V2);
+            printf("[SMEM BOUNDS] Config: DKQ=%d, DV=%d, ncols=%d\n", DKQ, DV, ncols);
+            printf("[SMEM BOUNDS] =============================================\n\n");
+        }
     }
 
     // TMA tile parameters (legacy chunk variables kept for template API compatibility).
@@ -3139,6 +3198,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // Therefore, all other warps also need to execute a __syncthreads().
         // Otherwise the points at which warps synchronize with each other would become misaligned.
         __syncthreads();
+    }
+
+    // =========================================================================
+    // DEBUG: Output write phase - validate dst pointer before writes
+    // =========================================================================
+    {
+        static bool output_debug_done = false;
+        if (!output_debug_done && threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0) {
+            printf("\n[OUTPUT DEBUG] ========== Starting Output Write ==========\n");
+            printf("[OUTPUT DEBUG] dstk=%p, dstk_fixup=%p\n", (void*)dstk, (void*)dstk_fixup);
+            printf("[OUTPUT DEBUG] jt=%d, ne01.z=%u, ne02=%d\n", jt, ne01.z, ne02);
+            printf("[OUTPUT DEBUG] ncols1=%d, ncols=%d, DV=%d\n", ncols1, ncols, DV);
+            printf("[OUTPUT DEBUG] is_fixup=%d, needs_fixup=%d\n", is_fixup, needs_fixup);
+            printf("[OUTPUT DEBUG] KQ_max[0]=%f, KQ_rowsum[0]=%f\n", KQ_max[0], KQ_rowsum[0]);
+            // Calculate expected max dst offset
+            const int max_j_dst = ncols1 - 1;
+            const int max_c_dst = ncols2 - 1;
+            const size_t max_offset = ((jt*ncols1 + max_j_dst)*ne02 + max_c_dst)*(DV/2) + (DV/2 - 1);
+            printf("[OUTPUT DEBUG] Max dst offset: %zu elements (%zu bytes)\n", max_offset, max_offset * sizeof(float2));
+            printf("[OUTPUT DEBUG] =============================================\n\n");
+            output_debug_done = true;
+        }
     }
 
 #pragma unroll

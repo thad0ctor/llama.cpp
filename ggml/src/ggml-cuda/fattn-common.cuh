@@ -1065,6 +1065,115 @@ void launch_fattn(
     }
     CUDA_CHECK(launch_err);
 
+    // =========================================================================
+    // DEBUG: Synchronize and check for runtime errors (illegal memory access)
+    // This isolates whether flash attention or a later kernel (like MMQ) crashes.
+    // REMOVE THIS BLOCK AFTER DEBUGGING - it kills performance!
+    // =========================================================================
+    {
+        static bool sync_debug_enabled = true;  // Set to false to disable sync
+        static bool params_printed = false;
+
+        if (sync_debug_enabled) {
+            // Print comprehensive parameters BEFORE sync (in case of crash)
+            if (!params_printed) {
+                fprintf(stderr, "\n[FATTN PARAMS] ============ Flash Attention Parameters ============\n");
+                fprintf(stderr, "[FATTN PARAMS] Kernel Launch:\n");
+                fprintf(stderr, "[FATTN PARAMS]   Grid: (%u, %u, %u) = %u blocks\n",
+                        blocks_num.x, blocks_num.y, blocks_num.z,
+                        blocks_num.x * blocks_num.y * blocks_num.z);
+                fprintf(stderr, "[FATTN PARAMS]   Block: (%u, %u, %u) = %u threads\n",
+                        block_dim.x, block_dim.y, block_dim.z,
+                        block_dim.x * block_dim.y * block_dim.z);
+                fprintf(stderr, "[FATTN PARAMS]   Shared mem: %zu bytes (%.2f KB)\n", nbytes_shared, nbytes_shared/1024.0);
+                fprintf(stderr, "[FATTN PARAMS]   nwarps: %d, warp_size: %d\n", nwarps, warp_size);
+                fprintf(stderr, "[FATTN PARAMS]   parallel_blocks: %d, stream_k: %d\n", parallel_blocks, stream_k);
+                fprintf(stderr, "[FATTN PARAMS]   max_blocks_per_sm: %d, nsm: %d\n", max_blocks_per_sm, nsm);
+
+                fprintf(stderr, "[FATTN PARAMS] Q tensor:\n");
+                fprintf(stderr, "[FATTN PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)Q->ne[0], (long)Q->ne[1], (long)Q->ne[2], (long)Q->ne[3]);
+                fprintf(stderr, "[FATTN PARAMS]   nb: [%zu, %zu, %zu, %zu]\n",
+                        Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3]);
+                fprintf(stderr, "[FATTN PARAMS]   data: %p, type: %d\n", Q->data, Q->type);
+
+                fprintf(stderr, "[FATTN PARAMS] K tensor:\n");
+                fprintf(stderr, "[FATTN PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)K->ne[0], (long)K->ne[1], (long)K->ne[2], (long)K->ne[3]);
+                fprintf(stderr, "[FATTN PARAMS]   nb: [%zu, %zu, %zu, %zu]\n",
+                        K->nb[0], K->nb[1], K->nb[2], K->nb[3]);
+                fprintf(stderr, "[FATTN PARAMS]   K_data: %p (converted: %s), type: %d\n",
+                        K_data, (K_data != (const char*)K->data) ? "yes" : "no", K->type);
+                fprintf(stderr, "[FATTN PARAMS]   nb11: %zu, nb12: %zu, nb13: %zu\n", nb11, nb12, nb13);
+
+                if (V) {
+                    fprintf(stderr, "[FATTN PARAMS] V tensor:\n");
+                    fprintf(stderr, "[FATTN PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                            (long)V->ne[0], (long)V->ne[1], (long)V->ne[2], (long)V->ne[3]);
+                    fprintf(stderr, "[FATTN PARAMS]   nb: [%zu, %zu, %zu, %zu]\n",
+                            V->nb[0], V->nb[1], V->nb[2], V->nb[3]);
+                    fprintf(stderr, "[FATTN PARAMS]   V_data: %p (converted: %s), type: %d\n",
+                            V_data, (V_data != (const char*)V->data) ? "yes" : "no", V->type);
+                    fprintf(stderr, "[FATTN PARAMS]   nb21: %zu, nb22: %zu, nb23: %zu\n", nb21, nb22, nb23);
+                }
+
+                fprintf(stderr, "[FATTN PARAMS] Output (KQV):\n");
+                fprintf(stderr, "[FATTN PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)KQV->ne[0], (long)KQV->ne[1], (long)KQV->ne[2], (long)KQV->ne[3]);
+                fprintf(stderr, "[FATTN PARAMS]   data: %p, type: %d\n", KQV->data, KQV->type);
+                fprintf(stderr, "[FATTN PARAMS]   nelements: %ld, nbytes: %zu\n",
+                        (long)ggml_nelements(KQV), ggml_nbytes(KQV));
+
+                if (mask) {
+                    fprintf(stderr, "[FATTN PARAMS] Mask:\n");
+                    fprintf(stderr, "[FATTN PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                            (long)mask->ne[0], (long)mask->ne[1], (long)mask->ne[2], (long)mask->ne[3]);
+                    fprintf(stderr, "[FATTN PARAMS]   data: %p\n", mask->data);
+                }
+
+                fprintf(stderr, "[FATTN PARAMS] Attention params:\n");
+                fprintf(stderr, "[FATTN PARAMS]   scale: %f, max_bias: %f, logit_softcap: %f\n",
+                        scale, max_bias, logit_softcap);
+                fprintf(stderr, "[FATTN PARAMS]   n_head: %u, n_head_log2: %u\n", n_head, n_head_log2);
+                fprintf(stderr, "[FATTN PARAMS]   m0: %f, m1: %f\n", m0, m1);
+
+                fprintf(stderr, "[FATTN PARAMS] Template params:\n");
+                fprintf(stderr, "[FATTN PARAMS]   DV: %d, ncols1: %d, ncols2: %d, ncols: %d\n",
+                        DV, ncols1, ncols2, ncols);
+                fprintf(stderr, "[FATTN PARAMS]   nbatch_fa: %d, ntiles_x: %d, ntiles_total: %d\n",
+                        nbatch_fa, ntiles_x, ntiles_total);
+
+                fprintf(stderr, "[FATTN PARAMS] Device info:\n");
+                fprintf(stderr, "[FATTN PARAMS]   device: %d, cc: %d\n", id, cc);
+
+                fprintf(stderr, "[FATTN PARAMS] =========================================================\n\n");
+                params_printed = true;
+            }
+
+            fprintf(stderr, "[FATTN SYNC DEBUG] Waiting for flash attention kernel to complete...\n");
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[FATTN SYNC DEBUG] !!! FLASH ATTENTION KERNEL CRASHED !!!\n");
+                fprintf(stderr, "[FATTN SYNC DEBUG] Error: %s\n", cudaGetErrorString(sync_err));
+                fprintf(stderr, "[FATTN SYNC DEBUG] Grid: (%u, %u, %u), Block: (%u, %u, %u)\n",
+                        blocks_num.x, blocks_num.y, blocks_num.z,
+                        block_dim.x, block_dim.y, block_dim.z);
+                fprintf(stderr, "[FATTN SYNC DEBUG] Shared mem: %zu bytes\n", nbytes_shared);
+                fprintf(stderr, "[FATTN SYNC DEBUG] See [FATTN PARAMS] above for full parameter dump\n");
+                GGML_ABORT("Flash attention kernel execution failed");
+            }
+            fprintf(stderr, "[FATTN SYNC DEBUG] Flash attention completed successfully!\n");
+
+            // Double-check with cudaGetLastError after sync
+            cudaError_t post_sync_err = cudaGetLastError();
+            if (post_sync_err != cudaSuccess) {
+                fprintf(stderr, "[FATTN SYNC DEBUG] Post-sync error: %s\n", cudaGetErrorString(post_sync_err));
+                GGML_ABORT("Flash attention post-sync error");
+            }
+        }
+    }
+    // =========================================================================
+
     if (stream_k) {
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
             const dim3 block_dim_combine(DV, 1, 1);

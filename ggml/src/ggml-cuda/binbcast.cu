@@ -394,6 +394,62 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+
+    // =========================================================================
+    // DEBUG: Synchronize and check for runtime errors in ADD kernel
+    // REMOVE THIS BLOCK AFTER DEBUGGING - it kills performance!
+    // =========================================================================
+    {
+        static bool add_sync_debug_enabled = true;
+        static bool add_params_printed = false;
+
+        if (add_sync_debug_enabled) {
+            const ggml_tensor * src0 = dst->src[0];
+            const ggml_tensor * src1 = dst->src[1];
+
+            if (!add_params_printed) {
+                const int id = ggml_cuda_get_device();
+                const int cc = ggml_cuda_info().devices[id].cc;
+
+                fprintf(stderr, "\n[ADD PARAMS] ============ ADD (Binary Bcast) Parameters ============\n");
+                fprintf(stderr, "[ADD PARAMS] Device: %d, cc: %d\n", id, cc);
+                fprintf(stderr, "[ADD PARAMS] src0:\n");
+                fprintf(stderr, "[ADD PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)src0->ne[0], (long)src0->ne[1], (long)src0->ne[2], (long)src0->ne[3]);
+                fprintf(stderr, "[ADD PARAMS]   data: %p, type: %d (%s)\n",
+                        src0->data, src0->type, ggml_type_name(src0->type));
+                fprintf(stderr, "[ADD PARAMS] src1:\n");
+                fprintf(stderr, "[ADD PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)src1->ne[0], (long)src1->ne[1], (long)src1->ne[2], (long)src1->ne[3]);
+                fprintf(stderr, "[ADD PARAMS]   data: %p, type: %d (%s)\n",
+                        src1->data, src1->type, ggml_type_name(src1->type));
+                fprintf(stderr, "[ADD PARAMS] dst:\n");
+                fprintf(stderr, "[ADD PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3]);
+                fprintf(stderr, "[ADD PARAMS]   data: %p, type: %d (%s)\n",
+                        dst->data, dst->type, ggml_type_name(dst->type));
+                fprintf(stderr, "[ADD PARAMS] =========================================================\n\n");
+                add_params_printed = true;
+            }
+
+            cudaError_t launch_err = cudaGetLastError();
+            if (launch_err != cudaSuccess) {
+                fprintf(stderr, "[ADD SYNC DEBUG] !!! ADD KERNEL LAUNCH FAILED !!!\n");
+                fprintf(stderr, "[ADD SYNC DEBUG] Error: %s\n", cudaGetErrorString(launch_err));
+            }
+
+            fprintf(stderr, "[ADD SYNC DEBUG] Waiting for ADD kernel to complete...\n");
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[ADD SYNC DEBUG] !!! ADD KERNEL CRASHED !!!\n");
+                fprintf(stderr, "[ADD SYNC DEBUG] Error: %s\n", cudaGetErrorString(sync_err));
+                fprintf(stderr, "[ADD SYNC DEBUG] See [ADD PARAMS] above for full parameter dump\n");
+                GGML_ABORT("ADD kernel execution failed");
+            }
+            fprintf(stderr, "[ADD SYNC DEBUG] ADD completed successfully!\n");
+        }
+    }
+    // =========================================================================
 }
 
 void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

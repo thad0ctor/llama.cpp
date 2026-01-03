@@ -529,6 +529,56 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+
+    // =========================================================================
+    // DEBUG: Synchronize and check for runtime errors in RMS_NORM kernel
+    // REMOVE THIS BLOCK AFTER DEBUGGING - it kills performance!
+    // =========================================================================
+    {
+        static bool rms_norm_sync_debug_enabled = true;
+        static bool rms_norm_params_printed = false;
+
+        if (rms_norm_sync_debug_enabled) {
+            if (!rms_norm_params_printed) {
+                const int id = ggml_cuda_get_device();
+                const int cc = ggml_cuda_info().devices[id].cc;
+
+                fprintf(stderr, "\n[RMS_NORM PARAMS] ============ RMS Norm Parameters ============\n");
+                fprintf(stderr, "[RMS_NORM PARAMS] Device: %d, cc: %d\n", id, cc);
+                fprintf(stderr, "[RMS_NORM PARAMS] src0 (input):\n");
+                fprintf(stderr, "[RMS_NORM PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)ne00, (long)ne01, (long)ne02, (long)ne03);
+                fprintf(stderr, "[RMS_NORM PARAMS]   nb: [%zu, %zu, %zu, %zu]\n",
+                        nb00, nb01, nb02, nb03);
+                fprintf(stderr, "[RMS_NORM PARAMS]   data: %p, type: %d\n", (void*)src0_d, src0->type);
+                fprintf(stderr, "[RMS_NORM PARAMS] dst (output): %p\n", (void*)dst_d);
+                fprintf(stderr, "[RMS_NORM PARAMS] strides: s01=%ld, s02=%ld, s03=%ld\n",
+                        (long)s01, (long)s02, (long)s03);
+                fprintf(stderr, "[RMS_NORM PARAMS] eps: %e\n", eps);
+                fprintf(stderr, "[RMS_NORM PARAMS] =========================================================\n\n");
+                rms_norm_params_printed = true;
+            }
+
+            cudaError_t launch_err = cudaGetLastError();
+            if (launch_err != cudaSuccess) {
+                fprintf(stderr, "[RMS_NORM SYNC DEBUG] !!! RMS_NORM KERNEL LAUNCH FAILED !!!\n");
+                fprintf(stderr, "[RMS_NORM SYNC DEBUG] Error: %s\n", cudaGetErrorString(launch_err));
+            }
+
+            fprintf(stderr, "[RMS_NORM SYNC DEBUG] Waiting for rms_norm kernel to complete...\n");
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[RMS_NORM SYNC DEBUG] !!! RMS_NORM KERNEL CRASHED !!!\n");
+                fprintf(stderr, "[RMS_NORM SYNC DEBUG] Error: %s\n", cudaGetErrorString(sync_err));
+                fprintf(stderr, "[RMS_NORM SYNC DEBUG] ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)ne00, (long)ne01, (long)ne02, (long)ne03);
+                fprintf(stderr, "[RMS_NORM SYNC DEBUG] See [RMS_NORM PARAMS] above for full parameter dump\n");
+                GGML_ABORT("RMS_NORM kernel execution failed");
+            }
+            fprintf(stderr, "[RMS_NORM SYNC DEBUG] RMS_NORM completed successfully!\n");
+        }
+    }
+    // =========================================================================
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

@@ -319,6 +319,55 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         soft_max_f32_cuda(src0_d, (const float *) src1_d, (const float *) src2_d, dst_d, params, stream);
     }
+
+    // =========================================================================
+    // DEBUG: Synchronize and check for runtime errors in SOFTMAX kernel
+    // REMOVE THIS BLOCK AFTER DEBUGGING - it kills performance!
+    // =========================================================================
+    {
+        static bool softmax_sync_debug_enabled = true;
+        static bool softmax_params_printed = false;
+
+        if (softmax_sync_debug_enabled) {
+            if (!softmax_params_printed) {
+                const int id = ggml_cuda_get_device();
+                const int cc = ggml_cuda_info().devices[id].cc;
+
+                fprintf(stderr, "\n[SOFTMAX PARAMS] ============ Softmax Parameters ============\n");
+                fprintf(stderr, "[SOFTMAX PARAMS] Device: %d, cc: %d\n", id, cc);
+                fprintf(stderr, "[SOFTMAX PARAMS] src0 (input):\n");
+                fprintf(stderr, "[SOFTMAX PARAMS]   ne: [%ld, %ld, %ld, %ld]\n",
+                        (long)src0->ne[0], (long)src0->ne[1], (long)src0->ne[2], (long)src0->ne[3]);
+                fprintf(stderr, "[SOFTMAX PARAMS]   data: %p, type: %d\n", src0->data, src0->type);
+                fprintf(stderr, "[SOFTMAX PARAMS] dst (output): %p\n", (void*)dst_d);
+                fprintf(stderr, "[SOFTMAX PARAMS] ncols: %ld, nrows_x: %ld, nrows_y: %ld\n",
+                        (long)ne00, (long)nrows_x, (long)nrows_y);
+                fprintf(stderr, "[SOFTMAX PARAMS] scale: %f, max_bias: %f\n", scale, max_bias);
+                fprintf(stderr, "[SOFTMAX PARAMS] use_f16_mask: %d, has_mask: %d, has_sinks: %d\n",
+                        use_f16, src1 != nullptr, src2 != nullptr);
+                fprintf(stderr, "[SOFTMAX PARAMS] =========================================================\n\n");
+                softmax_params_printed = true;
+            }
+
+            cudaError_t launch_err = cudaGetLastError();
+            if (launch_err != cudaSuccess) {
+                fprintf(stderr, "[SOFTMAX SYNC DEBUG] !!! SOFTMAX KERNEL LAUNCH FAILED !!!\n");
+                fprintf(stderr, "[SOFTMAX SYNC DEBUG] Error: %s\n", cudaGetErrorString(launch_err));
+            }
+
+            fprintf(stderr, "[SOFTMAX SYNC DEBUG] Waiting for softmax kernel to complete...\n");
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[SOFTMAX SYNC DEBUG] !!! SOFTMAX KERNEL CRASHED !!!\n");
+                fprintf(stderr, "[SOFTMAX SYNC DEBUG] Error: %s\n", cudaGetErrorString(sync_err));
+                fprintf(stderr, "[SOFTMAX SYNC DEBUG] ncols=%ld, nrows_x=%ld\n", (long)ne00, (long)nrows_x);
+                fprintf(stderr, "[SOFTMAX SYNC DEBUG] See [SOFTMAX PARAMS] above for full parameter dump\n");
+                GGML_ABORT("Softmax kernel execution failed");
+            }
+            fprintf(stderr, "[SOFTMAX SYNC DEBUG] Softmax completed successfully!\n");
+        }
+    }
+    // =========================================================================
 }
 
 void ggml_cuda_op_soft_max_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
