@@ -204,7 +204,6 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    // Use aligned float4 load - required for MoE path where ids gives non-contiguous token indices
     float4 xi;
     if (i0 < ne00) {
         const int64_t base_idx = i03*s03 + i02*s02 + i01*s01 + i00;
@@ -223,8 +222,11 @@ static __global__ void quantize_mmq_q8_1(
             // Return zero to avoid crash
             xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         } else {
-            const float4 * x4 = (const float4 *)(x + base_idx);
-            xi = *x4;
+            // Individual element loads - DO NOT use float4 cast, it requires 16-byte alignment!
+            xi.x = x[base_idx + 0];
+            xi.y = x[base_idx + 1];
+            xi.z = x[base_idx + 2];
+            xi.w = x[base_idx + 3];
         }
     } else {
         xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
