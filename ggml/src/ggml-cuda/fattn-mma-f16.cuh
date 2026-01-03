@@ -729,7 +729,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 //   stride_tile: destination stride in half2 (same as regular load_tile)
 //   STRIDE_BYTES: row stride in bytes for swizzle calculation (stride_tile * sizeof(half2))
 // ------------------------------------------------------------------------------------------------------------------
-template<int stride_tile, int STRIDE_BYTES, int nwarps, int nbatch_fa>
+template<int stride_tile, int STRIDE_BYTES, int nwarps, int nbatch_fa, int warp_id_offset = 0>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
         const half2 * const __restrict__ KV, 
         uint32_t tile_KV_base,  // Shared memory base address (32-bit)
@@ -739,8 +739,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
     constexpr int preload = 64;
     constexpr int h2_per_chunk = 16/sizeof(half2);  // 4 half2 per 16B copy
     const int chunks_per_row = D2 / h2_per_chunk;
+    
+    // For SM_120 consumer warps: threadIdx.y is 1-4, but we need warp_id 0-3
+    // warp_id_offset allows caller to specify the offset (e.g., 1 for consumer warps)
+    const int warp_id = threadIdx.y - warp_id_offset;
 
-    auto load = [&] __device__ (auto n) { 
+    auto load = [&, warp_id] __device__ (auto n) { 
         const int stride_k = WARP_SIZE >> n;
         const int k0_start = stride_k == WARP_SIZE ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
         const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
@@ -752,7 +756,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
 
 #pragma unroll
         for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
-            const int i = i0 + threadIdx.y*stride_i + (stride_k == WARP_SIZE ? 0 : threadIdx.x / stride_k);
+            const int i = i0 + warp_id*stride_i + (stride_k == WARP_SIZE ? 0 : threadIdx.x / stride_k);
 
             if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) {
                 break;
@@ -1573,7 +1577,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 // SM_120 OPTIMIZED: Use swizzled cp.async loading for V
                 constexpr int STRIDE_BYTES_V = stride_tile_V * sizeof(half2);
                 const uint32_t tile_V_base = ggml_cuda_cvta_generic_to_shared(tile_V);
-                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V, nwarps, nbatch_fa>(
+                // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
+                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V, nwarps, nbatch_fa, 1>(
                     V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V_base, nbatch_V2, stride_V);
 #else
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -1701,16 +1706,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const uint32_t tile_K_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);
                 const uint32_t tile_K_buf1 = ggml_cuda_cvta_generic_to_shared(tile_V);
                 
+                // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
                 if (chunk == 0) {
                     // Issue first K load (K[0] into buffer 0)
-                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa>(
+                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
                         K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K_buf0, nbatch_K2, stride_K);
                     cp_async_commit_group();
                     
                     // If there's a next chunk, prefetch it into buffer 1
                     if (chunk + 1 < num_K_chunks) {
                         const int next_k0_start = (chunk + 1) * nbatch_K2;
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa>(
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
                             K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, tile_K_buf1, nbatch_K2, stride_K);
                         cp_async_commit_group();
                     }
@@ -1726,7 +1732,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     if (chunk + 1 < num_K_chunks) {
                         const int next_k0_start = (chunk + 1) * nbatch_K2;
                         const uint32_t next_buf = (chunk % 2 == 0) ? tile_K_buf1 : tile_K_buf0;
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa>(
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
                             K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, next_buf, nbatch_K2, stride_K);
                         cp_async_commit_group();
                         cp_async_wait_group<1>();
@@ -2117,9 +2123,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!last_iter) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
                 // SM_120: Use swizzled cp.async for K (next iteration preload)
+                // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
                 constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
                 const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa>(
+                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
                     K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K_base, nbatch_K2, stride_K);
 #else
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -2264,9 +2271,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const uint32_t tile_V_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);  // K is done
                     const uint32_t tile_V_buf1 = ggml_cuda_cvta_generic_to_shared(tile_V);
                     
+                    // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
                     if (v_chunk == 0) {
                         // Issue first V load (V[0] into buffer 0)
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa>(
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 1>(
                             V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V_buf0, i0_diff/2, stride_V);
                         cp_async_commit_group();
                         
@@ -2276,7 +2284,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                             const int next_i0_stop = (next_i0_start + 2*nbatch_V2 < DV) ? (next_i0_start + 2*nbatch_V2) : DV;
                             const int next_i0_diff = next_i0_stop - next_i0_start;
                             if (next_i0_start < reusable_cutoff) {
-                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa>(
+                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 1>(
                                     V_h2 + int64_t(k_VKQ_0)*stride_V + next_i0_start/2, tile_V_buf1, next_i0_diff/2, stride_V);
                                 cp_async_commit_group();
                             }
@@ -2297,7 +2305,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                             const int next_i0_diff = next_i0_stop - next_i0_start;
                             const uint32_t next_buf = (v_chunk % 2 == 0) ? tile_V_buf1 : tile_V_buf0;
                             if (next_i0_start < reusable_cutoff) {
-                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa>(
+                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 1>(
                                     V_h2 + int64_t(k_VKQ_0)*stride_V + next_i0_start/2, next_buf, next_i0_diff/2, stride_V);
                                 cp_async_commit_group();
                             }
@@ -2904,9 +2912,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         } else {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120: Use swizzled cp.async for K preload
+            // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
             constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
             const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa>(
+            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
                 K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K_base, nbatch_K2, stride_K);
 #else
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
