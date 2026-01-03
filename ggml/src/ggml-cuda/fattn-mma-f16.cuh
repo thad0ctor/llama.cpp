@@ -1182,6 +1182,24 @@ static __device__ __forceinline__ void fattn_producer_loop_sm120(
     int kv_head_row_offset)
 {
 #ifdef BLACKWELL_TMA_AVAILABLE
+    // ============================================================================
+    // TRUE OPTION C: TMA + bulk_group completion + __syncthreads__
+    // ============================================================================
+    // On SM_120 (RTX 5090), ALL mbarrier.arrive* variants crash at runtime.
+    // This includes:
+    //   - mbarrier.arrive.expect_tx (combined)
+    //   - mbarrier.arrive (standalone)
+    //   - mbarrier.expect_tx may cause ptxas ICE
+    //
+    // SOLUTION: Use TMA with .bulk_group completion mechanism:
+    //   1. tma_load_2d_no_mbar(): Issues TMA without mbarrier signaling
+    //   2. tma_commit_group(): Creates completion checkpoint
+    //   3. tma_wait_all(): Waits for all TMA ops to complete
+    //   4. __syncthreads(): Coordinates producer/consumer warps
+    //
+    // NO MBARRIER INSTRUCTIONS IN THIS PATH!
+    // ============================================================================
+    
     // TMA fence to ensure tensor map descriptors are visible
     tma_fence_acquire_maps(tensor_maps, 2);
     
@@ -1194,11 +1212,6 @@ static __device__ __forceinline__ void fattn_producer_loop_sm120(
     constexpr int bytes_K_chunk = nbatch_fa * nbatch_K2 * sizeof(half2);
     constexpr int bytes_V_chunk = nbatch_fa * nbatch_V2 * sizeof(half2);
     constexpr int bytes_K_total = nstages * bytes_K_chunk;
-    
-    // Use a LOCAL mbarrier for TMA completion (avoids using producer/consumer barriers)
-    // This is allocated in the sm120_flags area
-    uint64_t* local_mbar_K = &state->sm120_flags.tma_mbar[0];
-    uint64_t* local_mbar_V = &state->sm120_flags.tma_mbar[1];
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
         const int stage = (kb0 - kb0_start) % nstages;
@@ -1207,30 +1220,19 @@ static __device__ __forceinline__ void fattn_producer_loop_sm120(
         // ========== K Phase: Load all K chunks via TMA ==========
         half2* tile_K = (half2*)(smem_base + stage * bytes_K_chunk);
         
-        // Only thread 0 issues TMA
+        // Only thread 0 issues TMA (avoids redundant loads)
         if (threadIdx.x == 0) {
-            // Initialize local mbarrier for K TMA completion
-            mbarrier_init(local_mbar_K, 1);  // 1 arrival expected (us)
-            
-            // Calculate total K bytes to transfer
-            constexpr int num_K_chunks = (DKQ/2 + nbatch_K2 - 1) / nbatch_K2;
-            constexpr int bytes_K_total_tma = num_K_chunks * bytes_K_chunk;
-            
-            // Set expected bytes WITHOUT arrival (avoids mbarrier.arrive.expect_tx crash)
-            mbarrier_expect_tx(local_mbar_K, bytes_K_total_tma);
-            
-            // Issue TMA loads (each signals completion to mbarrier)
+            // Issue all K TMA loads using bulk_group completion (NO MBARRIER)
             for (int k0 = 0; k0 < DKQ/2; k0 += nbatch_K2) {
-                tma_load_2d(tile_K + k0 * nbatch_fa, map_K, local_mbar_K, k0 * 2, row_offset);
+                tma_load_2d_no_mbar(tile_K + k0 * nbatch_fa, map_K, k0 * 2, row_offset);
             }
-            
-            // Signal our arrival (separate from expect_tx)
-            mbarrier_arrive(local_mbar_K);
-            
-            // Wait for TMA to complete
-            mbarrier_wait(local_mbar_K, 0);
+            // Commit the bulk group to create a completion checkpoint
+            tma_commit_group();
+            // Wait for all TMA loads to complete
+            tma_wait_all();
         }
-        __threadfence_block();  // Ensure K data visible to other warps
+        // Ensure K data visible to all warps in the block
+        __threadfence_block();
         
         // SYNC 1: K is ready - consumers can start processing K
         __syncthreads();
@@ -1239,28 +1241,16 @@ static __device__ __forceinline__ void fattn_producer_loop_sm120(
         half2* tile_V = (half2*)(smem_base + bytes_K_total + stage * bytes_V_chunk);
         
         if (threadIdx.x == 0) {
-            // Initialize local mbarrier for V TMA completion
-            mbarrier_init(local_mbar_V, 1);
-            
-            // Calculate total V bytes
-            constexpr int num_V_chunks = (DV/2 + nbatch_V2 - 1) / nbatch_V2;
-            constexpr int bytes_V_total_tma = num_V_chunks * bytes_V_chunk;
-            
-            // Set expected bytes WITHOUT arrival
-            mbarrier_expect_tx(local_mbar_V, bytes_V_total_tma);
-            
-            // Issue TMA loads
+            // Issue all V TMA loads using bulk_group completion (NO MBARRIER)
             for (int v0 = 0; v0 < DV/2; v0 += nbatch_V2) {
-                tma_load_2d(tile_V + v0 * nbatch_fa, map_V, local_mbar_V, v0 * 2, row_offset);
+                tma_load_2d_no_mbar(tile_V + v0 * nbatch_fa, map_V, v0 * 2, row_offset);
             }
-            
-            // Signal our arrival
-            mbarrier_arrive(local_mbar_V);
-            
-            // Wait for TMA to complete
-            mbarrier_wait(local_mbar_V, 0);
+            // Commit and wait for V TMA completion
+            tma_commit_group();
+            tma_wait_all();
         }
-        __threadfence_block();  // Ensure V data visible
+        // Ensure V data visible to all warps
+        __threadfence_block();
         
         // SYNC 2: V is ready - consumers can start processing V
         __syncthreads();
@@ -1269,6 +1259,7 @@ static __device__ __forceinline__ void fattn_producer_loop_sm120(
         __syncthreads();
     }
 
+    GGML_UNUSED(state);
     GGML_UNUSED(num_consumers);
 #else
     GGML_UNUSED(tensor_maps);

@@ -278,21 +278,22 @@ __device__ __forceinline__ bool mbarrier_try_wait(uint64_t* mbar, uint32_t phase
 static constexpr int SM120_MAX_STAGES = 2;
 
 // Shared memory flags for SM_120 fallback synchronization
+// Note: With Option C (TMA + bulk_group + __syncthreads__), we no longer need
+// the spinwait flags. Coordination is handled entirely via __syncthreads().
+// This struct is kept for potential future extensions or debugging.
 struct sm120_sync_flags {
     // Ready flags: Producer sets to 1 when data is loaded
+    // Currently unused - __syncthreads__ provides coordination
     volatile uint32_t K_ready[SM120_MAX_STAGES];
     volatile uint32_t V_ready[SM120_MAX_STAGES];
     
     // Consumed flags: Consumers set to 1 when done reading
+    // Currently unused - __syncthreads__ provides coordination
     volatile uint32_t K_consumed[SM120_MAX_STAGES];
     volatile uint32_t V_consumed[SM120_MAX_STAGES];
     
     // Q loaded flag (single, no staging needed)
     volatile uint32_t Q_ready;
-    
-    // Local mbarriers for TMA completion (used only by producer warp)
-    // [0] = K TMA, [1] = V TMA
-    uint64_t tma_mbar[2];
 };
 
 // Initialize SM_120 sync flags (call from thread 0 only)
@@ -456,7 +457,6 @@ struct sm120_sync_flags {
     volatile uint32_t K_consumed[SM120_MAX_STAGES];
     volatile uint32_t V_consumed[SM120_MAX_STAGES];
     volatile uint32_t Q_ready;
-    uint64_t tma_mbar[2];
 };
 
 __device__ __forceinline__ void sm120_sync_init(sm120_sync_flags* flags) {
