@@ -943,6 +943,19 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
+        // Debug: Show Stream-K work distribution
+        static bool streamk_debug = false;
+        if (!streamk_debug) {
+            fprintf(stderr, "[STREAM-K DEBUG] max_blocks=%d, ntiles_KQ=%d, ntiles_total=%d\n",
+                    max_blocks, ntiles_KQ, ntiles_total);
+            fprintf(stderr, "[STREAM-K DEBUG] total_work_stream_k=%d, nblocks_stream_k=%d (capped: %s)\n",
+                    total_work_stream_k, nblocks_stream_k,
+                    (nblocks_stream_k < max_blocks) ? "YES" : "NO");
+            fprintf(stderr, "[STREAM-K DEBUG] use_stream_k=%d, blocks_num.x=%d\n",
+                    use_stream_k, blocks_num.x);
+            streamk_debug = true;
+        }
+
         dst_tmp_meta.alloc(blocks_num.x*ncols * (2*2 + DV) * sizeof(float));
     } else {
         const int ntiles_KQ = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by tensor size.
