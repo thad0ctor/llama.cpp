@@ -50,13 +50,17 @@ static __global__ void mm_ids_helper(
                 }
             }
 
+            // Count how many threads matched and give each a unique offset
+            // This handles duplicates where multiple top-k slots route to the same expert
+            const int has_match = (iex_used != -1) ? 1 : 0;
+            const int match_count = warp_reduce_sum<warp_size>(has_match);
+            const int intra_offset = warp_prefix_inclusive_sum<int, warp_size>(has_match) - has_match;
+
             if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
+                store[it_compact + intra_offset] = mm_ids_helper_store(it, iex_used);
             }
 
-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
-                it_compact++;
-            }
+            it_compact += match_count;
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
@@ -71,25 +75,30 @@ static __global__ void mm_ids_helper(
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
 
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+            // Count how many threads in this group matched (not just any/none)
+            // This handles duplicates where multiple top-k slots route to the same expert
+            const int has_match = (iex_used != -1) ? 1 : 0;
+            const int group_match_count = warp_reduce_sum<neu_padded>(has_match);
 
             // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
             int it_compact_add_lower = 0;
 #pragma unroll
             for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+                const int tmp = __shfl_up_sync(0xFFFFFFFF, group_match_count, offset, warp_size);
                 if (threadIdx.x >= static_cast<unsigned int>(offset)) {
                     it_compact_add_lower += tmp;
                 }
             }
 
+            // Exclusive prefix sum within the group gives each matching thread a unique offset
+            int intra_group_offset = warp_prefix_inclusive_sum<int, neu_padded>(has_match) - has_match;
+
             if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+                store[it_compact + it_compact_add_lower + intra_group_offset] = mm_ids_helper_store(it, iex_used);
             }
 
             // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + group_match_count, warp_size - 1, warp_size);
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
@@ -129,7 +138,9 @@ static void launch_mm_ids_helper(
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+    // Worst case: all tokens route all their top-k slots to the same expert
+    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+    const size_t nbytes_shared = static_cast<size_t>(n_tokens) * n_expert_used * sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
@@ -138,36 +149,6 @@ static void launch_mm_ids_helper(
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
-    
-    // DEBUG: Print mm_ids_helper parameters
-    {
-        static int call_count = 0;
-        call_count++;
-        fprintf(stderr, "\n[MM_IDS_HELPER #%d] ids=%p, ids_src1=%p, ids_dst=%p, expert_bounds=%p\n",
-                call_count, (void*)ids, (void*)ids_src1, (void*)ids_dst, (void*)expert_bounds);
-        fprintf(stderr, "[MM_IDS_HELPER #%d] n_experts=%d, n_tokens=%d, n_expert_used=%d\n",
-                call_count, n_experts, n_tokens, n_expert_used);
-        fprintf(stderr, "[MM_IDS_HELPER #%d] nchannels_y=%d, si1=%d, sis1=%d\n",
-                call_count, nchannels_y, si1, sis1);
-        
-        const int id = ggml_cuda_get_device();
-        const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-        const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
-        fprintf(stderr, "[MM_IDS_HELPER #%d] device=%d, smpbo=%zu, nbytes_shared=%zu\n",
-                call_count, id, smpbo, nbytes_shared);
-        fprintf(stderr, "[MM_IDS_HELPER #%d] grid=(%d,1,1), block=(%d,1,1)\n",
-                call_count, n_experts, ggml_cuda_info().devices[id].warp_size);
-        
-        // Verify pointers are valid device memory
-        cudaPointerAttributes attr;
-        cudaError_t err = cudaPointerGetAttributes(&attr, ids);
-        fprintf(stderr, "[MM_IDS_HELPER #%d] ids pointer: valid=%d, type=%d\n", 
-                call_count, (err == cudaSuccess), attr.type);
-        err = cudaPointerGetAttributes(&attr, ids_src1);
-        fprintf(stderr, "[MM_IDS_HELPER #%d] ids_src1 pointer: valid=%d, type=%d\n",
-                call_count, (err == cudaSuccess), attr.type);
-    }
-    
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
