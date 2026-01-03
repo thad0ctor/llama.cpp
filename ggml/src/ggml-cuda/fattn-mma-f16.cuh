@@ -4037,7 +4037,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     // Handle Blackwell features (TMA)
-    bool use_tma_runtime = ggml_cuda_has_blackwell_features(cc);
+    // SM_120 (consumer Blackwell / RTX 5090): Does NOT use TMA - uses cp.async instead
+    // SM_100/103/110 (datacenter Blackwell): Uses TMA + mbarrier
+    bool use_tma_runtime = ggml_cuda_has_blackwell_features(cc) && !ggml_cuda_is_consumer_blackwell(cc);
 
     // DEBUG: Trace dispatch conditions for Blackwell kernel selection
     static bool debug_printed = false;
