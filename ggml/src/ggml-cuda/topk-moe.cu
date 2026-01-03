@@ -279,6 +279,11 @@ __global__ void topk_moe_cuda_optimized(
             output_weights[k / WARP_SIZE] = max_val;
         }
 
+        if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
+             printf("topk_opt: row=%d k=%d max_expert=%d max_val=%f wt[0]=%f logits[0]=%f\n",
+                    row, k, max_expert, max_val, wt[0], row_logits_global[0]);
+        }
+
         // Mark selected expert as used
         if ((max_expert & (WARP_SIZE - 1)) == lane) {
             wt[max_expert / WARP_SIZE] = -INFINITY;
