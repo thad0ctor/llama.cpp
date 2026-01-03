@@ -2643,14 +2643,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     fattn_pipeline_state* pipeline_state = nullptr;
     int pipeline_stage = -1;
 
-    // Check if we are in Consumer Mode OR SM_120 mode (both use chunked layout)
+    // Check if we are in Consumer Mode (producer/consumer pipelining)
     extern __shared__ char smem[];
-    // SM_120 (RTX 5090) uses Blackwell kernel with chunked layout but num_consumers=0
-    // We detect this case at compile time and use chunked layout accordingly
+    // SM_120 (RTX 5090): Uses chunked shared memory layout BUT NOT consumer mode.
+    // Consumer mode expects a producer warp to have loaded K/V, but SM_120's producer idles.
+    // Instead, SM_120 consumers load their own K/V via cp.async (consumer_mode = false).
+    //
+    // Other Blackwell (SM_100): Uses producer/consumer pipelining with mbarrier (consumer_mode = true).
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    constexpr bool use_chunked_layout = true;  // SM_120 always uses Blackwell's chunked layout
+    // SM_120: Use chunked layout for shared memory BUT NOT consumer mode
+    // Consumers will load their own K/V data via cp.async
+    constexpr bool use_chunked_layout = true;   // For shared memory addressing
+    constexpr bool set_pipeline_state = false;  // Don't use consumer mode - load K/V ourselves
 #else
     constexpr bool use_chunked_layout = (num_consumers > 0);  // Other archs only when pipelined
+    constexpr bool set_pipeline_state = (num_consumers > 0);  // Use consumer mode when pipelined
 #endif
     if (use_chunked_layout) {
         // Shared memory layout for chunk pipelining:
@@ -2661,8 +2668,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int stride_tile_Q_local = DKQ/2 + 4;
         constexpr int bytes_Q = ncols * stride_tile_Q_local * sizeof(half2);
         constexpr int bytes_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
-        pipeline_state = (fattn_pipeline_state*)(smem + bytes_KV_total + bytes_Q + bytes_mask);
-        pipeline_stage = 0; // Initial stage
+        // Only set pipeline_state for true producer/consumer mode (not SM_120)
+        if constexpr (set_pipeline_state) {
+            pipeline_state = (fattn_pipeline_state*)(smem + bytes_KV_total + bytes_Q + bytes_mask);
+            pipeline_stage = 0; // Initial stage
+        }
 
         // =========================================================================
         // DEBUG: Shared memory bounds validation at process_tile entry
@@ -4286,7 +4296,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     if (!debug_printed && DKQ == 128 && DV == 128) {
         fprintf(stderr, "[FATTN DEBUG] Final dispatch decision:\n");
-        fprintf(stderr, "[FATTN DEBUG]   use_tma_runtime (final)=%d\n", use_tma_runtime);
+        fprintf(stderr, "[FATTN DEBUG]   is_consumer_blackwell (SM_120)=%d\n", ggml_cuda_is_consumer_blackwell(cc));
+        fprintf(stderr, "[FATTN DEBUG]   use_tma_runtime=%d\n", use_tma_runtime);
         fprintf(stderr, "[FATTN DEBUG]   config_bw.num_consumers=%d\n", config_bw.num_consumers);
         fprintf(stderr, "[FATTN DEBUG]   config_bw.nbatch_K2=%d, config_bw.nbatch_V2=%d\n", config_bw.nbatch_K2, config_bw.nbatch_V2);
         fprintf(stderr, "[FATTN DEBUG]   DKQ/2=%d, DV/2=%d\n", DKQ/2, DV/2);
@@ -4294,12 +4305,20 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         fprintf(stderr, "[FATTN DEBUG]   needs_V_chunking (DV/2 > nbatch_V2)=%d\n", (DV/2 > config_bw.nbatch_V2));
     }
 
-    // Blackwell kernel optimized for sm_100+ with Warp Specialization and TMA
-    // Requires: has_blackwell_features(cc) AND use_tma_runtime AND num_consumers > 0
-    // SM_120 (consumer Blackwell / RTX 5090): Uses cp.async path inside kernel (no mbarrier)
+    // Blackwell kernel optimized for sm_100+ with Warp Specialization
+    // SM_120 (consumer Blackwell / RTX 5090): Uses cp.async path inside kernel (no TMA/mbarrier)
+    // SM_100/103/110 (datacenter Blackwell): Uses TMA + mbarrier when use_tma_runtime=true
+    //
+    // Dispatch logic:
+    //   - SM_120: ALWAYS use Blackwell kernel (it has cp.async fallback, no TMA required)
+    //   - SM_100+: Use Blackwell kernel only if use_tma_runtime=true (needs TMA)
+    //
     // Use if constexpr to prevent template instantiation for unsupported DKQ/DV/ncols combinations
     if constexpr (ggml_cuda_fattn_has_blackwell_config(DKQ, DV, ncols)) {
-        if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime && config_bw.num_consumers > 0) {
+        // SM_120 always uses Blackwell kernel with cp.async; other Blackwell needs TMA
+        const bool use_blackwell = ggml_cuda_is_consumer_blackwell(cc) ||
+                                   (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime);
+        if (use_blackwell && config_bw.num_consumers > 0) {
             // Check chunk count - double-buffering supports exactly 2 chunks per dimension
             // num_K_chunks = ceil(DKQ/2 / nbatch_K2), num_V_chunks = ceil(DV/2 / nbatch_V2)
             // With nbatch_K2=32 for DKQ=128: num_K_chunks = 64/32 = 2 (perfect for double-buffer)
@@ -4330,8 +4349,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         } else {
             if (!debug_printed && DKQ == 128 && DV == 128) {
                 fprintf(stderr, "[FATTN DEBUG]   ==> SKIP Blackwell: condition failed\n");
-                fprintf(stderr, "[FATTN DEBUG]       has_bw_features=%d, use_tma=%d, consumers=%d\n",
-                    ggml_cuda_has_blackwell_features(cc), use_tma_runtime, config_bw.num_consumers);
+                fprintf(stderr, "[FATTN DEBUG]       is_consumer_bw=%d, has_bw_features=%d, use_tma=%d, consumers=%d\n",
+                    ggml_cuda_is_consumer_blackwell(cc), ggml_cuda_has_blackwell_features(cc),
+                    use_tma_runtime, config_bw.num_consumers);
             }
         }
     } else {
