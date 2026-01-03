@@ -1574,12 +1574,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             __syncthreads();
             if constexpr (!use_tma) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                // SM_120 OPTIMIZED: Use swizzled cp.async loading for V
-                constexpr int STRIDE_BYTES_V = stride_tile_V * sizeof(half2);
-                const uint32_t tile_V_base = ggml_cuda_cvta_generic_to_shared(tile_V);
-                // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
-                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V, nwarps, nbatch_fa, 1>(
-                    V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V_base, nbatch_V2, stride_V);
+                // SM_120: Skip V preload here - it only loads one chunk (nbatch_V2 columns).
+                // For models with DV/2 > nbatch_V2 (e.g., DV=128, nbatch_V2=32), we need
+                // multiple V chunks. The per-chunk V loading at lines ~2259+ handles this
+                // correctly with double-buffered pipelining. See the V-chunk loop condition.
 #else
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
@@ -2240,9 +2238,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             tile_V_i = tile_V;
         }
 
-        if (!consumer_mode && nstages <= 1) {
+        // SM_120: Always load V per-chunk because we skipped the preload (which only loads one chunk).
+        // Other archs: Only load V here when nstages <= 1 (preload handles nstages > 1).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        constexpr bool sm120_load_v = true;  // SM_120: Always load V per-chunk
+#else
+        constexpr bool sm120_load_v = false;
+#endif
+        if (!consumer_mode && (nstages <= 1 || sm120_load_v)) {
             if (i0_start < reusable_cutoff) {
-                constexpr bool use_cp_async = nstages == 1;
+                constexpr bool use_cp_async = (nstages == 1) || sm120_load_v;
                 if constexpr (use_tma) {
                     #ifdef BLACKWELL_TMA_AVAILABLE
                     // Load V via TMA (full tile with SWIZZLE_NONE for large tiles)
