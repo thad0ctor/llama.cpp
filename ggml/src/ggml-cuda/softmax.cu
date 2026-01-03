@@ -219,6 +219,41 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
 
 template<typename T>
 static void soft_max_f32_cuda(const float * x, const T * mask, const float * sinks, float * dst, const soft_max_params & params, cudaStream_t stream) {
+    // =========================================================================
+    // DEBUG: Check softmax INPUT for NaN/Inf BEFORE kernel launch
+    // This detects if NaN comes from MUL_MAT (gate projection) before softmax
+    // =========================================================================
+    {
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(stream, &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            // Check first few values of input for NaN
+            float debug_vals[8];
+            size_t bytes_to_copy = sizeof(debug_vals);
+            size_t total_elements = params.ncols * params.ne01 * params.ne02 * params.ne03;
+            if (total_elements * sizeof(float) < bytes_to_copy) {
+                bytes_to_copy = total_elements * sizeof(float);
+            }
+            cudaMemcpy(debug_vals, x, bytes_to_copy, cudaMemcpyDeviceToHost);
+            bool has_nan = false;
+            int nan_count = bytes_to_copy / sizeof(float);
+            for (int i = 0; i < nan_count; i++) {
+                if (isnan(debug_vals[i]) || isinf(debug_vals[i])) {
+                    has_nan = true;
+                    break;
+                }
+            }
+            if (has_nan) {
+                fprintf(stderr, "[SOFTMAX NaN DEBUG] Input contains NaN/Inf! vals[0..7]: %f %f %f %f %f %f %f %f\n",
+                        debug_vals[0], debug_vals[1], debug_vals[2], debug_vals[3],
+                        debug_vals[4], debug_vals[5], debug_vals[6], debug_vals[7]);
+                fprintf(stderr, "[SOFTMAX NaN DEBUG] Input shape: ncols=%ld, ne01=%ld, ne02=%ld, ne03=%ld\n",
+                        (long)params.ncols, (long)params.ne01, (long)params.ne02, (long)params.ne03);
+            }
+        }
+    }
+    // =========================================================================
+
     int nth = WARP_SIZE;
     const int64_t ncols_x = params.ncols;
 

@@ -2130,6 +2130,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    fprintf(stderr, "[MUL_MAT_DEBUG] src0: ne=[%lld,%lld,%lld,%lld] type=%s name=%s\n",
+            (long long)src0->ne[0], (long long)src0->ne[1],
+            (long long)src0->ne[2], (long long)src0->ne[3],
+            ggml_type_name(src0->type), src0->name);
+    fprintf(stderr, "[MUL_MAT_DEBUG] src1: ne=[%lld,%lld,%lld,%lld] type=%s name=%s\n",
+            (long long)src1->ne[0], (long long)src1->ne[1],
+            (long long)src1->ne[2], (long long)src1->ne[3],
+            ggml_type_name(src1->type), src1->name);
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2653,9 +2661,104 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
+            // =========================================================================
+            // DEBUG: Check MUL_MAT output for NaN/Inf
+            // This detects if gate projection produces NaN (before softmax)
+            // =========================================================================
+            {
+                cudaStreamCaptureStatus capture_status;
+                cudaStreamIsCapturing(ctx.stream(), &capture_status);
+                if (capture_status == cudaStreamCaptureStatusNone) {
+                    // Only check small outputs (likely router logits, not huge matrices)
+                    int64_t total_elements = ggml_nelements(dst);
+                    if (total_elements <= 65536) {  // Small tensor, might be router logits
+                        cudaDeviceSynchronize();  // Ensure MUL_MAT completed
+                        float debug_vals[8];
+                        size_t bytes_to_copy = sizeof(debug_vals);
+                        if (total_elements * sizeof(float) < bytes_to_copy) {
+                            bytes_to_copy = total_elements * sizeof(float);
+                        }
+                        cudaMemcpy(debug_vals, dst->data, bytes_to_copy, cudaMemcpyDeviceToHost);
+                        bool has_nan = false;
+                        int check_count = bytes_to_copy / sizeof(float);
+                        for (int i = 0; i < check_count; i++) {
+                            if (isnan(debug_vals[i]) || isinf(debug_vals[i])) {
+                                has_nan = true;
+                                break;
+                            }
+                        }
+                        if (has_nan) {
+                            fprintf(stderr, "[MUL_MAT NaN DEBUG] Output contains NaN/Inf! tensor=%s\n", dst->name);
+                            fprintf(stderr, "[MUL_MAT NaN DEBUG] vals[0..7]: %f %f %f %f %f %f %f %f\n",
+                                    debug_vals[0], debug_vals[1], debug_vals[2], debug_vals[3],
+                                    debug_vals[4], debug_vals[5], debug_vals[6], debug_vals[7]);
+                            fprintf(stderr, "[MUL_MAT NaN DEBUG] Shape: [%ld, %ld, %ld, %ld], total=%ld\n",
+                                    (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3],
+                                    (long)total_elements);
+                        }
+                    }
+                }
+            }
+            // =========================================================================
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            // =========================================================================
+            // DEBUG: Check MUL_MAT_ID output for NaN/Inf
+            // This is the MoE expert computation - if it produces NaN, all subsequent
+            // layers will propagate the corruption
+            // =========================================================================
+            {
+                cudaStreamCaptureStatus capture_status;
+                cudaStreamIsCapturing(ctx.stream(), &capture_status);
+                if (capture_status == cudaStreamCaptureStatusNone) {
+                    cudaDeviceSynchronize();  // Ensure MUL_MAT_ID completed
+                    float debug_vals[8];
+                    int64_t total_elements = ggml_nelements(dst);
+                    size_t bytes_to_copy = sizeof(debug_vals);
+                    if (total_elements * sizeof(float) < bytes_to_copy) {
+                        bytes_to_copy = total_elements * sizeof(float);
+                    }
+                    cudaMemcpy(debug_vals, dst->data, bytes_to_copy, cudaMemcpyDeviceToHost);
+                    bool has_nan = false;
+                    int check_count = bytes_to_copy / sizeof(float);
+                    for (int i = 0; i < check_count; i++) {
+                        if (isnan(debug_vals[i]) || isinf(debug_vals[i])) {
+                            has_nan = true;
+                            break;
+                        }
+                    }
+                    if (has_nan) {
+                        fprintf(stderr, "[MUL_MAT_ID NaN DEBUG] !!! MoE EXPERT OUTPUT HAS NaN/Inf !!! tensor=%s\n", dst->name);
+                        fprintf(stderr, "[MUL_MAT_ID NaN DEBUG] vals[0..7]: %f %f %f %f %f %f %f %f\n",
+                                debug_vals[0], debug_vals[1], debug_vals[2], debug_vals[3],
+                                debug_vals[4], debug_vals[5], debug_vals[6], debug_vals[7]);
+                        fprintf(stderr, "[MUL_MAT_ID NaN DEBUG] Shape: [%ld, %ld, %ld, %ld], total=%ld\n",
+                                (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3],
+                                (long)total_elements);
+                        // Print src info
+                        if (dst->src[0]) {
+                            fprintf(stderr, "[MUL_MAT_ID NaN DEBUG] src[0] (experts): %s, shape=[%ld,%ld,%ld,%ld]\n",
+                                    dst->src[0]->name,
+                                    (long)dst->src[0]->ne[0], (long)dst->src[0]->ne[1],
+                                    (long)dst->src[0]->ne[2], (long)dst->src[0]->ne[3]);
+                        }
+                        if (dst->src[1]) {
+                            fprintf(stderr, "[MUL_MAT_ID NaN DEBUG] src[1] (input): %s, shape=[%ld,%ld,%ld,%ld]\n",
+                                    dst->src[1]->name,
+                                    (long)dst->src[1]->ne[0], (long)dst->src[1]->ne[1],
+                                    (long)dst->src[1]->ne[2], (long)dst->src[1]->ne[3]);
+                        }
+                        if (dst->src[2]) {
+                            fprintf(stderr, "[MUL_MAT_ID NaN DEBUG] src[2] (ids): %s, shape=[%ld,%ld,%ld,%ld]\n",
+                                    dst->src[2]->name,
+                                    (long)dst->src[2]->ne[0], (long)dst->src[2]->ne[1],
+                                    (long)dst->src[2]->ne[2], (long)dst->src[2]->ne[3]);
+                        }
+                    }
+                }
+            }
+            // =========================================================================
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
