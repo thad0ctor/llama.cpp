@@ -931,7 +931,11 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_total + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_total / (max_blocks*tiles_nwaves);
 
-        const int nblocks_stream_k = max_blocks;
+        // Stream-K distributes work across K tiles too: iter_k * iter_j * (ne02/ncols2) * ne03
+        // Cap blocks to actual work units to avoid blocks with no work (which causes uninitialized output)
+        const int ntiles_KQ = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // iter_k
+        const int total_work_stream_k = ntiles_KQ * ntiles_total;     // iter_k * iter_j * heads * batch
+        const int nblocks_stream_k = std::min(max_blocks, total_work_stream_k);
 
         const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
 
