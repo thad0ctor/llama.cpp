@@ -176,7 +176,8 @@ template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2) {
+        const int64_t ne0, const int ne1, const int ne2,
+        const int64_t max_src_elements) {  // DEBUG: Added for bounds checking
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -203,13 +204,28 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
+    // Use aligned float4 load - required for MoE path where ids gives non-contiguous token indices
     float4 xi;
     if (i0 < ne00) {
         const int64_t base_idx = i03*s03 + i02*s02 + i01*s01 + i00;
-        xi.x = x[base_idx + 0];
-        xi.y = x[base_idx + 1];
-        xi.z = x[base_idx + 2];
-        xi.w = x[base_idx + 3];
+
+        // DEBUG: Bounds check for MoE - detect which thread causes OOB
+        if (ids && (base_idx < 0 || base_idx + 3 >= max_src_elements)) {
+            // Print debug info and return without accessing bad memory
+            printf("[QUANT KERNEL OOB] block=(%d,%d,%d) thread=%d\n",
+                   blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
+            printf("[QUANT KERNEL OOB] i0=%lld, i1=%lld, i01(ids[i1])=%lld\n",
+                   (long long)i0, (long long)i1, (long long)i01);
+            printf("[QUANT KERNEL OOB] base_idx=%lld, max_safe=%lld\n",
+                   (long long)base_idx, (long long)max_src_elements);
+            printf("[QUANT KERNEL OOB] s01=%lld, s02=%lld, s03=%lld\n",
+                   (long long)s01, (long long)s02, (long long)s03);
+            // Return zero to avoid crash
+            xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        } else {
+            const float4 * x4 = (const float4 *)(x + base_idx);
+            xi = *x4;
+        }
     } else {
         xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
@@ -344,21 +360,28 @@ void quantize_mmq_q8_1_cuda(
         fprintf(stderr, "[QUANT Q8_1] No pending errors, launching kernel...\n");
     }
     
+    // DEBUG: Compute max valid source elements for bounds checking
+    // For MoE: source tensor is [ne00, 1, n_tokens, 1], so total elements = ne00 * n_tokens
+    // For non-MoE: total elements = ne00 * ne1 * ne2 * ne3
+    // We use s03 which is the full tensor stride, giving us the total size
+    const int64_t max_src_elements = ids ? (s03 + ne00) : (ne0 * ne1 * ne2 * ne3);
+    fprintf(stderr, "[QUANT Q8_1] max_src_elements=%lld (for bounds check)\n", (long long)max_src_elements);
+
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             fprintf(stderr, "[QUANT Q8_1] Using MMQ_Q8_1_DS_LAYOUT_D4 for type=%d\n", (int)type_src0);
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, max_src_elements);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             fprintf(stderr, "[QUANT Q8_1] Using MMQ_Q8_1_DS_LAYOUT_DS4 for type=%d\n", (int)type_src0);
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, max_src_elements);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             fprintf(stderr, "[QUANT Q8_1] Using MMQ_Q8_1_DS_LAYOUT_D2S6 for type=%d\n", (int)type_src0);
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, max_src_elements);
             break;
         default:
             GGML_ABORT("fatal error");
