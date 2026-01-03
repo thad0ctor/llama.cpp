@@ -3657,17 +3657,15 @@ __global__ void flash_attn_ext_f16_blackwell(
     __syncthreads();
     
     // ========================================================================
-    // SM_120 FALLBACK: Initialize shared memory flags instead of mbarrier
-    // On SM_120 (RTX 5090), mbarrier.arrive.expect_tx crashes at runtime.
-    // We use TMA + shared memory flags + __syncthreads__ instead.
+    // SM_120 PATH: Consumer warps load K/V themselves via cp.async
+    // On SM_120 (RTX 5090), we don't use producer/consumer pipelining.
+    // Instead, consumer warps cooperatively load K/V using cp.async.
+    // Producer warp (threadIdx.y=0) idles. No mbarrier or TMA needed.
     // ========================================================================
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120 path: Initialize sync flags, skip mbarrier
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        sm120_sync_init(&state->sm120_flags);
-        if (blockIdx.x == 0) {
-            printf("[SM120 FALLBACK] Using TMA + shared memory flags + __syncthreads__\n");
-        }
+    // SM_120 path: No mbarrier init needed - consumers load K/V themselves
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+        printf("[SM120 PATH] Using cp.async + __syncthreads__ (no TMA, no mbarrier)\n");
     }
     __syncthreads();
 #else
