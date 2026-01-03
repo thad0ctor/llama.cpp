@@ -348,9 +348,9 @@ void ggml_cuda_mul_mat_q(
             }
             fprintf(stderr, "\n");
 
-            // Check ALL values (should be in range [0, ne12))
-            // For MoE, ids_src1[i] = token_index, which must be < ne12 (number of tokens)
-            int64_t max_valid = ne12;  // Token indices must be < ne12
+            // Check ALL values (should be in range [0, ne12 * ne11))
+            // For MoE, ids_src1[i] = token_index * channels + channel, which must be < ne12 * ne11
+            int64_t max_valid = ne12 * ne11;  // Indices must be < ne12 * ne11 (tokens * channels)
             int bad_count = 0;
             int first_bad_idx = -1;
             int32_t first_bad_val = 0;
