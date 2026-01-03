@@ -269,34 +269,127 @@ void ggml_cuda_mul_mat_q(
         fprintf(stderr, "[MMQ MoE DEBUG] ne02=%ld, ne12=%ld, n_expert_used=%ld, ne11=%ld\n",
                 (long)ne02, (long)ne12, (long)n_expert_used, (long)ne11);
         fprintf(stderr, "[MMQ MoE DEBUG] si1=%d, sis1=%d\n", si1, sis1);
-        fprintf(stderr, "[MMQ MoE DEBUG] ids_src1=%p (size=%ld elements)\n", 
+
+        // DEBUG: Validate ids tensor strides - THIS IS LIKELY THE BUG!
+        fprintf(stderr, "[MMQ MoE DEBUG] ids tensor strides: nb=[%zu, %zu, %zu, %zu]\n",
+                ids->nb[0], ids->nb[1], ids->nb[2], ids->nb[3]);
+        fprintf(stderr, "[MMQ MoE DEBUG] ids tensor ne=[%lld, %lld, %lld, %lld]\n",
+                (long long)ids->ne[0], (long long)ids->ne[1], (long long)ids->ne[2], (long long)ids->ne[3]);
+
+        // Expected stride for contiguous [n_expert_used, n_tokens] tensor:
+        // nb[1] should be n_expert_used * sizeof(int32) = 8 * 4 = 32
+        // si1 should be 8, NOT 128!
+        const size_t expected_nb1 = ids->ne[0] * sizeof(int32_t);
+        const int expected_si1 = (int)ids->ne[0];  // = n_expert_used = 8
+        if ((size_t)ids->nb[1] != expected_nb1) {
+            fprintf(stderr, "[MMQ MoE CRITICAL] ids tensor has WRONG stride!\n");
+            fprintf(stderr, "[MMQ MoE CRITICAL] Expected nb[1]=%zu (si1=%d), got nb[1]=%zu (si1=%d)\n",
+                    expected_nb1, expected_si1, ids->nb[1], si1);
+            fprintf(stderr, "[MMQ MoE CRITICAL] This will cause mm_ids_helper to read garbage!\n");
+
+            // Print first few rows of ids tensor to show the problem
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<int32_t> ids_data(std::min((int64_t)256, ids->ne[0] * ids->ne[1]));
+            CUDA_CHECK(cudaMemcpy(ids_data.data(), ids->data, ids_data.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+            fprintf(stderr, "[MMQ MoE DEBUG] ids tensor raw data (first 256 elements as linear array):\n");
+            for (int row = 0; row < std::min(4, (int)ids->ne[1]); row++) {
+                fprintf(stderr, "  Row %d (with current si1=%d, offset %d): ", row, si1, row * si1);
+                for (int col = 0; col < std::min(8, (int)ids->ne[0]); col++) {
+                    int idx = row * si1 + col;
+                    if (idx < (int)ids_data.size()) {
+                        fprintf(stderr, "%d ", ids_data[idx]);
+                    } else {
+                        fprintf(stderr, "OOB ");
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "  Row %d (with correct si1=%d, offset %d): ", 0, expected_si1, 0);
+            for (int col = 0; col < std::min(8, (int)ids->ne[0]); col++) {
+                fprintf(stderr, "%d ", ids_data[col]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "  Row %d (with correct si1=%d, offset %d): ", 1, expected_si1, expected_si1);
+            for (int col = 0; col < std::min(8, (int)ids->ne[0]); col++) {
+                fprintf(stderr, "%d ", ids_data[expected_si1 + col]);
+            }
+            fprintf(stderr, "\n");
+        }
+
+        fprintf(stderr, "[MMQ MoE DEBUG] ids_src1=%p (size=%ld elements)\n",
                 (void*)ids_src1.get(), (long)ne_get_rows);
-        
+
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
         CUDA_CHECK(cudaGetLastError());
         
-        // DEBUG: Sync and validate mm_ids_helper output
+        // DEBUG: Sync and validate mm_ids_helper output - CHECK ALL VALUES!
         {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             fprintf(stderr, "[MMQ MoE DEBUG] mm_ids_helper completed\n");
-            
-            // Read back first few values to verify they're valid indices
-            std::vector<int32_t> ids_host(std::min((int64_t)16, ne_get_rows));
+
+            // Read back ALL values to verify they're valid indices
+            std::vector<int32_t> ids_host(ne_get_rows);
             CUDA_CHECK(cudaMemcpy(ids_host.data(), ids_src1.get(), ids_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
-            fprintf(stderr, "[MMQ MoE DEBUG] First %zu ids_src1 values: ", ids_host.size());
-            for (size_t i = 0; i < ids_host.size(); i++) {
+            fprintf(stderr, "[MMQ MoE DEBUG] First 16 ids_src1 values: ");
+            for (size_t i = 0; i < std::min((size_t)16, ids_host.size()); i++) {
                 fprintf(stderr, "%d ", ids_host[i]);
             }
             fprintf(stderr, "\n");
-            
-            // Check if values look valid (should be in range [0, ne12*sis1))
-            int64_t max_valid = ne12 * sis1;
+
+            // Check ALL values (should be in range [0, ne12))
+            // For MoE, ids_src1[i] = token_index, which must be < ne12 (number of tokens)
+            int64_t max_valid = ne12;  // Token indices must be < ne12
+            int bad_count = 0;
+            int first_bad_idx = -1;
+            int32_t first_bad_val = 0;
+            int32_t max_seen = 0;
+            int32_t min_seen = INT32_MAX;
+
             for (size_t i = 0; i < ids_host.size(); i++) {
-                if (ids_host[i] < 0 || ids_host[i] >= max_valid) {
-                    fprintf(stderr, "[MMQ MoE DEBUG] WARNING: ids_src1[%zu]=%d is out of range [0, %ld)!\n",
-                            i, ids_host[i], (long)max_valid);
+                int32_t val = ids_host[i];
+                if (val > max_seen) max_seen = val;
+                if (val < min_seen) min_seen = val;
+
+                if (val < 0 || val >= max_valid) {
+                    bad_count++;
+                    if (first_bad_idx < 0) {
+                        first_bad_idx = (int)i;
+                        first_bad_val = val;
+                    }
                 }
+            }
+
+            fprintf(stderr, "[MMQ MoE DEBUG] ids_src1 stats: count=%zu, min=%d, max=%d, expected_max=%ld\n",
+                    ids_host.size(), min_seen, max_seen, (long)(max_valid - 1));
+
+            if (bad_count > 0) {
+                fprintf(stderr, "[MMQ MoE CRITICAL] Found %d INVALID ids_src1 values!\n", bad_count);
+                fprintf(stderr, "[MMQ MoE CRITICAL] First bad: ids_src1[%d] = %d (must be in [0, %ld))\n",
+                        first_bad_idx, first_bad_val, (long)max_valid);
+
+                // Print surrounding context
+                int ctx_start = std::max(0, first_bad_idx - 5);
+                int ctx_end = std::min((int)ids_host.size(), first_bad_idx + 10);
+                fprintf(stderr, "[MMQ MoE CRITICAL] Context around first bad value [%d..%d]:\n  ", ctx_start, ctx_end);
+                for (int j = ctx_start; j < ctx_end; j++) {
+                    if (j == first_bad_idx) fprintf(stderr, "[");
+                    fprintf(stderr, "%d", ids_host[j]);
+                    if (j == first_bad_idx) fprintf(stderr, "]");
+                    fprintf(stderr, " ");
+                }
+                fprintf(stderr, "\n");
+
+                // Check if the bad index would cause the actual OOB read
+                // base_idx = ids[i1] * s01 + i00, where s01 = 2048 for this case
+                int64_t bad_base_idx = (int64_t)first_bad_val * 2048;
+                int64_t max_safe_base = ne12 * 2048;  // = 346 * 2048 = 708608
+                fprintf(stderr, "[MMQ MoE CRITICAL] Bad value %d would access base_idx=%lld (max safe=%lld)\n",
+                        first_bad_val, (long long)bad_base_idx, (long long)max_safe_base);
+            } else {
+                fprintf(stderr, "[MMQ MoE DEBUG] All %zu ids_src1 values are valid [0, %ld)\n",
+                        ids_host.size(), (long)max_valid);
             }
         }
     }
@@ -312,7 +405,7 @@ void ggml_cuda_mul_mat_q(
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
 
         if (use_native_mxfp4) {
             quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
