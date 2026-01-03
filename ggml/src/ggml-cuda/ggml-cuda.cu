@@ -2426,21 +2426,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // DEBUG: Track every operation and check for prior corruption
+    // NOTE: Skip during CUDA graph capture (sync not allowed)
     {
-        static int op_count = 0;
-        op_count++;
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(ctx.stream(), &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            static int op_count = 0;
+            op_count++;
 
-        cudaError_t sync_err = cudaDeviceSynchronize();
+            cudaError_t sync_err = cudaDeviceSynchronize();
 
-        const char* op_name = ggml_op_name(dst->op);
+            const char* op_name = ggml_op_name(dst->op);
 
-        if (sync_err != cudaSuccess) {
-            fprintf(stderr, "[OP #%d] !!! PRIOR OP CORRUPTED CONTEXT !!! op=%s error=%s\n",
-                    op_count, op_name, cudaGetErrorString(sync_err));
-            GGML_ABORT("Context corrupted before operation");
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr, "[OP #%d] !!! PRIOR OP CORRUPTED CONTEXT !!! op=%s error=%s\n",
+                        op_count, op_name, cudaGetErrorString(sync_err));
+                GGML_ABORT("Context corrupted before operation");
+            }
+
+            fprintf(stderr, "[OP #%d] %s\n", op_count, op_name);
         }
-
-        fprintf(stderr, "[OP #%d] %s\n", op_count, op_name);
     }
 
     // why is this here instead of mul_mat?

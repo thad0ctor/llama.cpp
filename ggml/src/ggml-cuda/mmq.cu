@@ -74,44 +74,49 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     // DEBUG: Synchronize and check for runtime errors in MMQ kernel
     // This isolates whether MMQ itself crashes or reads corrupted data from FA.
     // REMOVE THIS BLOCK AFTER DEBUGGING - it kills performance!
+    // NOTE: Skip during CUDA graph capture (sync not allowed)
     // =========================================================================
     {
-        static bool mmq_sync_debug_enabled = true;  // Set to false to disable sync
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(stream, &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            static bool mmq_sync_debug_enabled = true;  // Set to false to disable sync
 
-        if (mmq_sync_debug_enabled) {
-            // Increment call counter BEFORE anything else
-            mmq_call_count++;
-            const int current_call = mmq_call_count;
+            if (mmq_sync_debug_enabled) {
+                // Increment call counter BEFORE anything else
+                mmq_call_count++;
+                const int current_call = mmq_call_count;
 
-            const int id = ggml_cuda_get_device();
-            const int cc = ggml_cuda_info().devices[id].cc;
+                const int id = ggml_cuda_get_device();
+                const int cc = ggml_cuda_info().devices[id].cc;
 
-            // Print params for EVERY call with the call number
-            fprintf(stderr, "\n[MMQ #%d] ============ MMQ Call #%d ============\n", current_call, current_call);
-            fprintf(stderr, "[MMQ #%d] Device: %d, cc: %d, is_consumer_blackwell: %d\n",
-                    current_call, id, cc, ggml_cuda_is_consumer_blackwell(cc));
-            fprintf(stderr, "[MMQ #%d] type_x=%d, nrows_x=%d, ncols_x=%d, ncols_y=%d\n",
-                    current_call, args.type_x, args.nrows_x, args.ncols_x, args.ncols_y);
-            fprintf(stderr, "[MMQ #%d] nrows_dst=%d, ncols_dst=%d, ncols_max=%d\n",
-                    current_call, args.nrows_dst, args.ncols_dst, args.ncols_max);
-            fprintf(stderr, "[MMQ #%d] stride_row_x=%d, use_stream_k=%d\n",
-                    current_call, args.stride_row_x, args.use_stream_k);
-            fprintf(stderr, "[MMQ #%d] x=%p, y=%p, dst=%p\n",
-                    current_call, args.x, (void*)args.y, (void*)args.dst);
+                // Print params for EVERY call with the call number
+                fprintf(stderr, "\n[MMQ #%d] ============ MMQ Call #%d ============\n", current_call, current_call);
+                fprintf(stderr, "[MMQ #%d] Device: %d, cc: %d, is_consumer_blackwell: %d\n",
+                        current_call, id, cc, ggml_cuda_is_consumer_blackwell(cc));
+                fprintf(stderr, "[MMQ #%d] type_x=%d, nrows_x=%d, ncols_x=%d, ncols_y=%d\n",
+                        current_call, args.type_x, args.nrows_x, args.ncols_x, args.ncols_y);
+                fprintf(stderr, "[MMQ #%d] nrows_dst=%d, ncols_dst=%d, ncols_max=%d\n",
+                        current_call, args.nrows_dst, args.ncols_dst, args.ncols_max);
+                fprintf(stderr, "[MMQ #%d] stride_row_x=%d, use_stream_k=%d\n",
+                        current_call, args.stride_row_x, args.use_stream_k);
+                fprintf(stderr, "[MMQ #%d] x=%p, y=%p, dst=%p\n",
+                        current_call, args.x, (void*)args.y, (void*)args.dst);
 
-            cudaError_t launch_err = cudaGetLastError();
-            if (launch_err != cudaSuccess) {
-                fprintf(stderr, "[MMQ #%d] !!! LAUNCH FAILED: %s\n", current_call, cudaGetErrorString(launch_err));
+                cudaError_t launch_err = cudaGetLastError();
+                if (launch_err != cudaSuccess) {
+                    fprintf(stderr, "[MMQ #%d] !!! LAUNCH FAILED: %s\n", current_call, cudaGetErrorString(launch_err));
+                }
+
+                fprintf(stderr, "[MMQ #%d] Syncing...\n", current_call);
+                cudaError_t sync_err = cudaDeviceSynchronize();
+                if (sync_err != cudaSuccess) {
+                    fprintf(stderr, "[MMQ #%d] !!! CRASHED !!! Error: %s\n", current_call, cudaGetErrorString(sync_err));
+                    fprintf(stderr, "[MMQ CRASH] Call #%d failed! Check params above.\n", current_call);
+                    GGML_ABORT("MMQ kernel execution failed");
+                }
+                fprintf(stderr, "[MMQ #%d] OK\n", current_call);
             }
-
-            fprintf(stderr, "[MMQ #%d] Syncing...\n", current_call);
-            cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                fprintf(stderr, "[MMQ #%d] !!! CRASHED !!! Error: %s\n", current_call, cudaGetErrorString(sync_err));
-                fprintf(stderr, "[MMQ CRASH] Call #%d failed! Check params above.\n", current_call);
-                GGML_ABORT("MMQ kernel execution failed");
-            }
-            fprintf(stderr, "[MMQ #%d] OK\n", current_call);
         }
     }
     // =========================================================================
@@ -123,19 +128,24 @@ void ggml_cuda_mul_mat_q(
     // =========================================================================
     // DEBUG: Check if CUDA context is already corrupted BEFORE we do anything
     // This catches errors from previous kernels (like Flash Attention)
+    // NOTE: Skip during CUDA graph capture (sync not allowed)
     // =========================================================================
     {
-        static int mmq_entry_count = 0;
-        mmq_entry_count++;
-        cudaError_t pre_err = cudaDeviceSynchronize();
-        if (pre_err != cudaSuccess) {
-            fprintf(stderr, "[MMQ PRE-CHECK #%d] !!! Context already corrupted BEFORE MMQ !!!\n", mmq_entry_count);
-            fprintf(stderr, "[MMQ PRE-CHECK #%d] Error: %s\n", mmq_entry_count, cudaGetErrorString(pre_err));
-            fprintf(stderr, "[MMQ PRE-CHECK #%d] Was about to run MMQ with nrows_x=%d ncols_x=%d\n",
-                    mmq_entry_count, (int)src0->ne[1], (int)src0->ne[0]);
-            fprintf(stderr, "[MMQ PRE-CHECK #%d] src0 type=%d, src1 type=%d\n",
-                    mmq_entry_count, src0->type, src1->type);
-            GGML_ABORT("CUDA context corrupted before MMQ entry");
+        cudaStreamCaptureStatus capture_status;
+        cudaStreamIsCapturing(ctx.stream(), &capture_status);
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            static int mmq_entry_count = 0;
+            mmq_entry_count++;
+            cudaError_t pre_err = cudaDeviceSynchronize();
+            if (pre_err != cudaSuccess) {
+                fprintf(stderr, "[MMQ PRE-CHECK #%d] !!! Context already corrupted BEFORE MMQ !!!\n", mmq_entry_count);
+                fprintf(stderr, "[MMQ PRE-CHECK #%d] Error: %s\n", mmq_entry_count, cudaGetErrorString(pre_err));
+                fprintf(stderr, "[MMQ PRE-CHECK #%d] Was about to run MMQ with nrows_x=%d ncols_x=%d\n",
+                        mmq_entry_count, (int)src0->ne[1], (int)src0->ne[0]);
+                fprintf(stderr, "[MMQ PRE-CHECK #%d] src0 type=%d, src1 type=%d\n",
+                        mmq_entry_count, src0->type, src1->type);
+                GGML_ABORT("CUDA context corrupted before MMQ entry");
+            }
         }
     }
     // =========================================================================
@@ -297,36 +307,41 @@ void ggml_cuda_mul_mat_q(
                     si1, (long long)n_expert_used);
         }
 
-        fprintf(stderr, "[MMQ MoE DEBUG] ids_src1=%p (size=%ld elements)\n",
-                (void*)ids_src1.get(), (long)ne_get_rows);
-
         // DEBUG: Read raw ids tensor data to verify argsort output with strided access
+        // NOTE: Skip during CUDA graph capture (sync not allowed)
         {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            const int64_t total_elements = std::min((int64_t)(si1 * 4), ids->ne[0] * ids->ne[1]); // Enough for 4 tokens
-            std::vector<int32_t> raw_ids(total_elements);
-            CUDA_CHECK(cudaMemcpy(raw_ids.data(), ids->data, raw_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(stream, &capture_status);
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                fprintf(stderr, "[MMQ MoE DEBUG] ids_src1=%p (size=%ld elements)\n",
+                        (void*)ids_src1.get(), (long)ne_get_rows);
 
-            fprintf(stderr, "[DEBUG] Raw argsort output (verifying strided access with si1=%d):\n", si1);
-            for (int tok = 0; tok < std::min(3, (int)ids->ne[1]); tok++) {
-                fprintf(stderr, "  Token %d (offset %d): ", tok, tok * si1);
-                bool has_invalid = false;
-                for (int exp = 0; exp < std::min(8, (int)ids->ne[0]); exp++) {
-                    int idx = tok * si1 + exp;
-                    if (idx < (int)raw_ids.size()) {
-                        int32_t val = raw_ids[idx];
-                        fprintf(stderr, "%d ", val);
-                        if (val < 0 || val >= (int)ne02) {
-                            has_invalid = true;
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const int64_t total_elements = std::min((int64_t)(si1 * 4), ids->ne[0] * ids->ne[1]); // Enough for 4 tokens
+                std::vector<int32_t> raw_ids(total_elements);
+                CUDA_CHECK(cudaMemcpy(raw_ids.data(), ids->data, raw_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+                fprintf(stderr, "[DEBUG] Raw argsort output (verifying strided access with si1=%d):\n", si1);
+                for (int tok = 0; tok < std::min(3, (int)ids->ne[1]); tok++) {
+                    fprintf(stderr, "  Token %d (offset %d): ", tok, tok * si1);
+                    bool has_invalid = false;
+                    for (int exp = 0; exp < std::min(8, (int)ids->ne[0]); exp++) {
+                        int idx = tok * si1 + exp;
+                        if (idx < (int)raw_ids.size()) {
+                            int32_t val = raw_ids[idx];
+                            fprintf(stderr, "%d ", val);
+                            if (val < 0 || val >= (int)ne02) {
+                                has_invalid = true;
+                            }
+                        } else {
+                            fprintf(stderr, "OOB ");
                         }
-                    } else {
-                        fprintf(stderr, "OOB ");
                     }
+                    if (has_invalid) {
+                        fprintf(stderr, " <-- INVALID EXPERT IDS!");
+                    }
+                    fprintf(stderr, "\n");
                 }
-                if (has_invalid) {
-                    fprintf(stderr, " <-- INVALID EXPERT IDS!");
-                }
-                fprintf(stderr, "\n");
             }
         }
 
@@ -335,110 +350,115 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
         
         // DEBUG: Sync and validate mm_ids_helper output - CHECK ALL VALUES!
+        // NOTE: Skip during CUDA graph capture (sync not allowed)
         {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            fprintf(stderr, "[MMQ MoE DEBUG] mm_ids_helper completed\n");
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(stream, &capture_status);
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                fprintf(stderr, "[MMQ MoE DEBUG] mm_ids_helper completed\n");
 
-            // Read back ALL values to verify they're valid indices
-            std::vector<int32_t> ids_host(ne_get_rows);
-            CUDA_CHECK(cudaMemcpy(ids_host.data(), ids_src1.get(), ids_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
-            fprintf(stderr, "[MMQ MoE DEBUG] First 16 ids_src1 values: ");
-            for (size_t i = 0; i < std::min((size_t)16, ids_host.size()); i++) {
-                fprintf(stderr, "%d ", ids_host[i]);
-            }
-            fprintf(stderr, "\n");
-
-            // Check ALL values (should be in range [0, ne12 * ne11))
-            // For MoE, ids_src1[i] = token_index * channels + channel, which must be < ne12 * ne11
-            int64_t max_valid = ne12 * ne11;  // Indices must be < ne12 * ne11 (tokens * channels)
-            int bad_count = 0;
-            int first_bad_idx = -1;
-            int32_t first_bad_val = 0;
-            int32_t max_seen = 0;
-            int32_t min_seen = INT32_MAX;
-
-            for (size_t i = 0; i < ids_host.size(); i++) {
-                int32_t val = ids_host[i];
-                if (val > max_seen) max_seen = val;
-                if (val < min_seen) min_seen = val;
-
-                if (val < 0 || val >= max_valid) {
-                    bad_count++;
-                    if (first_bad_idx < 0) {
-                        first_bad_idx = (int)i;
-                        first_bad_val = val;
-                    }
-                }
-            }
-
-            fprintf(stderr, "[MMQ MoE DEBUG] ids_src1 stats: count=%zu, min=%d, max=%d, expected_max=%ld\n",
-                    ids_host.size(), min_seen, max_seen, (long)(max_valid - 1));
-
-            if (bad_count > 0) {
-                fprintf(stderr, "[MMQ MoE CRITICAL] Found %d INVALID ids_src1 values!\n", bad_count);
-                fprintf(stderr, "[MMQ MoE CRITICAL] First bad: ids_src1[%d] = %d (must be in [0, %ld))\n",
-                        first_bad_idx, first_bad_val, (long)max_valid);
-
-                // Print surrounding context
-                int ctx_start = std::max(0, first_bad_idx - 5);
-                int ctx_end = std::min((int)ids_host.size(), first_bad_idx + 10);
-                fprintf(stderr, "[MMQ MoE CRITICAL] Context around first bad value [%d..%d]:\n  ", ctx_start, ctx_end);
-                for (int j = ctx_start; j < ctx_end; j++) {
-                    if (j == first_bad_idx) fprintf(stderr, "[");
-                    fprintf(stderr, "%d", ids_host[j]);
-                    if (j == first_bad_idx) fprintf(stderr, "]");
-                    fprintf(stderr, " ");
+                // Read back ALL values to verify they're valid indices
+                std::vector<int32_t> ids_host(ne_get_rows);
+                CUDA_CHECK(cudaMemcpy(ids_host.data(), ids_src1.get(), ids_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                fprintf(stderr, "[MMQ MoE DEBUG] First 16 ids_src1 values: ");
+                for (size_t i = 0; i < std::min((size_t)16, ids_host.size()); i++) {
+                    fprintf(stderr, "%d ", ids_host[i]);
                 }
                 fprintf(stderr, "\n");
 
-                // Check if the bad index would cause the actual OOB read
-                // base_idx = ids[i1] * s01 + i00, where s01 = 2048 for this case
-                int64_t bad_base_idx = (int64_t)first_bad_val * 2048;
-                int64_t max_safe_base = ne12 * 2048;  // = 346 * 2048 = 708608
-                fprintf(stderr, "[MMQ MoE CRITICAL] Bad value %d would access base_idx=%lld (max safe=%lld)\n",
-                        first_bad_val, (long long)bad_base_idx, (long long)max_safe_base);
-            } else {
-                fprintf(stderr, "[MMQ MoE DEBUG] All %zu ids_src1 values are valid [0, %ld)\n",
-                        ids_host.size(), (long)max_valid);
-            }
+                // Check ALL values (should be in range [0, ne12 * ne11))
+                // For MoE, ids_src1[i] = token_index * channels + channel, which must be < ne12 * ne11
+                int64_t max_valid = ne12 * ne11;  // Indices must be < ne12 * ne11 (tokens * channels)
+                int bad_count = 0;
+                int first_bad_idx = -1;
+                int32_t first_bad_val = 0;
+                int32_t max_seen = 0;
+                int32_t min_seen = INT32_MAX;
 
-            // DEBUG: Verify expert_bounds - check for gaps that could cause unwritten positions
-            {
-                std::vector<int32_t> bounds_host(ne02 + 1);
-                CUDA_CHECK(cudaMemcpy(bounds_host.data(), expert_bounds.get(),
-                                     bounds_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < ids_host.size(); i++) {
+                    int32_t val = ids_host[i];
+                    if (val > max_seen) max_seen = val;
+                    if (val < min_seen) min_seen = val;
 
-                fprintf(stderr, "[MMQ MoE DEBUG] expert_bounds verification:\n");
-                fprintf(stderr, "  First 5 experts: ");
-                for (int i = 0; i < std::min(5, (int)ne02 + 1); i++) {
-                    fprintf(stderr, "%d ", bounds_host[i]);
-                }
-                fprintf(stderr, "\n  Last expert bound: expert_bounds[%ld] = %d (expected: %ld)\n",
-                        (long)ne02, bounds_host[ne02], (long)ne_get_rows);
-
-                if (bounds_host[ne02] != (int32_t)ne_get_rows) {
-                    fprintf(stderr, "[MMQ MoE CRITICAL] expert_bounds[%ld] = %d != expected %ld\n",
-                            (long)ne02, bounds_host[ne02], (long)ne_get_rows);
-                    fprintf(stderr, "[MMQ MoE CRITICAL] Missing %ld entries - this explains the garbage values!\n",
-                            (long)(ne_get_rows - bounds_host[ne02]));
-
-                    // Find which experts have gaps
-                    for (int i = 0; i < (int)ne02; i++) {
-                        int expert_count = (i == (int)ne02 - 1) ?
-                            (bounds_host[i+1] - bounds_host[i]) :
-                            (bounds_host[i+1] - bounds_host[i]);
-                        if (expert_count < 0) {
-                            fprintf(stderr, "[MMQ MoE CRITICAL] Expert %d has NEGATIVE count: %d (bounds[%d]=%d, bounds[%d]=%d)\n",
-                                    i, expert_count, i, bounds_host[i], i+1, bounds_host[i+1]);
+                    if (val < 0 || val >= max_valid) {
+                        bad_count++;
+                        if (first_bad_idx < 0) {
+                            first_bad_idx = (int)i;
+                            first_bad_val = val;
                         }
                     }
                 }
 
-                // Verify bounds are monotonically increasing
-                for (int i = 0; i < (int)ne02; i++) {
-                    if (bounds_host[i] > bounds_host[i+1]) {
-                        fprintf(stderr, "[MMQ MoE CRITICAL] Non-monotonic bounds at expert %d: %d > %d\n",
-                                i, bounds_host[i], bounds_host[i+1]);
+                fprintf(stderr, "[MMQ MoE DEBUG] ids_src1 stats: count=%zu, min=%d, max=%d, expected_max=%ld\n",
+                        ids_host.size(), min_seen, max_seen, (long)(max_valid - 1));
+
+                if (bad_count > 0) {
+                    fprintf(stderr, "[MMQ MoE CRITICAL] Found %d INVALID ids_src1 values!\n", bad_count);
+                    fprintf(stderr, "[MMQ MoE CRITICAL] First bad: ids_src1[%d] = %d (must be in [0, %ld))\n",
+                            first_bad_idx, first_bad_val, (long)max_valid);
+
+                    // Print surrounding context
+                    int ctx_start = std::max(0, first_bad_idx - 5);
+                    int ctx_end = std::min((int)ids_host.size(), first_bad_idx + 10);
+                    fprintf(stderr, "[MMQ MoE CRITICAL] Context around first bad value [%d..%d]:\n  ", ctx_start, ctx_end);
+                    for (int j = ctx_start; j < ctx_end; j++) {
+                        if (j == first_bad_idx) fprintf(stderr, "[");
+                        fprintf(stderr, "%d", ids_host[j]);
+                        if (j == first_bad_idx) fprintf(stderr, "]");
+                        fprintf(stderr, " ");
+                    }
+                    fprintf(stderr, "\n");
+
+                    // Check if the bad index would cause the actual OOB read
+                    // base_idx = ids[i1] * s01 + i00, where s01 = 2048 for this case
+                    int64_t bad_base_idx = (int64_t)first_bad_val * 2048;
+                    int64_t max_safe_base = ne12 * 2048;  // = 346 * 2048 = 708608
+                    fprintf(stderr, "[MMQ MoE CRITICAL] Bad value %d would access base_idx=%lld (max safe=%lld)\n",
+                            first_bad_val, (long long)bad_base_idx, (long long)max_safe_base);
+                } else {
+                    fprintf(stderr, "[MMQ MoE DEBUG] All %zu ids_src1 values are valid [0, %ld)\n",
+                            ids_host.size(), (long)max_valid);
+                }
+
+                // DEBUG: Verify expert_bounds - check for gaps that could cause unwritten positions
+                {
+                    std::vector<int32_t> bounds_host(ne02 + 1);
+                    CUDA_CHECK(cudaMemcpy(bounds_host.data(), expert_bounds.get(),
+                                         bounds_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+                    fprintf(stderr, "[MMQ MoE DEBUG] expert_bounds verification:\n");
+                    fprintf(stderr, "  First 5 experts: ");
+                    for (int i = 0; i < std::min(5, (int)ne02 + 1); i++) {
+                        fprintf(stderr, "%d ", bounds_host[i]);
+                    }
+                    fprintf(stderr, "\n  Last expert bound: expert_bounds[%ld] = %d (expected: %ld)\n",
+                            (long)ne02, bounds_host[ne02], (long)ne_get_rows);
+
+                    if (bounds_host[ne02] != (int32_t)ne_get_rows) {
+                        fprintf(stderr, "[MMQ MoE CRITICAL] expert_bounds[%ld] = %d != expected %ld\n",
+                                (long)ne02, bounds_host[ne02], (long)ne_get_rows);
+                        fprintf(stderr, "[MMQ MoE CRITICAL] Missing %ld entries - this explains the garbage values!\n",
+                                (long)(ne_get_rows - bounds_host[ne02]));
+
+                        // Find which experts have gaps
+                        for (int i = 0; i < (int)ne02; i++) {
+                            int expert_count = (i == (int)ne02 - 1) ?
+                                (bounds_host[i+1] - bounds_host[i]) :
+                                (bounds_host[i+1] - bounds_host[i]);
+                            if (expert_count < 0) {
+                                fprintf(stderr, "[MMQ MoE CRITICAL] Expert %d has NEGATIVE count: %d (bounds[%d]=%d, bounds[%d]=%d)\n",
+                                        i, expert_count, i, bounds_host[i], i+1, bounds_host[i+1]);
+                            }
+                        }
+                    }
+
+                    // Verify bounds are monotonically increasing
+                    for (int i = 0; i < (int)ne02; i++) {
+                        if (bounds_host[i] > bounds_host[i+1]) {
+                            fprintf(stderr, "[MMQ MoE CRITICAL] Non-monotonic bounds at expert %d: %d > %d\n",
+                                    i, bounds_host[i], bounds_host[i+1]);
+                        }
                     }
                 }
             }
@@ -447,24 +467,29 @@ void ggml_cuda_mul_mat_q(
         // FIX: If mm_ids_helper didn't write to all expected positions, fill the gap with valid indices.
         // This prevents garbage values from causing out-of-bounds memory accesses in the quantize kernel.
         // This is a ZERO-OVERHEAD fix when all positions are correctly written (the common case).
+        // NOTE: Skip during CUDA graph capture (sync not allowed for cudaMemcpy)
         {
-            int32_t total_written;
-            CUDA_CHECK(cudaMemcpy(&total_written, expert_bounds.get() + ne02, sizeof(int32_t), cudaMemcpyDeviceToHost));
+            cudaStreamCaptureStatus capture_status;
+            cudaStreamIsCapturing(stream, &capture_status);
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                int32_t total_written;
+                CUDA_CHECK(cudaMemcpy(&total_written, expert_bounds.get() + ne02, sizeof(int32_t), cudaMemcpyDeviceToHost));
 
-            if (total_written < (int32_t)ne_get_rows) {
-                // There's a gap! Fill remaining positions with 0 (a valid token index).
-                // This should rarely happen - indicates a bug in mm_ids_helper or argsort.
-                const int32_t gap_size = (int32_t)ne_get_rows - total_written;
-                fprintf(stderr, "[MMQ MoE FIX] Gap detected: %d positions unfilled. Filling with 0.\n", gap_size);
+                if (total_written < (int32_t)ne_get_rows) {
+                    // There's a gap! Fill remaining positions with 0 (a valid token index).
+                    // This should rarely happen - indicates a bug in mm_ids_helper or argsort.
+                    const int32_t gap_size = (int32_t)ne_get_rows - total_written;
+                    fprintf(stderr, "[MMQ MoE FIX] Gap detected: %d positions unfilled. Filling with 0.\n", gap_size);
 
-                // Fill the gap with zeros
-                CUDA_CHECK(cudaMemsetAsync(ids_src1.get() + total_written, 0, gap_size * sizeof(int32_t), stream));
-                CUDA_CHECK(cudaMemsetAsync(ids_dst.get() + total_written, 0, gap_size * sizeof(int32_t), stream));
+                    // Fill the gap with zeros
+                    CUDA_CHECK(cudaMemsetAsync(ids_src1.get() + total_written, 0, gap_size * sizeof(int32_t), stream));
+                    CUDA_CHECK(cudaMemsetAsync(ids_dst.get() + total_written, 0, gap_size * sizeof(int32_t), stream));
 
-                // Also update expert_bounds to reflect the filled gap
-                int32_t new_total = (int32_t)ne_get_rows;
-                CUDA_CHECK(cudaMemcpyAsync(expert_bounds.get() + ne02, &new_total, sizeof(int32_t),
-                                           cudaMemcpyHostToDevice, stream));
+                    // Also update expert_bounds to reflect the filled gap
+                    int32_t new_total = (int32_t)ne_get_rows;
+                    CUDA_CHECK(cudaMemcpyAsync(expert_bounds.get() + ne02, &new_total, sizeof(int32_t),
+                                               cudaMemcpyHostToDevice, stream));
+                }
             }
         }
     }
