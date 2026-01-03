@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+// DEBUG: Counter to identify which MMQ call crashes
+static int mmq_call_count = 0;
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
@@ -74,71 +77,41 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     // =========================================================================
     {
         static bool mmq_sync_debug_enabled = true;  // Set to false to disable sync
-        static bool mmq_params_printed = false;
 
         if (mmq_sync_debug_enabled) {
-            // Print comprehensive parameters BEFORE sync (in case of crash)
-            if (!mmq_params_printed) {
-                const int id = ggml_cuda_get_device();
-                const int cc = ggml_cuda_info().devices[id].cc;
+            // Increment call counter BEFORE anything else
+            mmq_call_count++;
+            const int current_call = mmq_call_count;
 
-                fprintf(stderr, "\n[MMQ PARAMS] ============ MMQ Kernel Parameters ============\n");
-                fprintf(stderr, "[MMQ PARAMS] Device info:\n");
-                fprintf(stderr, "[MMQ PARAMS]   device: %d, cc: %d\n", id, cc);
-                fprintf(stderr, "[MMQ PARAMS]   is_consumer_blackwell (sm_120): %d\n", ggml_cuda_is_consumer_blackwell(cc));
+            const int id = ggml_cuda_get_device();
+            const int cc = ggml_cuda_info().devices[id].cc;
 
-                fprintf(stderr, "[MMQ PARAMS] Matrix dimensions:\n");
-                fprintf(stderr, "[MMQ PARAMS]   type_x: %d (quantized weight type)\n", args.type_x);
-                fprintf(stderr, "[MMQ PARAMS]   nrows_x: %d, ncols_x: %d\n", args.nrows_x, args.ncols_x);
-                fprintf(stderr, "[MMQ PARAMS]   ncols_y: %d, nrows_dst: %d, ncols_dst: %d\n",
-                        args.ncols_y, args.nrows_dst, args.ncols_dst);
-                fprintf(stderr, "[MMQ PARAMS]   ncols_max: %d\n", args.ncols_max);
-
-                fprintf(stderr, "[MMQ PARAMS] Strides:\n");
-                fprintf(stderr, "[MMQ PARAMS]   stride_row_x: %d\n", args.stride_row_x);
-                fprintf(stderr, "[MMQ PARAMS]   stride_channel_x: %d, stride_channel_y: %d, stride_channel_dst: %d\n",
-                        args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst);
-                fprintf(stderr, "[MMQ PARAMS]   stride_sample_x: %d, stride_sample_y: %d, stride_sample_dst: %d\n",
-                        args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst);
-
-                fprintf(stderr, "[MMQ PARAMS] Channel/Sample info:\n");
-                fprintf(stderr, "[MMQ PARAMS]   nchannels_x: %d, nchannels_y: %d\n",
-                        args.nchannels_x, args.nchannels_y);
-                fprintf(stderr, "[MMQ PARAMS]   nsamples_x: %d, nsamples_y: %d\n",
-                        args.nsamples_x, args.nsamples_y);
-
-                fprintf(stderr, "[MMQ PARAMS] Pointers:\n");
-                fprintf(stderr, "[MMQ PARAMS]   x (weights): %p\n", args.x);
-                fprintf(stderr, "[MMQ PARAMS]   y (activations): %p\n", (void*)args.y);
-                fprintf(stderr, "[MMQ PARAMS]   dst: %p\n", (void*)args.dst);
-                fprintf(stderr, "[MMQ PARAMS]   ids_dst: %p, expert_bounds: %p\n",
-                        (void*)args.ids_dst, (void*)args.expert_bounds);
-
-                fprintf(stderr, "[MMQ PARAMS] Flags:\n");
-                fprintf(stderr, "[MMQ PARAMS]   use_stream_k: %d\n", args.use_stream_k);
-
-                fprintf(stderr, "[MMQ PARAMS] =========================================================\n\n");
-                mmq_params_printed = true;
-            }
+            // Print params for EVERY call with the call number
+            fprintf(stderr, "\n[MMQ #%d] ============ MMQ Call #%d ============\n", current_call, current_call);
+            fprintf(stderr, "[MMQ #%d] Device: %d, cc: %d, is_consumer_blackwell: %d\n",
+                    current_call, id, cc, ggml_cuda_is_consumer_blackwell(cc));
+            fprintf(stderr, "[MMQ #%d] type_x=%d, nrows_x=%d, ncols_x=%d, ncols_y=%d\n",
+                    current_call, args.type_x, args.nrows_x, args.ncols_x, args.ncols_y);
+            fprintf(stderr, "[MMQ #%d] nrows_dst=%d, ncols_dst=%d, ncols_max=%d\n",
+                    current_call, args.nrows_dst, args.ncols_dst, args.ncols_max);
+            fprintf(stderr, "[MMQ #%d] stride_row_x=%d, use_stream_k=%d\n",
+                    current_call, args.stride_row_x, args.use_stream_k);
+            fprintf(stderr, "[MMQ #%d] x=%p, y=%p, dst=%p\n",
+                    current_call, args.x, (void*)args.y, (void*)args.dst);
 
             cudaError_t launch_err = cudaGetLastError();
             if (launch_err != cudaSuccess) {
-                fprintf(stderr, "[MMQ SYNC DEBUG] !!! MMQ KERNEL LAUNCH FAILED !!!\n");
-                fprintf(stderr, "[MMQ SYNC DEBUG] Error: %s\n", cudaGetErrorString(launch_err));
-                fprintf(stderr, "[MMQ SYNC DEBUG] See [MMQ PARAMS] above for full parameter dump\n");
+                fprintf(stderr, "[MMQ #%d] !!! LAUNCH FAILED: %s\n", current_call, cudaGetErrorString(launch_err));
             }
 
-            fprintf(stderr, "[MMQ SYNC DEBUG] Waiting for MMQ kernel to complete...\n");
+            fprintf(stderr, "[MMQ #%d] Syncing...\n", current_call);
             cudaError_t sync_err = cudaDeviceSynchronize();
             if (sync_err != cudaSuccess) {
-                fprintf(stderr, "[MMQ SYNC DEBUG] !!! MMQ KERNEL CRASHED !!!\n");
-                fprintf(stderr, "[MMQ SYNC DEBUG] Error: %s\n", cudaGetErrorString(sync_err));
-                fprintf(stderr, "[MMQ SYNC DEBUG] type_x=%d, nrows_x=%d, ncols_x=%d\n",
-                        args.type_x, args.nrows_x, args.ncols_x);
-                fprintf(stderr, "[MMQ SYNC DEBUG] See [MMQ PARAMS] above for full parameter dump\n");
+                fprintf(stderr, "[MMQ #%d] !!! CRASHED !!! Error: %s\n", current_call, cudaGetErrorString(sync_err));
+                fprintf(stderr, "[MMQ CRASH] Call #%d failed! Check params above.\n", current_call);
                 GGML_ABORT("MMQ kernel execution failed");
             }
-            fprintf(stderr, "[MMQ SYNC DEBUG] MMQ completed successfully!\n");
+            fprintf(stderr, "[MMQ #%d] OK\n", current_call);
         }
     }
     // =========================================================================
@@ -146,6 +119,43 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+
+    // =========================================================================
+    // DEBUG: Check if CUDA context is already corrupted BEFORE we do anything
+    // This catches errors from previous kernels (like Flash Attention)
+    // =========================================================================
+    {
+        static int mmq_entry_count = 0;
+        mmq_entry_count++;
+        cudaError_t pre_err = cudaDeviceSynchronize();
+        if (pre_err != cudaSuccess) {
+            fprintf(stderr, "[MMQ PRE-CHECK #%d] !!! Context already corrupted BEFORE MMQ !!!\n", mmq_entry_count);
+            fprintf(stderr, "[MMQ PRE-CHECK #%d] Error: %s\n", mmq_entry_count, cudaGetErrorString(pre_err));
+            fprintf(stderr, "[MMQ PRE-CHECK #%d] Was about to run MMQ with nrows_x=%d ncols_x=%d\n",
+                    mmq_entry_count, (int)src0->ne[1], (int)src0->ne[0]);
+            fprintf(stderr, "[MMQ PRE-CHECK #%d] src0 type=%d, src1 type=%d\n",
+                    mmq_entry_count, src0->type, src1->type);
+            GGML_ABORT("CUDA context corrupted before MMQ entry");
+        }
+    }
+    // =========================================================================
+
+    // DEBUG: Track if this is MoE or regular matmul
+    {
+        static int mmq_internal_call = 0;
+        mmq_internal_call++;
+        fprintf(stderr, "\n[MMQ INTERNAL #%d] ids=%p (MoE=%s)\n",
+                mmq_internal_call, (void*)ids, ids ? "YES" : "NO");
+        fprintf(stderr, "[MMQ INTERNAL #%d] src0: ne=[%lld,%lld,%lld,%lld] type=%d\n",
+                mmq_internal_call,
+                (long long)src0->ne[0], (long long)src0->ne[1],
+                (long long)src0->ne[2], (long long)src0->ne[3], src0->type);
+        fprintf(stderr, "[MMQ INTERNAL #%d] src1: ne=[%lld,%lld,%lld,%lld]\n",
+                mmq_internal_call,
+                (long long)src1->ne[0], (long long)src1->ne[1],
+                (long long)src1->ne[2], (long long)src1->ne[3]);
+    }
+
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.

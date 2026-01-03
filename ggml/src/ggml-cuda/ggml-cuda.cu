@@ -2216,6 +2216,32 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    // DEBUG: MoE entry
+    {
+        static int moe_call = 0;
+        moe_call++;
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+        fprintf(stderr, "\n[MUL_MAT_ID #%d] =====================================\n", moe_call);
+        fprintf(stderr, "[MUL_MAT_ID #%d] cc=%d\n", moe_call, cc);
+        fprintf(stderr, "[MUL_MAT_ID #%d] src0 (experts): ne=[%lld,%lld,%lld,%lld] type=%d data=%p\n",
+                moe_call, (long long)src0->ne[0], (long long)src0->ne[1],
+                (long long)src0->ne[2], (long long)src0->ne[3], src0->type, src0->data);
+        fprintf(stderr, "[MUL_MAT_ID #%d] src1 (tokens):  ne=[%lld,%lld,%lld,%lld] type=%d data=%p\n",
+                moe_call, (long long)src1->ne[0], (long long)src1->ne[1],
+                (long long)src1->ne[2], (long long)src1->ne[3], src1->type, src1->data);
+        fprintf(stderr, "[MUL_MAT_ID #%d] ids:            ne=[%lld,%lld,%lld,%lld] data=%p\n",
+                moe_call, (long long)ids->ne[0], (long long)ids->ne[1],
+                (long long)ids->ne[2], (long long)ids->ne[3], ids->data);
+        fprintf(stderr, "[MUL_MAT_ID #%d] dst:            ne=[%lld,%lld,%lld,%lld] data=%p\n",
+                moe_call, (long long)dst->ne[0], (long long)dst->ne[1],
+                (long long)dst->ne[2], (long long)dst->ne[3], dst->data);
+        fprintf(stderr, "[MUL_MAT_ID #%d] n_experts=%lld, should_use_mmq=%d\n",
+                moe_call, (long long)src0->ne[2],
+                ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], src0->ne[2]));
+        fprintf(stderr, "[MUL_MAT_ID #%d] =====================================\n", moe_call);
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
@@ -2298,6 +2324,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
 
+    // DEBUG: Before get_rows for sorting tokens
+    fprintf(stderr, "[MUL_MAT_ID] get_rows_cuda: ne_get_rows=%lld, ne10=%lld\n",
+            (long long)ne_get_rows, (long long)ne10);
+    fprintf(stderr, "[MUL_MAT_ID] src1_sorted.ptr=%p, ids_to_sorted=%p\n",
+            (void*)src1_sorted.ptr, (void*)ids_to_sorted);
+
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
         ne10, nb11, nb12, nb13,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
@@ -2310,6 +2342,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (tokens_per_expert[i02] == 0) {
             continue;
         }
+
+        // DEBUG: Track which expert is being processed
+        fprintf(stderr, "[MUL_MAT_ID] Processing expert %lld/%lld, tokens=%d\n",
+                (long long)i02, (long long)ne02, tokens_per_expert[i02]);
 
         ggml_tensor src0_slice = *src0;
         src0_slice.ne[2]    = 1;
@@ -2349,6 +2385,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
 
+        // DEBUG: Sync after each expert to catch exactly which one crashes
+        {
+            cudaError_t expert_err = cudaDeviceSynchronize();
+            if (expert_err != cudaSuccess) {
+                fprintf(stderr, "[MUL_MAT_ID] !!! EXPERT %lld CRASHED !!! error=%s\n",
+                        (long long)i02, cudaGetErrorString(expert_err));
+                fprintf(stderr, "[MUL_MAT_ID] tokens_per_expert[%lld]=%d\n",
+                        (long long)i02, tokens_per_expert[i02]);
+                fprintf(stderr, "[MUL_MAT_ID] src0_slice.data=%p\n", src0_slice.data);
+                fprintf(stderr, "[MUL_MAT_ID] src1_slice: ne=[%lld,%lld], data=%p\n",
+                        (long long)src1_slice.ne[0], (long long)src1_slice.ne[1], src1_slice.data);
+                fprintf(stderr, "[MUL_MAT_ID] dst_slice: ne=[%lld,%lld], data=%p\n",
+                        (long long)dst_slice.ne[0], (long long)dst_slice.ne[1], dst_slice.data);
+                GGML_ABORT("Expert matmul failed");
+            }
+            fprintf(stderr, "[MUL_MAT_ID] Expert %lld OK\n", (long long)i02);
+        }
+
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
@@ -2357,9 +2411,38 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+
+    // DEBUG: Final sync after MUL_MAT_ID
+    {
+        cudaError_t final_err = cudaDeviceSynchronize();
+        if (final_err != cudaSuccess) {
+            fprintf(stderr, "[MUL_MAT_ID] !!! FINAL get_rows CRASHED !!! error=%s\n",
+                    cudaGetErrorString(final_err));
+            GGML_ABORT("MUL_MAT_ID final get_rows failed");
+        }
+        fprintf(stderr, "[MUL_MAT_ID] Completed successfully\n");
+    }
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // DEBUG: Track every operation and check for prior corruption
+    {
+        static int op_count = 0;
+        op_count++;
+
+        cudaError_t sync_err = cudaDeviceSynchronize();
+
+        const char* op_name = ggml_op_name(dst->op);
+
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr, "[OP #%d] !!! PRIOR OP CORRUPTED CONTEXT !!! op=%s error=%s\n",
+                    op_count, op_name, cudaGetErrorString(sync_err));
+            GGML_ABORT("Context corrupted before operation");
+        }
+
+        fprintf(stderr, "[OP #%d] %s\n", op_count, op_name);
+    }
+
     // why is this here instead of mul_mat?
     if (dst->src[0] != nullptr && ggml_backend_buft_is_cuda_split(dst->src[0]->buffer->buft)) {
         ggml_cuda_set_peer_access(dst->src[1]->ne[1], ctx.device);
@@ -2689,10 +2772,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             return false;
     }
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
-        CUDA_CHECK(err);
+    // DEBUG: Check if THIS operation crashed
+    {
+        static int post_op_count = 0;
+        post_op_count++;
+
+        cudaError_t post_err = cudaDeviceSynchronize();
+        if (post_err != cudaSuccess) {
+            const char* op_name = ggml_op_name(dst->op);
+            fprintf(stderr, "[POST-OP #%d] !!! THIS OP CRASHED !!! op=%s error=%s\n",
+                    post_op_count, op_name, cudaGetErrorString(post_err));
+            if (dst->src[0]) {
+                fprintf(stderr, "[POST-OP #%d] src0 ne=[%lld,%lld,%lld,%lld]\n",
+                        post_op_count,
+                        (long long)dst->src[0]->ne[0], (long long)dst->src[0]->ne[1],
+                        (long long)dst->src[0]->ne[2], (long long)dst->src[0]->ne[3]);
+            }
+            GGML_ABORT("Operation execution failed");
+        }
     }
 
     return true;

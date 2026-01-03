@@ -300,6 +300,34 @@ void quantize_mmq_q8_1_cuda(
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % (4*QK8_1) == 0);
 
+    // DEBUG: Print all parameters and validate pointers
+    {
+        static int quant_call = 0;
+        quant_call++;
+        fprintf(stderr, "\n[QUANT Q8_1 #%d] x=%p, ids=%p, vy=%p\n", quant_call, (void*)x, (void*)ids, (void*)vy);
+        fprintf(stderr, "[QUANT Q8_1 #%d] ne00=%lld, s01=%lld, s02=%lld, s03=%lld\n",
+                quant_call, (long long)ne00, (long long)s01, (long long)s02, (long long)s03);
+        fprintf(stderr, "[QUANT Q8_1 #%d] ne0=%lld, ne1=%lld, ne2=%lld, ne3=%lld\n",
+                quant_call, (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3);
+
+        const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+        fprintf(stderr, "[QUANT Q8_1 #%d] grid=(%lld, %lld, %lld), block=(%d, 1, 1)\n",
+                quant_call, (long long)ne1, (long long)block_num_y, (long long)(ne2*ne3), CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+
+        // Check if pointers look valid
+        cudaPointerAttributes attr;
+        cudaError_t err = cudaPointerGetAttributes(&attr, x);
+        fprintf(stderr, "[QUANT Q8_1 #%d] x pointer valid=%d (type=%d)\n", quant_call, (err == cudaSuccess), attr.type);
+
+        if (ids) {
+            err = cudaPointerGetAttributes(&attr, ids);
+            fprintf(stderr, "[QUANT Q8_1 #%d] ids pointer valid=%d (type=%d)\n", quant_call, (err == cudaSuccess), attr.type);
+        }
+
+        err = cudaPointerGetAttributes(&attr, vy);
+        fprintf(stderr, "[QUANT Q8_1 #%d] vy pointer valid=%d (type=%d)\n", quant_call, (err == cudaSuccess), attr.type);
+    }
+
     // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
