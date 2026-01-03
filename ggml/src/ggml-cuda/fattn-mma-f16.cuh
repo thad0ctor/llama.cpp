@@ -2555,8 +2555,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     //   - With num_consumers=8: threadIdx.y 1-8 → warp_id 0-7
     //   - Producer (threadIdx.y=0) doesn't call this function
     // Unified mode: use nwarps with original threadIdx.y
+    // SM_120 FIX: Blackwell kernel launches 5 warps (1 producer + 4 consumers), but SM_120
+    // uses unified mode. We must use only 4 warps for compute (skip threadIdx.y=0) to match
+    // the Blackwell config which was designed for 4 consumer warps.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    constexpr int  effective_nwarps = nwarps - 1;  // 5 - 1 = 4 (match Blackwell consumer count)
+    const int      warp_id          = threadIdx.y - 1;  // Skip warp 0, use warps 1-4 as compute
+    if (threadIdx.y == 0) {
+        return;  // Producer warp exits early for SM_120 - only consumer warps compute
+    }
+#else
     constexpr int  effective_nwarps = (num_consumers > 0) ? num_consumers : nwarps;
     const int      warp_id          = (num_consumers > 0) ? (threadIdx.y - 1) : threadIdx.y;
+#endif
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = 2; // This is specifically KQ columns, Volta only has a single VKQ column.
@@ -3723,31 +3734,28 @@ __global__ void flash_attn_ext_f16_blackwell(
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
          // =====================================================================
-         // SM_120 PATH: Unified cp.async loading (no producer/consumer split)
+         // SM_120 PATH: Consumer warps compute (producer warp idles)
          // =====================================================================
          // On SM_120 (RTX 5090), TMA mbarrier.arrive crashes at runtime.
          // 
-         // Solution: Use the existing unified model with cp.async loading:
-         //   - All warps cooperatively load and compute (no warp specialization)
-         //   - Loading done via flash_attn_ext_f16_load_tile with cp.async
-         //   - No separate producer loop needed
+         // The Blackwell kernel is structured for 1 producer + N consumer warps.
+         // For SM_120, we:
+         //   - Have producer warp (threadIdx.y=0) idle
+         //   - Have consumer warps (threadIdx.y=1-4) do all the work with cp.async
+         //   - Use num_consumers=4 so effective_nwarps=4 and warp_id mapping is correct
          //
-         // The process_tile function with use_tma=false already handles:
-         //   - cp.async loading via flash_attn_ext_f16_load_tile
-         //   - Two-stage pipelining when nstages > 1
-         //   - Proper synchronization with __syncthreads()
-         //
-         // This path does NOT require the producer loop because loading is
-         // integrated into the iter function for the non-TMA path.
+         // This ensures the work distribution matches the Blackwell config (4 compute warps).
          // =====================================================================
-         {
+         if (threadIdx.y != 0) {
+             // Consumer warps only
              constexpr bool is_fixup = false;
              constexpr bool needs_fixup = false;
-             // Use use_tma=false for SM_120 - loading is done via cp.async in iter function
-             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, 0, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
+             // Use num_consumers=4 (not 0) so warp_id = threadIdx.y - 1 maps correctly
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
                  Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
          }
+         // Producer warp (threadIdx.y=0) idles here for SM_120
 #else
          // =====================================================================
          // MBARRIER PATH (SM_90/SM_100/SM_103/SM_110)
