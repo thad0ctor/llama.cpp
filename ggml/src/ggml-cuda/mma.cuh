@@ -508,6 +508,106 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+    // ============================================================================
+    // SM_120 Optimized ldmatrix with Swizzle Support
+    // ============================================================================
+    // These functions apply XOR-based swizzling to eliminate bank conflicts
+    // when loading from shared memory. The swizzle pattern matches the layout
+    // used by the global_to_shared_swizzle() function in cp-async.cuh.
+    //
+    // Key optimization: ldmatrix.x4 loads 4 8x8 tiles in a single instruction,
+    // reducing instruction count in the hot MMA loop.
+    // Gau-Nernst saw 91% → 93% throughput improvement from this optimization.
+    // ============================================================================
+
+    // Swizzle function for ldmatrix address calculation
+    // STRIDE_BYTES = row stride in bytes (e.g., DIM * sizeof(half))
+    template <int STRIDE_BYTES>
+    static __device__ __forceinline__ uint32_t ldmatrix_swizzle_addr(uint32_t base_addr, int row, int col_bytes) {
+        // Calculate linear offset
+        uint32_t offset = row * STRIDE_BYTES + col_bytes;
+        
+        // Apply swizzle: XOR bits [4:6] with row-derived pattern
+        if constexpr (STRIDE_BYTES > 16) {
+            constexpr int rows_per_swizzle = (64 / STRIDE_BYTES) > 0 ? (64 / STRIDE_BYTES) : 1;
+            uint32_t row_mod8 = (offset / STRIDE_BYTES) % 8;
+            uint32_t xor_bits = row_mod8 / rows_per_swizzle;
+            offset ^= (xor_bits << 4);
+        }
+        
+        return base_addr + offset;
+    }
+
+    // ldmatrix.x4 with swizzle for 16x8 tile (most common in Flash Attention)
+    // Loads directly from swizzled shared memory layout
+    template <int STRIDE_BYTES, typename T, data_layout dl>
+    static __device__ __forceinline__ void load_ldmatrix_swizzle(
+            tile<16, 8, T, dl> & t, uint32_t smem_base, int row_offset, int col_offset_bytes) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int * ) t.x;
+        
+        // Calculate thread's address in swizzled layout
+        // ldmatrix requires 16-byte alignment. Each thread loads 4 bytes (one int = half2).
+        // t.J/2 = 4 elements, times sizeof(int) = 16 bytes = proper alignment
+        const int thread_row = (threadIdx.x % t.I) + row_offset;
+        const int thread_col = (threadIdx.x / t.I) * (t.J / 2) * sizeof(int);  // FIX: was sizeof(half)
+        
+        uint32_t addr = ldmatrix_swizzle_addr<STRIDE_BYTES>(smem_base, thread_row, col_offset_bytes + thread_col);
+        
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+            : "r"(addr));
+#else
+        GGML_UNUSED_VARS(t, smem_base, row_offset, col_offset_bytes);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
+    // ldmatrix.x4.trans with swizzle (for transposed B matrix loads)
+    template <int STRIDE_BYTES, typename T>
+    static __device__ __forceinline__ void load_ldmatrix_trans_swizzle(
+            tile<16, 8, T> & t, uint32_t smem_base, int row_offset, int col_offset_bytes) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int * ) t.x;
+        
+        // ldmatrix requires 16-byte alignment. t.J/2 * sizeof(int) = 4 * 4 = 16 bytes
+        const int thread_row = (threadIdx.x % t.I) + row_offset;
+        const int thread_col = (threadIdx.x / t.I) * (t.J / 2) * sizeof(int);  // FIX: was sizeof(half)
+        
+        uint32_t addr = ldmatrix_swizzle_addr<STRIDE_BYTES>(smem_base, thread_row, col_offset_bytes + thread_col);
+        
+        // Note: .trans variant reorders output registers for transposed load
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+            : "r"(addr));
+#else
+        GGML_UNUSED_VARS(t, smem_base, row_offset, col_offset_bytes);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
+    // ldmatrix.x2 with swizzle for 8x8 tile
+    template <int STRIDE_BYTES, typename T>
+    static __device__ __forceinline__ void load_ldmatrix_x2_swizzle(
+            tile<8, 8, T> & t, uint32_t smem_base, int row_offset, int col_offset_bytes) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int *) t.x;
+        
+        // ldmatrix requires 16-byte alignment. t.J/2 * sizeof(int) = 4 * 4 = 16 bytes
+        const int thread_row = (threadIdx.x % t.I) + row_offset;
+        const int thread_col = ((threadIdx.x / t.I) * (t.J / 2)) * sizeof(int);  // FIX: was sizeof(half)
+        
+        uint32_t addr = ldmatrix_swizzle_addr<STRIDE_BYTES>(smem_base, thread_row, col_offset_bytes + thread_col);
+        
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+            : "=r"(xi[0]), "=r"(xi[1])
+            : "r"(addr));
+#else
+        GGML_UNUSED_VARS(t, smem_base, row_offset, col_offset_bytes);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
     static __device__ __forceinline__ void mma(
             tile<16, 8, int> & D, const tile<16, 4, int> & A, const tile<8, 4, int> & B) {
 #ifdef TURING_MMA_AVAILABLE
