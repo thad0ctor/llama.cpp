@@ -265,9 +265,40 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        fprintf(stderr, "\n[MMQ MoE DEBUG] Launching mm_ids_helper...\n");
+        fprintf(stderr, "[MMQ MoE DEBUG] ne02=%ld, ne12=%ld, n_expert_used=%ld, ne11=%ld\n",
+                (long)ne02, (long)ne12, (long)n_expert_used, (long)ne11);
+        fprintf(stderr, "[MMQ MoE DEBUG] si1=%d, sis1=%d\n", si1, sis1);
+        fprintf(stderr, "[MMQ MoE DEBUG] ids_src1=%p (size=%ld elements)\n", 
+                (void*)ids_src1.get(), (long)ne_get_rows);
+        
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
         CUDA_CHECK(cudaGetLastError());
+        
+        // DEBUG: Sync and validate mm_ids_helper output
+        {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            fprintf(stderr, "[MMQ MoE DEBUG] mm_ids_helper completed\n");
+            
+            // Read back first few values to verify they're valid indices
+            std::vector<int32_t> ids_host(std::min((int64_t)16, ne_get_rows));
+            CUDA_CHECK(cudaMemcpy(ids_host.data(), ids_src1.get(), ids_host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            fprintf(stderr, "[MMQ MoE DEBUG] First %zu ids_src1 values: ", ids_host.size());
+            for (size_t i = 0; i < ids_host.size(); i++) {
+                fprintf(stderr, "%d ", ids_host[i]);
+            }
+            fprintf(stderr, "\n");
+            
+            // Check if values look valid (should be in range [0, ne12*sis1))
+            int64_t max_valid = ne12 * sis1;
+            for (size_t i = 0; i < ids_host.size(); i++) {
+                if (ids_host[i] < 0 || ids_host[i] >= max_valid) {
+                    fprintf(stderr, "[MMQ MoE DEBUG] WARNING: ids_src1[%zu]=%d is out of range [0, %ld)!\n",
+                            i, ids_host[i], (long)max_valid);
+                }
+            }
+        }
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +

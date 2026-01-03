@@ -138,6 +138,36 @@ static void launch_mm_ids_helper(
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+    
+    // DEBUG: Print mm_ids_helper parameters
+    {
+        static int call_count = 0;
+        call_count++;
+        fprintf(stderr, "\n[MM_IDS_HELPER #%d] ids=%p, ids_src1=%p, ids_dst=%p, expert_bounds=%p\n",
+                call_count, (void*)ids, (void*)ids_src1, (void*)ids_dst, (void*)expert_bounds);
+        fprintf(stderr, "[MM_IDS_HELPER #%d] n_experts=%d, n_tokens=%d, n_expert_used=%d\n",
+                call_count, n_experts, n_tokens, n_expert_used);
+        fprintf(stderr, "[MM_IDS_HELPER #%d] nchannels_y=%d, si1=%d, sis1=%d\n",
+                call_count, nchannels_y, si1, sis1);
+        
+        const int id = ggml_cuda_get_device();
+        const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+        const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+        fprintf(stderr, "[MM_IDS_HELPER #%d] device=%d, smpbo=%zu, nbytes_shared=%zu\n",
+                call_count, id, smpbo, nbytes_shared);
+        fprintf(stderr, "[MM_IDS_HELPER #%d] grid=(%d,1,1), block=(%d,1,1)\n",
+                call_count, n_experts, ggml_cuda_info().devices[id].warp_size);
+        
+        // Verify pointers are valid device memory
+        cudaPointerAttributes attr;
+        cudaError_t err = cudaPointerGetAttributes(&attr, ids);
+        fprintf(stderr, "[MM_IDS_HELPER #%d] ids pointer: valid=%d, type=%d\n", 
+                call_count, (err == cudaSuccess), attr.type);
+        err = cudaPointerGetAttributes(&attr, ids_src1);
+        fprintf(stderr, "[MM_IDS_HELPER #%d] ids_src1 pointer: valid=%d, type=%d\n",
+                call_count, (err == cudaSuccess), attr.type);
+    }
+    
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);

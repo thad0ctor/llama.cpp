@@ -332,22 +332,53 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    
+    // DEBUG: Check for pending errors from previous operations
+    if (ids) {
+        cudaError_t pending_err = cudaDeviceSynchronize();
+        if (pending_err != cudaSuccess) {
+            fprintf(stderr, "[QUANT Q8_1 CRITICAL] PENDING ERROR before launch: %s\n", cudaGetErrorString(pending_err));
+            fprintf(stderr, "[QUANT Q8_1 CRITICAL] This means a PREVIOUS kernel corrupted memory!\n");
+            GGML_ABORT("Previous kernel error detected");
+        }
+        fprintf(stderr, "[QUANT Q8_1] No pending errors, launching kernel...\n");
+    }
+    
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
+            fprintf(stderr, "[QUANT Q8_1] Using MMQ_Q8_1_DS_LAYOUT_D4 for type=%d\n", (int)type_src0);
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
+            fprintf(stderr, "[QUANT Q8_1] Using MMQ_Q8_1_DS_LAYOUT_DS4 for type=%d\n", (int)type_src0);
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            fprintf(stderr, "[QUANT Q8_1] Using MMQ_Q8_1_DS_LAYOUT_D2S6 for type=%d\n", (int)type_src0);
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         default:
             GGML_ABORT("fatal error");
             break;
+    }
+    
+    // DEBUG: Immediate check after kernel launch
+    if (ids) {
+        cudaError_t launch_err = cudaGetLastError();
+        if (launch_err != cudaSuccess) {
+            fprintf(stderr, "[QUANT Q8_1 CRITICAL] LAUNCH FAILED: %s\n", cudaGetErrorString(launch_err));
+        } else {
+            fprintf(stderr, "[QUANT Q8_1] Kernel launched OK, waiting for completion...\n");
+            cudaError_t exec_err = cudaStreamSynchronize(stream);
+            if (exec_err != cudaSuccess) {
+                fprintf(stderr, "[QUANT Q8_1 CRITICAL] KERNEL EXECUTION FAILED: %s\n", cudaGetErrorString(exec_err));
+            } else {
+                fprintf(stderr, "[QUANT Q8_1] Kernel completed successfully!\n");
+            }
+        }
     }
 }
 
