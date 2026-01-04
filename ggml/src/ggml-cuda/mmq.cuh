@@ -1201,67 +1201,29 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
     }
 
     // =========================================================================
-    // PHASE 2: Pre-load ALL dB scales into registers using warp shuffle
-    // Original: 8 threads read same address = 8-way bank conflict
-    // Optimized: Thread with matching lane reads, then broadcasts via shuffle
-    // =========================================================================
-    // For tile_C (16x8), get_j(l) = ((threadIdx.x % 4) * 2) + (l % 2)
-    // So j values are spread across threads 0-3 (each handles 2 j values)
-    // Threads 0,4,8,... handle j=0,1; threads 1,5,9,... handle j=2,3; etc.
-    constexpr int num_j_per_block = mmq_x / (ntx * tile_C::J);
-    float dB_cache[num_j_per_block][tile_C::J][MMQ_TILE_NE_K/QI8_0];
-
-    // Each thread in lane 0-3 loads scales for its j values
-    // Then we use shuffle to broadcast to threads 4-7, 8-11, etc.
-    const int lane_id = threadIdx.x % 4;
-
-#pragma unroll
-    for (int jb = 0; jb < num_j_per_block; ++jb) {
-        const int j0 = jb * ntx * tile_C::J;
-#pragma unroll
-        for (int jl = 0; jl < tile_C::J; jl += 4) {
-            // Thread lane 0-3 each loads 2 consecutive scales
-            const int j = j0 + jl + lane_id;
-#pragma unroll
-            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
-                float scale;
-                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
-                    scale = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
-                } else {
-                    scale = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
-                }
-                // Store in cache - each lane stores its own j's scale
-                dB_cache[jb][jl + lane_id][k01/QI8_0] = scale;
-            }
-        }
-    }
-    // Sync to ensure all scales are loaded before MMA phase
-    // Note: This is warp-level, threads 0-31 are synchronized by warp execution
-    __syncwarp();
-
-    // =========================================================================
-    // PHASE 3: Pure MMA compute loop - no shared memory accesses!
-    // All data (A tiles, dA scales, dB scales) already in registers
+    // PHASE 2: MMA compute loop with direct scale reads
+    // Each thread reads its own scales directly from shared memory.
+    // Note: A previous shuffle-based optimization was removed because get_j(l)
+    // returns different values for different lanes, breaking the shuffle logic.
     // =========================================================================
 #pragma unroll
     for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
-        const int jb = j0 / (ntx * tile_C::J);
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
             tile_B B;
-            // B tile load still needed (quantized data), but scales are cached
             load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
-            // Get dB from cache using shuffle
-            // tile_C::get_j(l) gives j offset: ((threadIdx.x % 4) * 2) + (l % 2)
+            // Each thread reads its own dB scales directly from shared memory
             float dB[tile_C::ne/2];
 #pragma unroll
             for (int l = 0; l < tile_C::ne/2; ++l) {
-                const int j_offset = tile_C::get_j(l);
-                // Broadcast from the thread that loaded this j's scale
-                const int src_lane = j_offset % 4;
-                float scale_from_cache = dB_cache[jb][j_offset][k01/QI8_0];
-                dB[l] = __shfl_sync(0xFFFFFFFF, scale_from_cache, src_lane + (threadIdx.x & ~3));
+                const int j = j0 + tile_C::get_j(l);
+
+                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                    dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                } else {
+                    dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                }
             }
 
 #pragma unroll
