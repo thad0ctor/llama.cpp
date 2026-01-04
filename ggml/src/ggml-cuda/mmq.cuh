@@ -257,12 +257,12 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
 // sm_120 OPTIMIZATION (RTX 5090):
 // With 8×8 tile loads, each row accesses 8 consecutive banks. Adjacent rows need
 // to be offset by at least 8 banks to avoid conflicts.
-// Stride 41 gives offset 9 banks per row (41 % 32 = 9), better than stride 37 (offset 5).
-// This reduces bank conflicts from ~3 per pair of adjacent rows to ~0.
+// Stride 40 gives offset 8 banks per row (40 % 32 = 8), providing good conflict avoidance.
+// Stride 40 also ensures 16-byte alignment for cp_async (40 * 4 bytes = 160, divisible by 16).
 //
 // IMPORTANT: Host and device MUST use the same tile size!
 // Use MMQ_TILE_Y_K_PAD_SM120 for sm_120 and 0 for other architectures.
-#define MMQ_TILE_Y_K_PAD_SM120 5
+#define MMQ_TILE_Y_K_PAD_SM120 4
 #define MMQ_TILE_Y_K_PAD_DEFAULT 0
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define MMQ_TILE_Y_K_PAD MMQ_TILE_Y_K_PAD_SM120
@@ -3807,27 +3807,38 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 __syncthreads();
             } else {
                 // sm_120 (Consumer Blackwell): 2-buffer, simple double-buffering
+                // IMPORTANT: Source has stride sz=36, destination has stride MMQ_TILE_Y_K=40
+                // We must use strided copy to avoid column misalignment
                 int * buf_A = tile_y_0;
                 int * buf_B = tile_y_0 + tile_y_size;
 
-                // Load Tile 0 into Buffer A
+                constexpr int chunks_per_col = sz / 4;  // 36 / 4 = 9 chunks per column
+                constexpr int total_chunks = mmq_x * chunks_per_col;
+
+                // Load Tile 0 into Buffer A (strided copy: src stride sz -> dst stride MMQ_TILE_Y_K)
                 {
                     const int * by0 = y_base;
 #pragma unroll
-                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
-                        const int offset = c * 4;
-                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_A + offset), by0 + offset);
+                    for (int c = tid; c < total_chunks; c += nthreads) {
+                        const int col = c / chunks_per_col;
+                        const int chunk_in_col = c % chunks_per_col;
+                        const int src_offset = col * sz + chunk_in_col * 4;
+                        const int dst_offset = col * MMQ_TILE_Y_K + chunk_in_col * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_A + dst_offset), by0 + src_offset);
                     }
                     cp_async_commit_group();
                 }
 
-                // Start loading Tile 1 into Buffer B (Async)
+                // Start loading Tile 1 into Buffer B (strided copy: src stride sz -> dst stride MMQ_TILE_Y_K)
                 {
                     const int * by1 = y_base + ncols_y * sz;
 #pragma unroll
-                    for (int c = tid; c < chunks_per_tile; c += nthreads) {
-                        const int offset = c * 4;
-                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_B + offset), by1 + offset);
+                    for (int c = tid; c < total_chunks; c += nthreads) {
+                        const int col = c / chunks_per_col;
+                        const int chunk_in_col = c % chunks_per_col;
+                        const int src_offset = col * sz + chunk_in_col * 4;
+                        const int dst_offset = col * MMQ_TILE_Y_K + chunk_in_col * 4;
+                        cp_async_cg_16<256>(ggml_cuda_cvta_generic_to_shared(buf_B + dst_offset), by1 + src_offset);
                     }
                     cp_async_commit_group();
                 }
@@ -4347,7 +4358,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         fprintf(stderr, "[MMQ DEBUG] nbytes_shared=%d (%.1f KB), max=99 KB\n", nbytes_shared, nbytes_shared / 1024.0f);
         fprintf(stderr, "[MMQ DEBUG] args: nrows_x=%d, ncols_x=%d, ncols_max=%d\n", args.nrows_x, args.ncols_x, args.ncols_max);
         fprintf(stderr, "[MMQ DEBUG] is_consumer_blackwell=%d\n", ggml_cuda_is_consumer_blackwell(cc));
-        fprintf(stderr, "[MMQ DEBUG] tile_y_k=%d (sm_120 needs pad=%d for stride 38)\n", tile_y_k, MMQ_TILE_Y_K_PAD_SM120);
+        fprintf(stderr, "[MMQ DEBUG] tile_y_k=%d (sm_120 pad=%d)\n", tile_y_k, MMQ_TILE_Y_K_PAD_SM120);
         fprintf(stderr, "[MMQ DEBUG] MMQ_MMA_TILE_X_K_Q8_0=%d, MMQ_MMA_TILE_X_K_Q8_0_SM120=%d\n", 
                 MMQ_MMA_TILE_X_K_Q8_0, MMQ_MMA_TILE_X_K_Q8_0_SM120);
         fprintf(stderr, "[MMQ DEBUG] ================================\n\n");
