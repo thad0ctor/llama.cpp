@@ -2628,15 +2628,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     // Check if we are in Consumer Mode (producer/consumer pipelining)
     extern __shared__ char smem[];
-    // SM_120 (RTX 5090): Uses unified mode with Ampere-style shared memory layout.
-    // All 4 warps do both load and compute - no producer/consumer split.
-    // Uses simple cp.async + __syncthreads() pattern (no mbarrier needed).
-    // Aligned with Gau-Nernst reference: https://gau-nernst.github.io/fa-5090/
+    // SM_120 (RTX 5090): Uses unified mode but MUST use the chunked memory layout
+    // to match the pointers calculated in flash_attn_ext_f16_blackwell.
     //
     // Other Blackwell (SM_100): Uses producer/consumer pipelining with mbarrier (consumer_mode = true).
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120: Use Ampere-style layout (unified mode, no chunked pipelining)
-    constexpr bool use_chunked_layout = false;  // Ampere layout for unified mode
+    // SM_120: Force chunked layout so process_tile finds tile_Q/K/V where the kernel put them
+    constexpr bool use_chunked_layout = true;
     constexpr bool set_pipeline_state = false;  // No consumer mode - all warps load and compute
 #else
     constexpr bool use_chunked_layout = (num_consumers > 0);  // Other archs only when pipelined
@@ -4208,8 +4206,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // New layout: [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask][pipeline_state][mbarriers]
     // Apply for ALL Blackwell (including SM_120 which uses cp.async but same shared memory layout)
     const auto config_bw = ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
-    // SM_120: use_tma_runtime=false but still needs Blackwell shared memory layout
-    const bool use_blackwell_shmem = ggml_cuda_has_blackwell_features(cc) && config_bw.num_consumers > 0;
+    // SM_120 (consumer Blackwell): num_consumers=0 (unified mode) but still needs Blackwell shared memory layout
+    // SM_100/103/110 (datacenter Blackwell): num_consumers>0 (producer/consumer mode)
+    const bool use_blackwell_shmem = ggml_cuda_has_blackwell_features(cc) &&
+                                     (config_bw.num_consumers > 0 || ggml_cuda_is_consumer_blackwell(cc));
     if (use_blackwell_shmem) {
         // K: 2 chunk buffers for double-buffering
         size_t bytes_K_chunk = config_bw.nbatch_fa * config_bw.nbatch_K2 * sizeof(half2);
