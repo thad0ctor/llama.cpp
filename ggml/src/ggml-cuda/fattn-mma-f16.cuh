@@ -746,10 +746,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
         const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
         const int stride_i = WARP_SIZE / stride_k;
 
-        // DEBUG: Track which unroll iteration does work
+        // DEBUG: Track which unroll iteration does work + count loads
         if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && k0_start != k0_stop) {
-            printf("[LOAD UNROLL] n=%d: stride_k=%d, k0=[%d,%d), stride_i=%d, nwarps=%d, warp_id=%d\n",
-                   (int)n, stride_k, k0_start, k0_stop, stride_i, nwarps, warp_id);
+            static int load_call_count = 0;
+            load_call_count++;
+            printf("[LOAD UNROLL] call#%d n=%d: stride_k=%d, k0=[%d,%d), stride_i=%d, nwarps=%d, warp_id=%d, base=0x%x\n",
+                   load_call_count, (int)n, stride_k, k0_start, k0_stop, stride_i, nwarps, warp_id, tile_KV_base);
         }
 
         if (k0_start == k0_stop) {
@@ -1767,6 +1769,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                __half2float(k_src_half[6]), __half2float(k_src_half[7]));
                         printf("[SM120 GMEM DEBUG] K_src=%p, k_VKQ_0=%d, stride_K=%d, k0_start=%d\n",
                                (void*)K_src, k_VKQ_0, stride_K, k0_start);
+                        
+                        // Also print K rows 1-3 from GMEM to verify source data
+                        const half* k_row1 = k_src_half + stride_K * 2;  // stride_K is in half2, so *2 for halfs
+                        const half* k_row2 = k_src_half + stride_K * 4;
+                        const half* k_row3 = k_src_half + stride_K * 6;
+                        printf("[SM120 GMEM DEBUG] K_row1[0..1]: (%f,%f), K_row2[0..1]: (%f,%f), K_row3[0..1]: (%f,%f)\n",
+                               __half2float(k_row1[0]), __half2float(k_row1[1]),
+                               __half2float(k_row2[0]), __half2float(k_row2[1]),
+                               __half2float(k_row3[0]), __half2float(k_row3[1]));
                     }
                     // --- END SM_120 DEBUG ---
 
@@ -2049,6 +2060,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // DEBUG: Print after K loop completes
     if (consumer_mode && threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
         printf("[CONSUMER DEBUG] K loop complete, starting softmax/V processing\n");
+    }
+
+    // DEBUG: Print KQ_C values after MMA (before softmax) to check for NaN source
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && kb0 == 0) {
+        bool kq_has_nan = false;
+        bool kq_has_inf = false;
+        for (int i = 0; i < nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J)); ++i) {
+            for (int l = 0; l < T_C_KQ::ne && l < 4; ++l) {
+                float v = KQ_C[i].x[l];
+                if (isnan(v)) kq_has_nan = true;
+                if (isinf(v)) kq_has_inf = true;
+            }
+        }
+        printf("[KQ DEBUG] After MMA, before softmax: KQ_C[0].x[0..3] = %f, %f, %f, %f\n",
+               KQ_C[0].x[0], KQ_C[0].x[1], KQ_C[0].x[2], KQ_C[0].x[3]);
+        if (kq_has_nan) printf("[KQ DEBUG] *** NaN DETECTED in KQ_C (from MMA)! ***\n");
+        if (kq_has_inf) printf("[KQ DEBUG] *** Inf DETECTED in KQ_C (from MMA)! ***\n");
     }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
