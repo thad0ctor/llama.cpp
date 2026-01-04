@@ -1276,6 +1276,9 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
                            threadIdx.x, C.x[0], C.x[1], C.x[2], C.x[3],
                            A[n][k01/QI8_0].x[0], A[n][k01/QI8_0].x[1], A[n][k01/QI8_0].x[2], A[n][k01/QI8_0].x[3],
                            B.x[0], B.x[1]);
+                    // Check scales - these should NOT be zero
+                    printf("[SCALES thread %d] dA[0][0][0]=%f dA[0][1][0]=%f dB[0]=%f dB[1]=%f\n",
+                           threadIdx.x, dA[0][0][0], dA[0][1][0], dB[0], dB[1]);
                 }
 
 #pragma unroll
