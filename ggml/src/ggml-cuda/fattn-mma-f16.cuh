@@ -106,65 +106,57 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 //   - Better memory bandwidth utilization
 //
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_sm120(const int DKQ, const int DV, const int ncols) {
-    
-    // ========== Small heads - 4 consumers (160 threads) ==========
-    // Chunking constraint: nbatch_K2 >= DKQ/2, nbatch_V2 >= DV/2
-    // Otherwise falls back to Ampere kernel!
-    // Loop constraint: nbatch_fa % (4×16) = nbatch_fa % 64 == 0
-    
+
+    // ========== SM_120 (RTX 5090) - Aligned with Gau-Nernst reference ==========
+    // Uses 4 warps (128 threads), ALL warps do both load and compute
+    // NO producer/consumer split - simpler and avoids warp divergence bugs
+    // Reference: https://gau-nernst.github.io/fa-5090/
+    //
+    // Key design choices:
+    //   - 128 threads = 4 warps (NUM_WARPS=4 in reference)
+    //   - num_consumers=0 means unified mode (no producer warp)
+    //   - All warps cooperatively load K/V via cp.async
+    //   - All warps compute attention in parallel
+    //   - nbatch_fa=128 to match reference BLOCK_Q=128
+
     if (DKQ == 64 && DV == 64) {
-        // nbatch_K2 >= 32, nbatch_V2 >= 32 to avoid chunking
-        // Shared mem: nbatch_fa × (nbatch_K2 + nbatch_V2) × 4 × 2
-        // 64 × (32 + 32) × 4 × 2 = 32KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 16, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 16, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 16, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 16, 2, true, 4);
+        // Shared mem: 128 × (32 + 32) × 4 × 2 = 64KB ✓
+        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
     }
     if (DKQ == 80 && DV == 80) {
-        // nbatch_K2=32 to fit SWIZZLE_128B, enables 2-chunk pipelining
-        // num_K_chunks = ceil(40/32) = 2
         // nbatch_combine=20 to satisfy (DV/2) % nbatch_combine == 0 → 40 % 20 = 0
-        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 20, 2, true, 4);
+        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
     }
-    
-    // ========== TIER 2: Medium heads - 4 consumers (160 threads) ==========
-    // Loop constraint: nbatch_fa % 64 == 0
-    // Chunking constraint: nbatch_K2 >= DKQ/2, nbatch_V2 >= DV/2
-    
+
+    // ========== Medium heads - 4 warps (128 threads) ==========
+
     if (DKQ == 96 && DV == 96) {
-        // nbatch_K2=32 to fit SWIZZLE_128B, enables 2-chunk pipelining
-        // num_K_chunks = ceil(48/32) = 2
         // nbatch_combine=24 to satisfy (DV/2) % nbatch_combine == 0 → 48 % 24 = 0
-        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 24, 2, true, 4);
+        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
     }
     if (DKQ == 112 && DV == 112) {
-        // nbatch_K2=32 to fit SWIZZLE_128B, enables 2-chunk pipelining
-        // num_K_chunks = ceil(56/32) = 2
         // nbatch_combine=28 to satisfy (DV/2) % nbatch_combine == 0 → 56 % 28 = 0
-        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 28, 2, true, 4);
+        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
     }
     if (DKQ == 128 && DV == 128) {
         // Most common: Llama, Mistral, Qwen, etc.
-        // nbatch_K2=32 enables chunking: (DKQ/2=64) > 32 = true
-        // 2 chunks per tile, each 128 bytes (fits SWIZZLE_128B)
-        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB for KV ✓
-        if (ncols <=  8) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
-        if (ncols <= 16) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
-        if (ncols <= 32) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, true, 4);
-        if (ncols <= 64) return fattn_mma_config(160, 1, 64, 32, 32, 32, 2, false, 4);
+        // This is the exact config from Gau-Nernst reference
+        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, false, 0);
     }
     
     // ========== Large heads - Fall back to Ampere ==========
@@ -1705,21 +1697,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const uint32_t tile_K_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);
                 const uint32_t tile_K_buf1 = ggml_cuda_cvta_generic_to_shared(tile_V);
                 
-                // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
+                // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
                 if (chunk == 0) {
                     // Issue first K load (K[0] into buffer 0)
-                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
+                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
                         K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K_buf0, nbatch_K2, stride_K);
                     cp_async_commit_group();
-                    
+
                     // If there's a next chunk, prefetch it into buffer 1
                     if (chunk + 1 < num_K_chunks) {
                         const int next_k0_start = (chunk + 1) * nbatch_K2;
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
                             K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, tile_K_buf1, nbatch_K2, stride_K);
                         cp_async_commit_group();
                     }
-                    
+
                     // Wait for K[0] to complete (allow 1 group in flight if prefetch was issued)
                     if (chunk + 1 < num_K_chunks) {
                         cp_async_wait_group<1>();
@@ -1731,7 +1723,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     if (chunk + 1 < num_K_chunks) {
                         const int next_k0_start = (chunk + 1) * nbatch_K2;
                         const uint32_t next_buf = (chunk % 2 == 0) ? tile_K_buf1 : tile_K_buf0;
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
                             K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, next_buf, nbatch_K2, stride_K);
                         cp_async_commit_group();
                         cp_async_wait_group<1>();
@@ -2122,10 +2114,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!last_iter) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
                 // SM_120: Use swizzled cp.async for K (next iteration preload)
-                // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
+                // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
                 constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
                 const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
+                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
                     K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K_base, nbatch_K2, stride_K);
 #else
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -2278,25 +2270,25 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const uint32_t tile_V_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);  // K is done
                     const uint32_t tile_V_buf1 = ggml_cuda_cvta_generic_to_shared(tile_V);
                     
-                    // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
+                    // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
                     if (v_chunk == 0) {
                         // Issue first V load (V[0] into buffer 0)
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 1>(
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 0>(
                             V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V_buf0, i0_diff/2, stride_V);
                         cp_async_commit_group();
-                        
+
                         // If there's a next V chunk, prefetch it into buffer 1
                         if (v_chunk + 1 < num_V_chunks) {
                             const int next_i0_start = (v_chunk + 1) * nbatch_V2 * 2;
                             const int next_i0_stop = (next_i0_start + 2*nbatch_V2 < DV) ? (next_i0_start + 2*nbatch_V2) : DV;
                             const int next_i0_diff = next_i0_stop - next_i0_start;
                             if (next_i0_start < reusable_cutoff) {
-                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 1>(
+                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 0>(
                                     V_h2 + int64_t(k_VKQ_0)*stride_V + next_i0_start/2, tile_V_buf1, next_i0_diff/2, stride_V);
                                 cp_async_commit_group();
                             }
                         }
-                        
+
                         // Wait for V[0] to complete
                         if (v_chunk + 1 < num_V_chunks) {
                             cp_async_wait_group<1>();
@@ -2312,11 +2304,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                             const int next_i0_diff = next_i0_stop - next_i0_start;
                             const uint32_t next_buf = (v_chunk % 2 == 0) ? tile_V_buf1 : tile_V_buf0;
                             if (next_i0_start < reusable_cutoff) {
-                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 1>(
+                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 0>(
                                     V_h2 + int64_t(k_VKQ_0)*stride_V + next_i0_start/2, next_buf, next_i0_diff/2, stride_V);
                                 cp_async_commit_group();
                             }
-                            
+
                             // Wait for current V chunk
                             cp_async_wait_group<1>();
                         } else {
@@ -2593,27 +2585,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     using     T_B_VKQ   = typename mma_tile_sizes<ncols>::T_B_VKQ;
     using     T_C_VKQ   = typename mma_tile_sizes<ncols>::T_C_VKQ;
 
-    // Consumer mode: use num_consumers as effective warp count, remap warp IDs
-    //   - With num_consumers=8: threadIdx.y 1-8 → warp_id 0-7
-    //   - Producer (threadIdx.y=0) doesn't call this function
-    // Unified mode: use nwarps with original threadIdx.y
-    // SM_120 FIX: Blackwell kernel launches 5 warps (1 producer + 4 consumers), but SM_120
-    // uses unified mode. We must use only 4 warps for compute (skip threadIdx.y=0) to match
-    // the Blackwell config which was designed for 4 consumer warps.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    constexpr int  effective_nwarps = nwarps - 1;  // 5 - 1 = 4 (match Blackwell consumer count)
-    const int      warp_id          = threadIdx.y - 1;  // Skip warp 0, use warps 1-4 as compute
-    if (threadIdx.y == 0) {
-        return;  // Producer warp exits early for SM_120 - only consumer warps compute
-    }
-    // DEBUG: Confirm process_tile is executing for consumer warps
-    if (threadIdx.x == 0 && warp_id == 0 && blockIdx.x == 0) {
-        printf("[PROCESS_TILE SM120] Entered! warp_id=%d, effective_nwarps=%d\n", warp_id, effective_nwarps);
-    }
-#else
+    // Warp configuration:
+    // - Consumer mode (num_consumers > 0): Use num_consumers warps, remap IDs (threadIdx.y 1-N → warp_id 0-(N-1))
+    // - Unified mode (num_consumers == 0): All warps do both load and compute (SM_120, Ampere)
+    //
+    // SM_120 (RTX 5090) uses unified mode with 4 warps - aligned with Gau-Nernst reference
     constexpr int  effective_nwarps = (num_consumers > 0) ? num_consumers : nwarps;
     const int      warp_id          = (num_consumers > 0) ? (threadIdx.y - 1) : threadIdx.y;
-#endif
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = 2; // This is specifically KQ columns, Volta only has a single VKQ column.
@@ -2643,16 +2621,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     // Check if we are in Consumer Mode (producer/consumer pipelining)
     extern __shared__ char smem[];
-    // SM_120 (RTX 5090): Uses chunked shared memory layout BUT NOT consumer mode.
-    // Consumer mode expects a producer warp to have loaded K/V, but SM_120's producer idles.
-    // Instead, SM_120 consumers load their own K/V via cp.async (consumer_mode = false).
+    // SM_120 (RTX 5090): Uses unified mode with Ampere-style shared memory layout.
+    // All 4 warps do both load and compute - no producer/consumer split.
+    // Uses simple cp.async + __syncthreads() pattern (no mbarrier needed).
+    // Aligned with Gau-Nernst reference: https://gau-nernst.github.io/fa-5090/
     //
     // Other Blackwell (SM_100): Uses producer/consumer pipelining with mbarrier (consumer_mode = true).
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120: Use chunked layout for shared memory BUT NOT consumer mode
-    // Consumers will load their own K/V data via cp.async
-    constexpr bool use_chunked_layout = true;   // For shared memory addressing
-    constexpr bool set_pipeline_state = false;  // Don't use consumer mode - load K/V ourselves
+    // SM_120: Use Ampere-style layout (unified mode, no chunked pipelining)
+    constexpr bool use_chunked_layout = false;  // Ampere layout for unified mode
+    constexpr bool set_pipeline_state = false;  // No consumer mode - all warps load and compute
 #else
     constexpr bool use_chunked_layout = (num_consumers > 0);  // Other archs only when pipelined
     constexpr bool set_pipeline_state = (num_consumers > 0);  // Use consumer mode when pipelined
@@ -2667,6 +2645,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int bytes_Q = ncols * stride_tile_Q_local * sizeof(half2);
         constexpr int bytes_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
         // Only set pipeline_state for true producer/consumer mode (not SM_120)
+        // SM_120: pipeline_state stays nullptr - consumers load K/V/mask themselves via cp.async
+        // Other archs: pipeline_state set when using producer/consumer pipelining
         if constexpr (set_pipeline_state) {
             pipeline_state = (fattn_pipeline_state*)(smem + bytes_KV_total + bytes_Q + bytes_mask);
             pipeline_stage = 0; // Initial stage
@@ -2696,9 +2676,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             printf("[SMEM BOUNDS]   V_chunk[1] = smem+%d = %p\n", 2*bytes_K_chunk + bytes_V_chunk, smem + 2*bytes_K_chunk + bytes_V_chunk);
             printf("[SMEM BOUNDS]   Q_tiles    = smem+%d = %p\n", bytes_KV_total, smem + bytes_KV_total);
             printf("[SMEM BOUNDS]   mask       = smem+%d = %p\n", bytes_KV_total + bytes_Q, smem + bytes_KV_total + bytes_Q);
-            printf("[SMEM BOUNDS]   pipeline   = smem+%d = %p\n", bytes_KV_total + bytes_Q + bytes_mask, (void*)pipeline_state);
+            // Show both the computed pipeline address AND whether it's actually used
+            const int pipeline_offset = bytes_KV_total + bytes_Q + bytes_mask;
+            printf("[SMEM BOUNDS]   pipeline_addr = smem+%d = %p\n", pipeline_offset, (void*)(smem + pipeline_offset));
+            printf("[SMEM BOUNDS]   pipeline_state = %p (null means SM_120 loads K/V itself)\n", (void*)pipeline_state);
             printf("[SMEM BOUNDS] Config: nbatch_fa=%d, nbatch_K2=%d, nbatch_V2=%d\n", nbatch_fa, nbatch_K2, nbatch_V2);
-            printf("[SMEM BOUNDS] Config: DKQ=%d, DV=%d, ncols=%d\n", DKQ, DV, ncols);
+            printf("[SMEM BOUNDS] Config: DKQ=%d, DV=%d, ncols=%d, nstages=%d\n", DKQ, DV, ncols, nstages);
             printf("[SMEM BOUNDS] =============================================\n\n");
         }
     }
@@ -2929,10 +2912,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         } else {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120: Use swizzled cp.async for K preload
-            // warp_id_offset=1 because consumer warps have threadIdx.y = 1..num_consumers
+            // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
             constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
             const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 1>(
+            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
                 K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K_base, nbatch_K2, stride_K);
 #else
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
