@@ -1089,6 +1089,10 @@ void launch_fattn(
         }
     }
     
+    // CRITICAL FIX: Explicit casts to match kernel signature types.
+    // The kernel expects int32_t for nb01/nb02/nb03, nb11/nb12, nb21/nb22, nb31/nb32
+    // but Q->nb[], K->nb[], V->nb[], mask->nb[] are size_t (64-bit).
+    // Without casts, CUDA parameter buffer gets misaligned, corrupting all subsequent params!
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,
         K_data,
@@ -1098,11 +1102,13 @@ void launch_fattn(
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
-        nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        (int32_t)Q->ne[0], ne01, (int32_t)Q->ne[2], (int32_t)Q->ne[3],
+        (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
+        (int32_t)K->ne[0], (int32_t)K->ne[1], (int32_t)K->ne[2], (int32_t)K->ne[3],
+        (int32_t)nb11, (int32_t)nb12, (int64_t)nb13,
+        (int32_t)nb21, (int32_t)nb22, (int64_t)nb23,
+        mask ? (int32_t)mask->ne[1] : 0, mask ? (int32_t)mask->ne[2] : 0, mask ? (int32_t)mask->ne[3] : 0,
+        mask ? (int32_t)mask->nb[1] : 0, mask ? (int32_t)mask->nb[2] : 0, mask ? (int64_t)mask->nb[3] : 0,
         args...
     );
     
