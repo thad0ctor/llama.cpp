@@ -305,7 +305,8 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
 }
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
-#if defined(BLACKWELL_MMA_AVAILABLE)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    // SM_120: Use Blackwell config (direct arch check, not macro)
     return ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
 #elif defined(AMPERE_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
@@ -3568,22 +3569,15 @@ __global__ void flash_attn_ext_f16_blackwell(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
                             const char * __restrict__ tensor_maps)
 {
-    // DEBUG: UNCONDITIONAL - outside any #ifdef - confirm kernel entry
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    // DEBUG: Confirm kernel entry on SM_120
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
-        printf("[BLACKWELL KERNEL ENTRY] flash_attn_ext_f16_blackwell called!\n");
+        printf("[BLACKWELL KERNEL ENTRY] flash_attn_ext_f16_blackwell called! __CUDA_ARCH__=%d\n", __CUDA_ARCH__);
         printf("[BLACKWELL KERNEL ENTRY] blockDim=(%d,%d,%d), DKQ=%d, DV=%d\n",
                blockDim.x, blockDim.y, blockDim.z, DKQ, DV);
-#ifdef BLACKWELL_TMA_AVAILABLE
-        printf("[BLACKWELL KERNEL ENTRY] BLACKWELL_TMA_AVAILABLE=YES\n");
-#else
-        printf("[BLACKWELL KERNEL ENTRY] BLACKWELL_TMA_AVAILABLE=NO (kernel body skipped!)\n");
-#endif
     }
     __syncthreads();
-
-#ifdef BLACKWELL_MMA_AVAILABLE
-    // Blackwell kernel body - uses MMA (available on both sm_100 and sm_120)
-    // TMA vs cp.async is controlled by the use_tma template parameter, not this guard
+    // SM_120 kernel body - direct architecture check (not macro-based)
     // EARLY DEBUG: Check if kernel even starts
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
         printf("[KERNEL DEBUG] Blackwell kernel ENTRY - block=(%d,%d,%d) thread=(%d,%d)\n",
