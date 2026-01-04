@@ -648,8 +648,22 @@ static __global__ void flash_attn_stream_k_fixup(
     const bool did_not_have_any_data   = kbc0 == kbc0_stop;
     const bool wrote_beginning_of_tile = kbc0 % iter_k == 0;
     const bool did_not_write_last      = kbc0/iter_k == kbc0_stop/iter_k && kbc0_stop % iter_k != 0;
+    // DEBUG: Trace fixup kernel entry for first few blocks
+    if (bidx0 < 2 && j == 0 && c == 0 && tid == 0) {
+        printf("[FIXUP ENTRY] bidx0=%d j=%d c=%d: kbc0=%d kbc0_stop=%d iter_k=%d iter_j=%d\n",
+               bidx0, j, c, kbc0, kbc0_stop, iter_k, iter_j);
+        printf("[FIXUP ENTRY]   did_not_have_any_data=%d wrote_beginning_of_tile=%d did_not_write_last=%d\n",
+               did_not_have_any_data, wrote_beginning_of_tile, did_not_write_last);
+    }
+
     if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
         return;
+    }
+
+    // DEBUG: This block will modify the output!
+    if (j == 0 && c == 0 && tid == 0) {
+        printf("[FIXUP ACTIVE] bidx0=%d WILL MODIFY OUTPUT! kbc0=%d kbc0_stop=%d\n",
+               bidx0, kbc0, kbc0_stop);
     }
 
     const int sequence = kbc0 / (iter_k*iter_j*(ne02/ncols2));
@@ -672,6 +686,12 @@ static __global__ void flash_attn_stream_k_fixup(
         const float2 tmp = dst_fixup[bidx0*ncols + jc];
         max_val = tmp.x;
         rowsum  = tmp.y;
+    }
+
+    // DEBUG: Show loaded values for first thread
+    if (j == 0 && c == 0 && tid == 0) {
+        printf("[FIXUP LOAD] bidx0=%d: dst_val=%f max_val=%f rowsum=%f\n",
+               bidx0, dst_val, max_val, rowsum);
     }
 
     // Iterate over previous blocks and compute the combined results.
@@ -699,6 +719,14 @@ static __global__ void flash_attn_stream_k_fixup(
         const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
         const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
 
+        // DEBUG: Show scaling values
+        if (j == 0 && c == 0 && tid == 0) {
+            printf("[FIXUP COMBINE] bidx0=%d bidx=%d: max_val=%f tmp.x=%f diff_val=%f diff_add=%f\n",
+                   bidx0, bidx, max_val, tmp.x, diff_val, diff_add);
+            printf("[FIXUP COMBINE]   scale_val=%f scale_add=%f dst_add=%f tmp.y=%f\n",
+                   scale_val, scale_add, dst_add, tmp.y);
+        }
+
         dst_val = scale_val*dst_val + scale_add*dst_add;
         rowsum  = scale_val*rowsum  + scale_add*tmp.y;
 
@@ -710,6 +738,16 @@ static __global__ void flash_attn_stream_k_fixup(
         }
         bidx--;
         kbc_stop = kbc;
+    }
+
+    // DEBUG: Show final values before write
+    if (j == 0 && c == 0 && tid == 0) {
+        const float final_val = dst_val / rowsum;
+        printf("[FIXUP WRITE] bidx0=%d: dst_val=%f rowsum=%f final=%f\n",
+               bidx0, dst_val, rowsum, final_val);
+        if (isnan(final_val) || isinf(final_val) || fabsf(final_val) < 1e-20f) {
+            printf("[FIXUP WRITE] *** WARNING: Writing bad value! ***\n");
+        }
     }
 
     // Write back final result:

@@ -2093,6 +2093,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     if (!consumer_mode) {
         cp_async_wait_group<0>();  // All groups complete (V is ready)
         __syncthreads();
+
+        // --- DEBUG: Verify V tile contents after load ---
+        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && kb0 == 0) {
+            const half* v_smem = (const half*)tile_V;
+            bool v_has_nan = false;
+            bool v_has_inf = false;
+            // Check first 64 values of V tile
+            for (int i = 0; i < 64; ++i) {
+                float val = __half2float(v_smem[i]);
+                if (isnan(val)) v_has_nan = true;
+                if (isinf(val)) v_has_inf = true;
+            }
+            printf("[V TILE DEBUG] After cp_async wait - V tile first 8 values:\n");
+            printf("[V TILE DEBUG] v[0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                   __half2float(v_smem[0]), __half2float(v_smem[1]),
+                   __half2float(v_smem[2]), __half2float(v_smem[3]),
+                   __half2float(v_smem[4]), __half2float(v_smem[5]),
+                   __half2float(v_smem[6]), __half2float(v_smem[7]));
+            if (v_has_nan) printf("[V TILE DEBUG] *** NaN DETECTED in V tile! ***\n");
+            if (v_has_inf) printf("[V TILE DEBUG] *** Inf DETECTED in V tile! ***\n");
+        }
+        // --- END DEBUG ---
     }
 #endif
 
@@ -2666,6 +2688,45 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     }
+
+    // --- DEBUG: Check VKQ accumulators for NaN after all V chunks processed ---
+    // This runs for ALL threads (not just thread 0) to catch NaN in any lane
+    {
+        bool vkq_has_nan = false;
+        bool vkq_has_inf = false;
+#if defined(TURING_MMA_AVAILABLE)
+        constexpr int vkq_size = (cols_per_warp == 8) ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J);
+#else
+        constexpr int vkq_size = DV/(2*T_C_VKQ::J);
+#endif
+        for (int i = 0; i < vkq_size; ++i) {
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                // VKQ_C[i].x[l] is a half2, convert to float2
+                float2 vals = __half22float2(VKQ_C[i].x[l]);
+                if (isnan(vals.x) || isnan(vals.y)) vkq_has_nan = true;
+                if (isinf(vals.x) || isinf(vals.y)) vkq_has_inf = true;
+            }
+        }
+        // Print NaN occurrences for first few threads
+        if (vkq_has_nan || vkq_has_inf) {
+            if (threadIdx.x < 4) {  // Limit output
+                float2 v0 = __half22float2(VKQ_C[0].x[0]);
+                float2 v1 = __half22float2(VKQ_C[0].x[1]);
+                printf("[VKQ NaN DEBUG] Block=%d Warp=%d Thread=%d: NaN=%d Inf=%d in VKQ_C after V loop\n",
+                       blockIdx.x, warp_id, threadIdx.x, vkq_has_nan ? 1 : 0, vkq_has_inf ? 1 : 0);
+                printf("[VKQ NaN DEBUG]   VKQ_C[0].x[0..1] = (%f,%f), (%f,%f)\n",
+                       v0.x, v0.y, v1.x, v1.y);
+            }
+        }
+        // Also print first warp's values for reference (only on first kb0 iteration)
+        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && kb0 == 0) {
+            float2 v0 = __half22float2(VKQ_C[0].x[0]);
+            float2 v1 = __half22float2(VKQ_C[0].x[1]);
+            printf("[VKQ DEBUG] Block=0 Warp=0 Thread=0: VKQ_C[0].x[0..1] = (%f,%f), (%f,%f)\n",
+                   v0.x, v0.y, v1.x, v1.y);
+        }
+    }
+    // --- END DEBUG ---
 
     if (!consumer_mode && nstages > 1 && mla) {
         // Preload K for next iteration:
@@ -3468,24 +3529,52 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             }
                         }
 
-                        // DEBUG: Check for NaN before writing output
+                        // DEBUG: Check for NaN before writing output (print for ALL threads with NaN, not just thread 0)
                         if (isnan(dstk_val.x) || isnan(dstk_val.y) || isinf(dstk_val.x) || isinf(dstk_val.y)) {
-                            if (threadIdx.x == 0) {
-                                printf("[FA KERNEL NaN] Block %d warp %d: NaN in dstk_val! x=%f y=%f\n",
-                                       blockIdx.x, warp_id, dstk_val.x, dstk_val.y);
-                                printf("[FA KERNEL NaN] jc_dst=%d k=%d j_dst=%d c_dst=%d\n",
-                                       jc_dst, k, j_dst, c_dst);
+                            // Print for first 4 threads to limit output
+                            if (threadIdx.x < 4) {
+                                printf("[FA KERNEL NaN] Block=%d Warp=%d Thread=%d: NaN/Inf in dstk_val! x=%f y=%f\n",
+                                       blockIdx.x, warp_id, threadIdx.x, dstk_val.x, dstk_val.y);
+                                printf("[FA KERNEL NaN]   jc_dst=%d k=%d j_dst=%d c_dst=%d jt=%d\n",
+                                       jc_dst, k, j_dst, c_dst, jt);
+                                printf("[FA KERNEL NaN]   tile_Q read index: %d, dstk_val_add source\n",
+                                       (jc_tile_K)*tile_stride + k);
                                 if constexpr (!needs_fixup && !is_fixup) {
                                     const float KQ_rowsum_j = meta_j[1];
-                                    printf("[FA KERNEL NaN] KQ_rowsum_j=%f (division by this)\n", KQ_rowsum_j);
+                                    printf("[FA KERNEL NaN]   KQ_rowsum_j=%f meta_j[0]=%f\n", KQ_rowsum_j, meta_j[0]);
                                 }
                             }
+                        }
+
+                        // DEBUG: Comprehensive kernel write check - shows pointer comparison
+                        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && k00 == 0 && k0 == k0_start && jc0_dst == 0) {
+                            const size_t final_idx = ((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k;
+                            float2* final_ptr = &dstk[final_idx];
+
+                            printf("\n!! KERNEL WRITE CHECK !!\n");
+                            printf("  - is_fixup: %d\n", is_fixup);
+                            printf("  - Writing value: (%f, %f)\n", dstk_val.x, dstk_val.y);
+                            printf("  - Index calculation: jt=%d ncols1=%d j_dst=%d ne02=%d c_dst=%d DV=%d k00=%d k=%d\n",
+                                   jt, ncols1, j_dst, ne02, c_dst, DV, k00, k);
+                            printf("  - Final index: %zu\n", final_idx);
+                            printf("  - Base Pointer (dstk): %p\n", (void*)dstk);
+                            printf("  - Final Pointer: %p\n", (void*)final_ptr);
+                            printf("  - Fixup Base (dstk_fixup): %p\n\n", (void*)dstk_fixup);
                         }
 
                         if (is_fixup) {
                             dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
                         } else {
                             dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = dstk_val;
+                        }
+
+                        // DEBUG: Verify write by reading back (only for first element)
+                        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && k00 == 0 && k0 == k0_start && jc0_dst == 0 && !is_fixup) {
+                            __threadfence(); // Ensure write is visible
+                            const size_t final_idx = ((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k;
+                            float2 readback = dstk[final_idx];
+                            printf("!! KERNEL WRITE VERIFY !! Readback at idx %zu: (%f, %f)\n\n",
+                                   final_idx, readback.x, readback.y);
                         }
                     }
                 }
