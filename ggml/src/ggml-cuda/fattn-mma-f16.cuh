@@ -2919,7 +2919,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     //
     // OOB check strategy:
     // - Main loop (full tiles): oob_check=false - all rows are valid
-    // - Last iteration (potentially partial): oob_check=true - may have fewer valid rows
+    // - Last iteration (potentially partial): oob_check=true when nstages==1
+    //   Note: oob_check is incompatible with multi-stage pipeline (nstages > 1),
+    //   so we can only enable it when nstages == 1. For nstages > 1, bounds are
+    //   handled via the k_VKQ_sup runtime parameter.
+    constexpr bool oob_check_last = (nstages == 1);
+
     if constexpr (ncols2 == 1) {
         for (; kb0 < kb0_stop-1; ++kb0) {
             // Compute stage for this iteration (consumer mode only)
@@ -2938,12 +2943,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 phase_V ^= 1;
             }
         }
-        // Last iteration - enable OOB check for potentially partial tile
+        // Last iteration - enable OOB check when compatible (nstages == 1)
         const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, /* oob_check= */ true, use_tma,
+            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check_last, use_tma,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -2967,12 +2972,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 phase_V ^= 1;
             }
         }
-        // Last iteration - enable OOB check for potentially partial tile
+        // Last iteration - enable OOB check when compatible (nstages == 1)
         const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, /* oob_check= */ true, use_tma,
+            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check_last, use_tma,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
