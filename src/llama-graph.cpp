@@ -1423,10 +1423,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     if (cparams.flash_attn && kq_b == nullptr) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
-        // Flash attention kernels require K/V to be physically contiguous after permute.
+        // Flash attention kernels require Q/K/V to be physically contiguous after permute.
         // The permute above changes logical dimension order but preserves original strides,
         // which causes the kernel to read from incorrect memory locations.
-        // Making K/V contiguous ensures the physical memory layout matches the logical dimensions.
+        // Making Q/K/V contiguous ensures the physical memory layout matches the logical dimensions.
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_cont(ctx0, q);
+        }
         if (!ggml_is_contiguous(k)) {
             k = ggml_cont(ctx0, k);
         }
