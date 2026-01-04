@@ -772,6 +772,13 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
         x_df[i*MMQ_MMA_TILE_X_K_Q8_0_SM120                 + kbxd] = bxi->d;
     }
+
+    // Debug: verify stride used during load
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+        printf("[LOAD_SM120] stride=%d, x_qs[0]=%d, x_qs[stride]=%d, x_qs[2*stride]=%d\n",
+               MMQ_MMA_TILE_X_K_Q8_0_SM120, x_qs[0], x_qs[MMQ_MMA_TILE_X_K_Q8_0_SM120], x_qs[2*MMQ_MMA_TILE_X_K_Q8_0_SM120]);
+    }
 }
 #endif
 
@@ -1154,6 +1161,12 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
     // =========================================================================
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
+
+    // Debug: verify stride used during dot product read
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k00 == 0) {
+        printf("[DOT_SM120] stride=%d, x_qs[0]=%d, x_qs[stride]=%d, x_qs[2*stride]=%d\n",
+               MMQ_MMA_TILE_X_K_Q8_0_SM120, x_qs[0], x_qs[MMQ_MMA_TILE_X_K_Q8_0_SM120], x_qs[2*MMQ_MMA_TILE_X_K_Q8_0_SM120]);
+    }
 
 #pragma unroll
     for (int n = 0; n < ntx; ++n) {
