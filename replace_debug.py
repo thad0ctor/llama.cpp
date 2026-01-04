@@ -24,9 +24,16 @@ def process_file(filepath):
         content = f.read()
 
     # Pattern 1: fprintf(stderr, "[\n]..."
-    # We match fprintf(stderr, followed by whitespace, then a string literal starting with [ or \n[
-    # Regex: fprintf\(stderr,\s*"(?:\\n)?\[
-    # Replacement: DEBUG_PRINT("...
+    # Replacement: DEBUG_PRINT("..."
+    # We want to replace 'fprintf(stderr, "' with 'DEBUG_PRINT("'
+    # ONLY IF the string starts with optional \n then [
+    
+    # Regex breakdown:
+    # fprintf\(stderr,\s*"  : matches fprintf(stderr, "
+    # (                     : start capture group 1
+    #   (?:\\n)?            : optional literal \n
+    #   \[                  : literal [
+    # )                     : end capture group 1
     
     # Using a function for replacement to handle the exact string start
     def repl_fprintf(match):

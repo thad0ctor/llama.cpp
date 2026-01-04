@@ -1269,6 +1269,15 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
                 tile_C C;
                 mma(C, A[n][k01/QI8_0], B);
 
+                // Debug: check MMA output for threads that compute rows 0,1,2,3
+                if ((threadIdx.x == 0 || threadIdx.x == 4 || threadIdx.x == 8 || threadIdx.x == 12) &&
+                    threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k00 == 0 && k01 == 0 && j0 == 0 && n == 0) {
+                    printf("[MMA thread %d] C.x=[%d,%d,%d,%d] A.x=[%d,%d,%d,%d] B.x=[%d,%d]\n",
+                           threadIdx.x, C.x[0], C.x[1], C.x[2], C.x[3],
+                           A[n][k01/QI8_0].x[0], A[n][k01/QI8_0].x[1], A[n][k01/QI8_0].x[2], A[n][k01/QI8_0].x[3],
+                           B.x[0], B.x[1]);
+                }
+
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
