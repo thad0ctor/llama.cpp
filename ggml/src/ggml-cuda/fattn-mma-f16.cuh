@@ -1476,16 +1476,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     const int      warp_id          = (num_consumers > 0) ? (threadIdx.y - 1) : threadIdx.y;
 
     constexpr int  np              = effective_nwarps * (cols_per_warp/ncols2) / ncols1; // Number of parallel CUDA warps per Q column.
-    // SM_120 uses Blackwell kernel with cp.async (use_tma=false but Blackwell shared memory layout)
-    // Other archs: use_tma=false means Ampere config, use_tma=true means Blackwell config
+    // Config selection:
+    // - SM_120 (__CUDA_ARCH__ >= 1200): Use SM_120 configs (unified mode, 4 warps, nbatch_fa=128)
+    // - Other Blackwell (use_tma=true): Use Blackwell TMA configs
+    // - Ampere/Turing (use_tma=false): Use Ampere configs
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120: Always use Blackwell configs - shared memory was allocated using these
-    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2);
+    // SM_120: Use dedicated SM_120 configs (routes via get_config_blackwell → get_config_sm120)
+    constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
+    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
+    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
+    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
+    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2);
 #else
+    // Other archs: use_tma determines Blackwell TMA vs Ampere config
     constexpr int  nbatch_fa       = use_tma ? ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nbatch_fa_ampere(DKQ, DV, ncols);
     constexpr int  nbatch_K2       = use_tma ? ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nbatch_K2_ampere(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = use_tma ? ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nbatch_V2_ampere(DKQ, DV, ncols);
@@ -2596,10 +2599,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = 2; // This is specifically KQ columns, Volta only has a single VKQ column.
     constexpr int  np              = effective_nwarps * (cols_per_warp/ncols2) / ncols1; // Number of parallel CUDA warps per Q column.
-    // SM_120 uses Blackwell kernel with cp.async (use_tma=false but Blackwell shared memory layout)
-    // Other archs: use_tma=false means Ampere config, use_tma=true means Blackwell config
+    // Config selection:
+    // - SM_120 (__CUDA_ARCH__ >= 1200): Use SM_120 configs (unified mode, 4 warps, nbatch_fa=128)
+    // - Other Blackwell (use_tma=true): Use Blackwell TMA configs
+    // - Ampere/Turing (use_tma=false): Use Ampere configs
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120: Always use Blackwell configs - shared memory was allocated using these
+    // SM_120: Use dedicated SM_120 configs (routes via get_config_blackwell → get_config_sm120)
     constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
@@ -2607,6 +2612,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2);
 #else
+    // Other archs: use_tma determines Blackwell TMA vs Ampere config
     constexpr int  nbatch_fa       = use_tma ? ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nbatch_fa_ampere     (DKQ, DV, ncols);
     constexpr int  nbatch_K2       = use_tma ? ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nbatch_K2_ampere     (DKQ, DV, ncols);
     constexpr int  nbatch_V2       = use_tma ? ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nbatch_V2_ampere     (DKQ, DV, ncols);
@@ -3595,9 +3601,10 @@ __global__ void flash_attn_ext_f16_blackwell(
     constexpr int nbatch_V2 = config.nbatch_V2;
     constexpr int nstages = config.nstages_target;
     constexpr int num_consumers = config.num_consumers;
-    // nwarps for tiling = num_consumers (8), not total warps (9)
-    // Producer warp (threadIdx.y=0) doesn't participate in consumer work
-    constexpr int nwarps = num_consumers;
+    // nwarps for tiling:
+    // - Producer/consumer mode (num_consumers > 0): nwarps = num_consumers
+    // - Unified mode (num_consumers == 0): nwarps = total threads / WARP_SIZE (SM_120)
+    constexpr int nwarps = (num_consumers > 0) ? num_consumers : (config.nthreads / WARP_SIZE);
 
     extern __shared__ char smem[];
     // New shared memory layout for k0-chunk pipelining (double-buffering within loops):
@@ -4306,7 +4313,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         // SM_120 always uses Blackwell kernel with cp.async; other Blackwell needs TMA
         const bool use_blackwell = ggml_cuda_is_consumer_blackwell(cc) ||
                                    (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime);
-        if (use_blackwell && config_bw.num_consumers > 0) {
+        // SM_120: num_consumers=0 (unified mode), still uses Blackwell kernel with SM_120 configs
+        // Other Blackwell: num_consumers>0 (producer/consumer mode)
+        if (use_blackwell && (config_bw.num_consumers > 0 || ggml_cuda_is_consumer_blackwell(cc))) {
             // Check chunk count - double-buffering supports exactly 2 chunks per dimension
             // num_K_chunks = ceil(DKQ/2 / nbatch_K2), num_V_chunks = ceil(DV/2 / nbatch_V2)
             // With nbatch_K2=32 for DKQ=128: num_K_chunks = 64/32 = 2 (perfect for double-buffer)
