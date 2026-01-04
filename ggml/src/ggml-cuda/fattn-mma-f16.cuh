@@ -3781,11 +3781,11 @@ __global__ void flash_attn_ext_f16_blackwell(
     // Check loop condition
     const bool loop_cond = (kbc < kbc_stop);
     if (threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("[ALL BLOCKS] Block %d: loop_cond=%d (kbc<kbc_stop=%d, kb0_stop==iter_k=%d)\n", 
-               blockIdx.x, loop_cond, kbc < kbc_stop, kb0_stop == iter_k);
+        printf("[ALL BLOCKS] Block %d: loop_cond=%d (kbc=%d < kbc_stop=%d)\n",
+               blockIdx.x, loop_cond, kbc, kbc_stop);
     }
 
-    while (kbc < kbc_stop && kb0_stop == iter_k) {
+    while (kbc < kbc_stop) {
         if (threadIdx.x == 0 && threadIdx.y == 0) {
             printf("[LOOP] Block %d: ENTERED while loop, kbc=%d\n", blockIdx.x, kbc);
         }
