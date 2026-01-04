@@ -721,23 +721,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 // Parameters:
 //   stride_tile: destination stride in half2 (same as regular load_tile)
 //   STRIDE_BYTES: row stride in bytes for swizzle calculation (stride_tile * sizeof(half2))
+//   oob_check: if true, check if row index is within i_sup bounds before issuing cp.async
+//   i_sup: upper bound for valid row indices (only used if oob_check is true)
 // ------------------------------------------------------------------------------------------------------------------
-template<int stride_tile, int STRIDE_BYTES, int nwarps, int nbatch_fa, int warp_id_offset = 0>
+template<int stride_tile, int STRIDE_BYTES, int nwarps, int nbatch_fa, int warp_id_offset = 0, bool oob_check = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
-        const half2 * const __restrict__ KV, 
+        const half2 * const __restrict__ KV,
         uint32_t tile_KV_base,  // Shared memory base address (32-bit)
-        const int D2, 
-        const int stride_KV) {
+        const int D2,
+        const int stride_KV,
+        const int i_sup = nbatch_fa) {
 #if defined(CP_ASYNC_AVAILABLE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     constexpr int preload = 64;
     constexpr int h2_per_chunk = 16/sizeof(half2);  // 4 half2 per 16B copy
     const int chunks_per_row = D2 / h2_per_chunk;
-    
+
     // For SM_120 consumer warps: threadIdx.y is 1-4, but we need warp_id 0-3
     // warp_id_offset allows caller to specify the offset (e.g., 1 for consumer warps)
     const int warp_id = threadIdx.y - warp_id_offset;
 
-    auto load = [&, warp_id] __device__ (auto n) { 
+    auto load = [&, warp_id] __device__ (auto n) {
         const int stride_k = WARP_SIZE >> n;
         const int k0_start = stride_k == WARP_SIZE ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
         const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
@@ -755,13 +758,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
                 break;
             }
 
+            // Check if this row is within valid bounds (only when oob_check is enabled)
+            const bool valid_row = !oob_check || (i < i_sup);
+
 #pragma unroll
             for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                 const int k = k0 + (stride_k == WARP_SIZE ? threadIdx.x : threadIdx.x % stride_k);
 
                 // Calculate unswizzled offset in bytes
                 uint32_t offset_bytes = i * STRIDE_BYTES + k * 16;
-                
+
                 // Apply swizzle: XOR bits [4:6] based on row index
                 if constexpr (STRIDE_BYTES > 16) {
                     constexpr int rows_per_swizzle = (64 / STRIDE_BYTES) > 0 ? (64 / STRIDE_BYTES) : 1;
@@ -769,8 +775,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
                     uint32_t xor_bits = row_mod8 / rows_per_swizzle;
                     offset_bytes ^= (xor_bits << 4);
                 }
-                
-                cp_async_cg_16<preload>(tile_KV_base + offset_bytes, KV + i*stride_KV + k*h2_per_chunk);
+
+                if (valid_row) {
+                    cp_async_cg_16<preload>(tile_KV_base + offset_bytes, KV + i*stride_KV + k*h2_per_chunk);
+                } else {
+                    // OOB row: write zeros to shared memory instead of issuing cp.async to invalid address
+                    // Use inline PTX to store 128 bits (16 bytes) of zeros to shared memory
+                    asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};"
+                        : : "r"(tile_KV_base + offset_bytes), "r"(0));
+                }
             }
         }
     };
@@ -780,6 +793,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
     GGML_UNUSED(tile_KV_base);
     GGML_UNUSED(D2);
     GGML_UNUSED(stride_KV);
+    GGML_UNUSED(i_sup);
     NO_DEVICE_CODE;
 #endif
 }
@@ -1689,59 +1703,81 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // ================================================================
-            // SM_120 OPTIMIZED: Two-Stage K Pipelining with Swizzled cp.async
+            // SM_120 OPTIMIZED: Gau-Nernst V5 "Better Pipelining"
             // ================================================================
-            // This path runs REGARDLESS of nstages value - SM_120 always uses
-            // its own cp.async pipelining with swizzled shared memory layout.
+            // Key optimization: V loading overlaps with K computation (S = Q @ K.T)
+            // - Double-buffered K: Load K[n+1] while computing with K[n]
+            // - Single-buffered V: Load V once at start, overlaps with ALL K computation
             //
-            // Memory layout (chunked): [K chunk 0][K chunk 1][V chunk 0][V chunk 1]
-            // K buf1 is at tile_K + 1 chunk size, NOT at tile_V!
+            // Memory layout: [K chunk 0][K chunk 1][V single buffer]
+            // Pipeline flow:
+            //   chunk 0: Load K[0], prefetch K[1], start V load -> wait for K[0]
+            //   chunk n: Prefetch K[n+1] -> wait for K[n] (V still loading in background)
+            //   After K loop: wait_group<0> to ensure V is ready before softmax
             // ================================================================
             {
                 constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
                 constexpr int bytes_K_chunk_local = nbatch_fa * stride_tile_K * sizeof(half2);
+                constexpr int STRIDE_BYTES_V_early = stride_tile_V * sizeof(half2);
 
-                // Double buffer addresses - K buf1 is 1 chunk after K buf0, NOT tile_V
+                // Double buffer addresses for K
                 const uint32_t tile_K_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);
                 const uint32_t tile_K_buf1 = tile_K_buf0 + bytes_K_chunk_local;
 
-                // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
-                if (chunk == 0) {
-                    // Issue first K load (K[0] into buffer 0)
-                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
-                        K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K_buf0, nbatch_K2, stride_K);
-                    cp_async_commit_group();
+                // Single buffer address for V (after K buffers)
+                const uint32_t tile_V_buf = ggml_cuda_cvta_generic_to_shared(tile_V);
 
-                    // If there's a next chunk, prefetch it into buffer 1
-                    if (chunk + 1 < num_K_chunks) {
-                        const int next_k0_start = (chunk + 1) * nbatch_K2;
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
-                            K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, tile_K_buf1, nbatch_K2, stride_K);
-                        cp_async_commit_group();
+                if (chunk == 0) {
+                    // ============================================================
+                    // Gau-Nernst V5: Issue K[0], K[1], and V loads together
+                    // ============================================================
+
+                    // 1. Issue first K load (K[0] into buffer 0)
+                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, oob_check>(
+                        K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K_buf0, nbatch_K2, stride_K, k_VKQ_sup);
+                    cp_async_commit_group();  // Group 0: K[0]
+
+                    // 2. If there's a next K chunk, prefetch it into buffer 1
+                    if constexpr (num_K_chunks > 1) {
+                        const int next_k0_start = nbatch_K2;
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, oob_check>(
+                            K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, tile_K_buf1, nbatch_K2, stride_K, k_VKQ_sup);
+                        cp_async_commit_group();  // Group 1: K[1]
                     }
 
-                    // Wait for K[0] to complete (allow 1 group in flight if prefetch was issued)
-                    if (chunk + 1 < num_K_chunks) {
-                        cp_async_wait_group<1>();
+                    // 3. Start V[0] load (single buffer, overlaps with K computation)
+                    // Only loads first V chunk (nbatch_V2 columns). Subsequent V chunks
+                    // are loaded synchronously in the V loop after softmax.
+                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_early, nwarps, nbatch_fa, 0, oob_check>(
+                        V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V_buf, nbatch_V2, stride_V, k_VKQ_sup);
+                    cp_async_commit_group();  // Group 2: V[0] (if num_K_chunks > 1) or Group 1: V[0]
+
+                    // 4. Wait for K[0] to complete
+                    // Groups in flight: K[1] (if exists) + V = 1 or 2 groups
+                    if constexpr (num_K_chunks > 1) {
+                        cp_async_wait_group<2>();  // Wait for K[0], keep K[1] and V in flight
                     } else {
-                        cp_async_wait_group<0>();
+                        cp_async_wait_group<1>();  // Wait for K[0], keep V in flight
                     }
                 } else {
-                    // Subsequent chunks: Prefetch next chunk if it exists
+                    // Subsequent K chunks: K[n] was prefetched in previous iteration
+                    // Now prefetch K[n+1] for next iteration, then wait for K[n]
                     if (chunk + 1 < num_K_chunks) {
                         const int next_k0_start = (chunk + 1) * nbatch_K2;
                         const uint32_t next_buf = (chunk % 2 == 0) ? tile_K_buf1 : tile_K_buf0;
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
-                            K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, next_buf, nbatch_K2, stride_K);
-                        cp_async_commit_group();
-                        cp_async_wait_group<1>();
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, oob_check>(
+                            K_h2 + int64_t(k_VKQ_0)*stride_K + next_k0_start, next_buf, nbatch_K2, stride_K, k_VKQ_sup);
+                        cp_async_commit_group();  // Commit K[n+1] prefetch
+                        // Groups: K[n] (from prev iter), V[0], K[n+1] → wait completes K[n]
+                        cp_async_wait_group<2>();
                     } else {
-                        cp_async_wait_group<0>();
+                        // Last K chunk: just wait for K[n], keep V in flight
+                        cp_async_wait_group<1>();
                     }
                 }
 
                 __syncthreads();
-                // Point to correct K chunk buffer (chunk 0 or chunk 1), NOT tile_V
+                // Point to correct K chunk buffer (alternating)
                 current_tile_K = (chunk % 2 == 0) ? tile_K : (half2*)((char*)tile_K + bytes_K_chunk_local);
             }
 #else
@@ -1891,6 +1927,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     if (consumer_mode && threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
         printf("[CONSUMER DEBUG] K loop complete, starting softmax/V processing\n");
     }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    // ================================================================
+    // SM_120 Gau-Nernst V5: Wait for V load to complete after K loop
+    // ================================================================
+    // V was issued at chunk 0 and has been loading during K computation.
+    // Now we need V for the MMA stage 2 (O += P @ V), so wait for it.
+    if (!consumer_mode) {
+        cp_async_wait_group<0>();  // All groups complete (V is ready)
+        __syncthreads();
+    }
+#endif
 
     if (use_logit_softcap) {
         constexpr int stride = cols_per_warp == 8 ? np*T_C_KQ::I : np*T_C_KQ::J;
@@ -2124,9 +2172,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
                 // SM_120: Use swizzled cp.async for K (next iteration preload)
                 // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
+                // Note: oob_check=false for prefetch since !last_iter guarantees next iter has full batch
                 constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
                 const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
+                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, false>(
                     K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K_base, nbatch_K2, stride_K);
 #else
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -2197,8 +2246,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (v_chunk == 0) {
                 __syncthreads();  // SYNC 2: V is ready from producer
             }
-            // All V chunks are already loaded by producer - just point to data
-            tile_V_i = consumer_tile_V_base + current_stage * (bytes_V_chunk / sizeof(half2));
+            // SM_120: Single-buffered V - always point to tile_V (no stage offset)
+            // Unlike SM_90/100/103/110, SM_120 has only 1 V buffer, not 2
+            tile_V_i = tile_V;
 #elif defined(BLACKWELL_TMA_AVAILABLE)
             // Standard mbarrier path for SM_90/100/103/110
             if constexpr (needs_chunking) {
@@ -2258,77 +2308,37 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     #endif
                 } else {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                    // SM_120 OPTIMIZED: Two-Stage V Pipelining with Swizzled cp.async
                     // ================================================================
-                    // Phase 2B: Overlap V[n+1] prefetch with V[n] computation
+                    // SM_120 Gau-Nernst V5: Single-Buffered V (already loaded)
+                    // ================================================================
+                    // V[0] was pre-loaded during K computation (overlapped with S = Q @ K.T)
+                    // and is already in the single V buffer (tile_V).
                     //
-                    // Memory layout (chunked): [K chunk 0][K chunk 1][V chunk 0][V chunk 1]
-                    // V buf0 is at tile_V (V chunk 0), V buf1 is at tile_V + bytes_V_chunk
-                    //
-                    // Pipeline flow:
-                    //   V chunk 0: Load V[0], commit; prefetch V[1], commit; wait_group<1>
-                    //   V chunk n: Prefetch V[n+1], wait_group<1>, compute V[n]
-                    //   Final: wait_group<0> for last chunk
+                    // For subsequent V chunks (v_chunk > 0), load synchronously.
+                    // This trades some latency for reduced shared memory usage.
                     // ================================================================
 
-                    constexpr int STRIDE_BYTES_V_inner = stride_tile_V * sizeof(half2);
-                    constexpr int bytes_V_chunk_local = nbatch_fa * stride_tile_V * sizeof(half2);
+                    constexpr int STRIDE_BYTES_V_single = stride_tile_V * sizeof(half2);
+                    const uint32_t tile_V_buf = ggml_cuda_cvta_generic_to_shared(tile_V);
 
-                    // Double buffer addresses - V uses its own chunk buffers, NOT K's memory
-                    const uint32_t tile_V_buf0 = ggml_cuda_cvta_generic_to_shared(tile_V);
-                    const uint32_t tile_V_buf1 = tile_V_buf0 + bytes_V_chunk_local;
-
-                    // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
                     if (v_chunk == 0) {
-                        // Issue first V load (V[0] into buffer 0)
-                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 0>(
-                            V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V_buf0, i0_diff/2, stride_V);
-                        cp_async_commit_group();
-
-                        // If there's a next V chunk, prefetch it into buffer 1
-                        if (v_chunk + 1 < num_V_chunks) {
-                            const int next_i0_start = (v_chunk + 1) * nbatch_V2 * 2;
-                            const int next_i0_stop = (next_i0_start + 2*nbatch_V2 < DV) ? (next_i0_start + 2*nbatch_V2) : DV;
-                            const int next_i0_diff = next_i0_stop - next_i0_start;
-                            if (next_i0_start < reusable_cutoff) {
-                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 0>(
-                                    V_h2 + int64_t(k_VKQ_0)*stride_V + next_i0_start/2, tile_V_buf1, next_i0_diff/2, stride_V);
-                                cp_async_commit_group();
-                            }
-                        }
-
-                        // Wait for V[0] to complete
-                        if (v_chunk + 1 < num_V_chunks) {
-                            cp_async_wait_group<1>();
-                        } else {
-                            cp_async_wait_group<0>();
-                        }
+                        // V[0] already loaded during K loop - no additional load needed
+                        // Just ensure all warps have synced (already done after K loop)
+                        // tile_V_i = tile_V; (already set above)
                     } else {
-                        // Subsequent V chunks: current data is already prefetched
-                        // Prefetch next chunk if it exists
-                        if (v_chunk + 1 < num_V_chunks) {
-                            const int next_i0_start = (v_chunk + 1) * nbatch_V2 * 2;
-                            const int next_i0_stop = (next_i0_start + 2*nbatch_V2 < DV) ? (next_i0_start + 2*nbatch_V2) : DV;
-                            const int next_i0_diff = next_i0_stop - next_i0_start;
-                            const uint32_t next_buf = (v_chunk % 2 == 0) ? tile_V_buf1 : tile_V_buf0;
-                            if (next_i0_start < reusable_cutoff) {
-                                flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_inner, nwarps, nbatch_fa, 0>(
-                                    V_h2 + int64_t(k_VKQ_0)*stride_V + next_i0_start/2, next_buf, next_i0_diff/2, stride_V);
-                                cp_async_commit_group();
-                            }
+                        // Subsequent V chunks: load synchronously into single buffer
+                        // This overwrites the previous V chunk data
+                        __syncthreads();  // Protect buffer from previous V computation
 
-                            // Wait for current V chunk
-                            cp_async_wait_group<1>();
-                        } else {
-                            // Last chunk: wait for all
-                            cp_async_wait_group<0>();
-                        }
+                        flash_attn_ext_f16_load_tile_swizzle<stride_tile_V, STRIDE_BYTES_V_single, nwarps, nbatch_fa, 0, oob_check>(
+                            V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V_buf, i0_diff/2, stride_V, k_VKQ_sup);
+                        cp_async_commit_group();
+                        cp_async_wait_group<0>();  // Wait for this V chunk
+                        __syncthreads();
                     }
 
-                    __syncthreads();
-
-                    // Update tile_V_i to point to correct V chunk buffer (chunk 0 or chunk 1)
-                    tile_V_i = (v_chunk % 2 == 0) ? tile_V : (half2*)((char*)tile_V + bytes_V_chunk_local);
+                    // Single buffer: always point to tile_V
+                    tile_V_i = tile_V;
 #else
                     flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                         (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
@@ -2645,11 +2655,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr bool set_pipeline_state = (num_consumers > 0);  // Use consumer mode when pipelined
 #endif
     if (use_chunked_layout) {
-        // Shared memory layout for chunk pipelining:
-        // [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask][pipeline_state]
+        // ================================================================
+        // Shared memory layout for SM_120 Gau-Nernst V5 pipelining:
+        // [K chunk 0][K chunk 1][V single buffer][Q tiles][mask][pipeline_state]
+        // ================================================================
+        // K: Double-buffered (load K[n+1] while computing with K[n])
+        // V: Single-buffered (loaded during K computation, used after softmax)
+        // ================================================================
         constexpr int bytes_K_chunk = nbatch_fa * nbatch_K2 * sizeof(half2);
         constexpr int bytes_V_chunk = nbatch_fa * nbatch_V2 * sizeof(half2);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        // SM_120: Single-buffered V (Gau-Nernst V5 optimization)
+        constexpr int bytes_KV_total = 2 * bytes_K_chunk + 1 * bytes_V_chunk;
+#else
+        // Other archs: Double-buffered V
         constexpr int bytes_KV_total = 2 * bytes_K_chunk + 2 * bytes_V_chunk;
+#endif
         constexpr int stride_tile_Q_local = DKQ/2 + 4;
         constexpr int bytes_Q = ncols * stride_tile_Q_local * sizeof(half2);
         constexpr int bytes_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
@@ -2682,7 +2703,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             printf("[SMEM BOUNDS]   K_chunk[0] = smem+0 = %p\n", smem);
             printf("[SMEM BOUNDS]   K_chunk[1] = smem+%d = %p\n", bytes_K_chunk, smem + bytes_K_chunk);
             printf("[SMEM BOUNDS]   V_chunk[0] = smem+%d = %p\n", 2*bytes_K_chunk, smem + 2*bytes_K_chunk);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+            printf("[SMEM BOUNDS]   V_chunk[1] = (SM_120: NONE - single-buffered V)\n");
+#else
             printf("[SMEM BOUNDS]   V_chunk[1] = smem+%d = %p\n", 2*bytes_K_chunk + bytes_V_chunk, smem + 2*bytes_K_chunk + bytes_V_chunk);
+#endif
             printf("[SMEM BOUNDS]   Q_tiles    = smem+%d = %p\n", bytes_KV_total, smem + bytes_KV_total);
             printf("[SMEM BOUNDS]   mask       = smem+%d = %p\n", bytes_KV_total + bytes_Q, smem + bytes_KV_total + bytes_Q);
             // Show both the computed pipeline address AND whether it's actually used
@@ -2747,21 +2772,27 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
 #endif
 
-    // Chunked layout mode (Blackwell or SM_120): use producer's chunk double-buffering layout
-    // New layout: [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask][pipeline_state]
-    // Producer writes K chunks at smem[0] and smem[bytes_K_chunk]
-    // Producer writes V chunks at smem[2*bytes_K_chunk] and smem[2*bytes_K_chunk + bytes_V_chunk]
-    // The actual chunk buffer selection (0 or 1) is handled dynamically in the iter function
-    // based on the current iteration. Here we set tile_K/V to the base of chunk 0.
+    // ================================================================
+    // Chunked layout mode (Blackwell or SM_120): use producer's pipelining layout
+    // ================================================================
+    // SM_120 Gau-Nernst V5: [K chunk 0][K chunk 1][V single buffer][Q tiles][mask]
+    // Other archs:         [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask]
+    // ================================================================
     if (use_chunked_layout) {
         constexpr int bytes_K_chunk = nbatch_fa * nbatch_K2 * sizeof(half2);
         constexpr int bytes_V_chunk = nbatch_fa * nbatch_V2 * sizeof(half2);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        // SM_120: Single-buffered V (Gau-Nernst V5 optimization)
+        constexpr int bytes_KV_total = 2 * bytes_K_chunk + 1 * bytes_V_chunk;
+#else
+        // Other archs: Double-buffered V
         constexpr int bytes_KV_total = 2 * bytes_K_chunk + 2 * bytes_V_chunk;
+#endif
         // tile_K points to base of K chunk buffers (chunk 0)
         tile_K = (half2*)smem;
-        // tile_V points to base of V chunk buffers (chunk 0), after both K chunks
+        // tile_V points to single V buffer (SM_120) or V chunk 0 (other archs), after K chunks
         tile_V = (half2*)((char*)smem + 2 * bytes_K_chunk);
-        // Q tiles are after KV buffers in the new layout
+        // Q tiles are after KV buffers
         tile_Q = (half2*)((char*)smem + bytes_KV_total);
         // Mask is after Q tiles
         tile_mask = (half*)((char*)smem + bytes_KV_total + ncols * stride_tile_Q * sizeof(half2));
@@ -2929,10 +2960,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120: Use swizzled cp.async for K preload
             // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
+            // oob_check=false for initial preload in multi-stage pipeline (full tile)
             constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
             const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0>(
-                K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K_base, nbatch_K2, stride_K);
+            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, oob_check>(
+                K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K_base, nbatch_K2, stride_K, k_VKQ_sup);
 #else
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
@@ -2976,7 +3008,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
     } else {
-        constexpr bool oob_check = false;
+        // ncols2 > 1: Enable OOB check when nstages == 1 (same logic as ncols2 == 1)
+        constexpr bool oob_check = (nstages == 1);
         for (; kb0 < kb0_stop-1; ++kb0) {
             // Compute stage for this iteration (consumer mode only)
             const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
@@ -2994,10 +3027,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 phase_V ^= 1;
             }
         }
-        // Last iteration
+        // Last iteration - calculate actual remaining rows for OOB check
         const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
         constexpr bool last_iter = true;
-        constexpr int  k_VKQ_sup = nbatch_fa;
+        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;  // FIXED: was constexpr nbatch_fa
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
@@ -3326,8 +3359,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                         if (!needs_fixup && !is_fixup) {
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            // Guard against division by zero (can happen when all K rows are OOB/zeroed)
+                            if (fabsf(KQ_rowsum_j) > 1e-20f) {
+                                dstk_val.x /= KQ_rowsum_j;
+                                dstk_val.y /= KQ_rowsum_j;
+                            } else {
+                                // Zero output for invalid/empty attention (prevents NaN)
+                                dstk_val = make_float2(0.0f, 0.0f);
+                            }
                         }
 
                         // DEBUG: Check for NaN before writing output
@@ -3611,13 +3650,20 @@ __global__ void flash_attn_ext_f16_blackwell(
 
     extern __shared__ char smem[];
     // New shared memory layout for k0-chunk pipelining (double-buffering within loops):
-    // [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask][pipeline_state][mbarriers]
+    // [K chunk 0][K chunk 1][V chunk][Q tiles][mask][pipeline_state][mbarriers]
     // K: 2 chunk buffers for double-buffering within k0 loop
-    // V: 2 chunk buffers for double-buffering within V loop
+    // V: SM_120 uses single-buffered V (Gau-Nernst V5 optimization), others use double-buffered
     constexpr int bytes_K_chunk = nbatch_fa * nbatch_K2 * sizeof(half2);
     constexpr int bytes_V_chunk = nbatch_fa * nbatch_V2 * sizeof(half2);
     constexpr int bytes_K_total = 2 * bytes_K_chunk;  // 2 stages for K chunks
-    constexpr int bytes_V_total = 2 * bytes_V_chunk;  // 2 stages for V chunks
+    // SM_120: Single-buffered V (Gau-Nernst V5 optimization)
+    // Other Blackwells (SM_90/100/103/110): Double-buffered V
+    // This MUST match the host-side calculation in ggml_cuda_flash_attn_ext_mma_f16_case()
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    constexpr int bytes_V_total = 1 * bytes_V_chunk;  // SM_120: single buffer for V
+#else
+    constexpr int bytes_V_total = 2 * bytes_V_chunk;  // Other Blackwells: double buffer for V
+#endif
     constexpr int bytes_KV_total = bytes_K_total + bytes_V_total;
 
     // Q tiles follow KV buffers
@@ -3836,22 +3882,7 @@ __global__ void flash_attn_ext_f16_blackwell(
             }
         }
         
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            printf("[Q LOAD] Block %d: Q loop done, syncing\n", blockIdx.x);
-        }
-         __syncthreads();  // All warps hit this barrier
-
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            printf("[Q LOAD] Block %d: Sync 1 done\n", blockIdx.x);
-        }
-
-         // Load Q into registers for consumers (producer skips this but still syncs)
-         // This is done inside process_tile for consumers
-         __syncthreads();  // Second barrier matching process_tile's Q register loading sync
-         
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
-            printf("[Q LOAD] Block %d: Sync 2 done, diverging\n", blockIdx.x);
-        }
+        __syncthreads();  // Q loaded to shared memory, all warps ready
 
          // =====================================================================
          // WARP DIVERGENCE: Producer vs Consumer paths
@@ -4225,9 +4256,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         // K: 2 chunk buffers for double-buffering
         size_t bytes_K_chunk = config_bw.nbatch_fa * config_bw.nbatch_K2 * sizeof(half2);
         size_t bytes_K_total = 2 * bytes_K_chunk;
-        // V: 2 chunk buffers for double-buffering
+        // V: SM_120 uses single buffer (Gau-Nernst V5), other archs use double-buffering
         size_t bytes_V_chunk = config_bw.nbatch_fa * config_bw.nbatch_V2 * sizeof(half2);
-        size_t bytes_V_total = 2 * bytes_V_chunk;
+        // SM_120 (consumer Blackwell): Single-buffered V for Gau-Nernst V5 optimization
+        // Other Blackwell: Double-buffered V
+        const bool sm120_single_v = ggml_cuda_is_consumer_blackwell(cc);
+        size_t bytes_V_total = sm120_single_v ? 1 * bytes_V_chunk : 2 * bytes_V_chunk;
         // Q tiles
         constexpr int stride_tile_Q = DKQ/2 + 4;
         size_t bytes_Q = ncols * stride_tile_Q * sizeof(half2);
@@ -4235,8 +4269,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         size_t bytes_mask = ncols1 * (config_bw.nbatch_fa/2 + 4) * sizeof(half2);
         // Total: KV buffers + Q + mask + pipeline state + alignment padding
         nbytes_shared_total = bytes_K_total + bytes_V_total + bytes_Q + bytes_mask + sizeof(fattn_pipeline_state) + 128;
-        
-        fprintf(stderr, "[SHMEM DEBUG] Blackwell shared memory calculation:\n");
+
+        fprintf(stderr, "[SHMEM DEBUG] Blackwell shared memory calculation (SM_120 single-V=%d):\n", sm120_single_v);
         fprintf(stderr, "[SHMEM DEBUG]   bytes_K_chunk=%zu, bytes_K_total=%zu\n", bytes_K_chunk, bytes_K_total);
         fprintf(stderr, "[SHMEM DEBUG]   bytes_V_chunk=%zu, bytes_V_total=%zu\n", bytes_V_chunk, bytes_V_total);
         fprintf(stderr, "[SHMEM DEBUG]   bytes_Q=%zu, bytes_mask=%zu\n", bytes_Q, bytes_mask);

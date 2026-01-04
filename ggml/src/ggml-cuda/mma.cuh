@@ -608,6 +608,117 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+    // ============================================================================
+    // SM_120 Optimized ldmatrix.x4 with Padding Support (Gau-Nernst V4)
+    // ============================================================================
+    // These functions support the +8 half2 padding scheme for bank conflict avoidance
+    // without XOR swizzling. The stride includes the padding.
+    //
+    // Key optimization: Pre-compute base address and offsets outside inner loops
+    // to reduce ALU overhead. Use ldmatrix.x4 for maximum throughput.
+    // ============================================================================
+
+    // ldmatrix.x4 for 16x8 tile with padding (no swizzle)
+    // STRIDE = actual stride in half2 elements (e.g., nbatch_K2 + 8 for padding)
+    template <int STRIDE, typename T, data_layout dl = DATA_LAYOUT_I_MAJOR>
+    static __device__ __forceinline__ void load_ldmatrix_x4_padded(
+            tile<16, 8, T, dl> & t, const T * __restrict__ smem_ptr, int row_offset, int col_offset) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int *) t.x;
+
+        // Pre-compute thread's position in the 16x8 tile
+        // Rows 0-15 are distributed across threads, columns 0-7 are loaded 4 at a time
+        const int thread_row = (threadIdx.x % t.I) + row_offset;
+        const int thread_col = (threadIdx.x / t.I) * (t.J / 2) + col_offset;
+
+        // Calculate shared memory address with stride
+        const int * xs = (const int *) smem_ptr + thread_row * STRIDE + thread_col;
+
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+            : "l"(xs));
+#else
+        GGML_UNUSED_VARS(t, smem_ptr, row_offset, col_offset);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
+    // ldmatrix.x4.trans for 16x8 tile with padding (transposed load for V matrix)
+    template <int STRIDE, typename T>
+    static __device__ __forceinline__ void load_ldmatrix_x4_trans_padded(
+            tile<16, 8, T> & t, const T * __restrict__ smem_ptr, int row_offset, int col_offset) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int *) t.x;
+
+        const int thread_row = (threadIdx.x % t.I) + row_offset;
+        const int thread_col = (threadIdx.x / t.I) * (t.J / 2) + col_offset;
+
+        const int * xs = (const int *) smem_ptr + thread_row * STRIDE + thread_col;
+
+        // .trans variant reorders output registers for transposed load
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+            : "l"(xs));
+#else
+        GGML_UNUSED_VARS(t, smem_ptr, row_offset, col_offset);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
+    // ldmatrix.x4 with pre-computed base address (for loop optimization)
+    // Call this version when base_addr is computed once outside the loop
+    template <typename T, data_layout dl = DATA_LAYOUT_I_MAJOR>
+    static __device__ __forceinline__ void load_ldmatrix_x4_preaddr(
+            tile<16, 8, T, dl> & t, uint32_t base_addr, int col_offset_bytes) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int *) t.x;
+
+        // Column offset is in bytes, added directly to pre-computed base address
+        uint32_t addr = base_addr + col_offset_bytes;
+
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+            : "r"(addr));
+#else
+        GGML_UNUSED_VARS(t, base_addr, col_offset_bytes);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
+    // ldmatrix.x4.trans with pre-computed base address
+    template <typename T>
+    static __device__ __forceinline__ void load_ldmatrix_x4_trans_preaddr(
+            tile<16, 8, T> & t, uint32_t base_addr, int col_offset_bytes) {
+#ifdef TURING_MMA_AVAILABLE
+        int * xi = (int *) t.x;
+
+        uint32_t addr = base_addr + col_offset_bytes;
+
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+            : "r"(addr));
+#else
+        GGML_UNUSED_VARS(t, base_addr, col_offset_bytes);
+        NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+    }
+
+    // Helper: Pre-compute thread's base address for ldmatrix.x4 operations
+    // Returns the shared memory address for this thread's row/column position
+    // Use this outside the inner loop, then call load_ldmatrix_x4_preaddr with col offsets
+    template <int STRIDE_BYTES>
+    static __device__ __forceinline__ uint32_t precompute_ldmatrix_addr(
+            uint32_t smem_base, int row_offset, int base_col_offset_bytes = 0) {
+        // For 16x8 tile: 16 rows, threads 0-15 get rows 0-15, threads 16-31 add column offset
+        constexpr int TILE_I = 16;
+        constexpr int TILE_J_HALF = 4;  // J/2 = 8/2 = 4, * sizeof(int) = 16 bytes
+
+        const int thread_row = (threadIdx.x % TILE_I) + row_offset;
+        const int thread_col_bytes = (threadIdx.x / TILE_I) * TILE_J_HALF * sizeof(int);
+
+        return smem_base + thread_row * STRIDE_BYTES + base_col_offset_bytes + thread_col_bytes;
+    }
+
     static __device__ __forceinline__ void mma(
             tile<16, 8, int> & D, const tile<16, 4, int> & A, const tile<8, 4, int> & B) {
 #ifdef TURING_MMA_AVAILABLE
