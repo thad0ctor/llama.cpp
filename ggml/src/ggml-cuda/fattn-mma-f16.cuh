@@ -3020,13 +3020,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              #endif
         } else {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-            // SM_120: Use swizzled cp.async for K preload
-            // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
-            // oob_check=false for initial preload in multi-stage pipeline (full tile)
-            constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
-            const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-            flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, oob_check>(
-                K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K_base, nbatch_K2, stride_K, k_VKQ_sup);
+            // SM_120: SKIP preload here - the iter function handles K loading with proper
+            // double-buffering and commit/wait sequencing. Loading here WITHOUT commit
+            // causes "orphaned" cp.async operations that race with iter's loading.
+            // The iter function at line 1774 will load K[0] with proper pipelining.
+            (void)0;  // Explicit no-op for SM_120
 #else
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
