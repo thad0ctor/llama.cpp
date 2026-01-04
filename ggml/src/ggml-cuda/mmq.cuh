@@ -727,6 +727,54 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0_sm120(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI8_0;
+    const int kqsx = txi % QI8_0;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
+
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_SM120 + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0_SM120 + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+    }
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbxd;
+
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0_SM120                 + kbxd] = bxi->d;
+    }
+}
+#endif
+
 #ifdef BLACKWELL_MMA_AVAILABLE
 // Blackwell-optimized Q8_0 load_tiles with 512 K iteration (16 blocks instead of 8)
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0_blackwell(
@@ -1112,7 +1160,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
             const int k0 = k00 + k01;
-            load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
+            load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q8_0_SM120 + k0, MMQ_MMA_TILE_X_K_Q8_0_SM120);
         }
 
 #pragma unroll
@@ -1121,7 +1169,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
 #pragma unroll
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
                 const int k0 = k00 + k01;
-                dA[n][l][k01/QI8_0] = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI8_0];
+                dA[n][l][k01/QI8_0] = x_df[i*MMQ_MMA_TILE_X_K_Q8_0_SM120 + k0/QI8_0];
             }
         }
     }
@@ -3534,9 +3582,13 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
 #ifdef BLACKWELL_MMA_AVAILABLE
     // sm_120 (RTX 5090, 99KB): Use SM120-optimized vec_dot with pre-loaded scales
     // sm_100 (B200, 227KB): Use Blackwell-optimized functions with 512K iteration
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q8_0_sm120<mmq_y, need_check>;
+#else
     static constexpr load_tiles_mmq_t load_tiles   = ggml_cuda_is_consumer_blackwell_device()
         ? load_tiles_q8_0<mmq_y, need_check>
         : load_tiles_q8_0_blackwell<mmq_y, need_check>;
+#endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     // sm_120: Use new optimized kernel with pre-loaded scales and shuffle broadcast
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma_sm120<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
