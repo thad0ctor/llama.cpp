@@ -680,7 +680,92 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
 }
 
 void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // DEBUG: Verify ROPE input/output
+    static bool debug_printed = false;
+    const ggml_tensor * src0 = dst->src[0];
+    
+    if (!debug_printed) {
+        fprintf(stderr, "\n[ROPE DEBUG] ========== ROPE Operation ==========\n");
+        fprintf(stderr, "[ROPE DEBUG] src0: ne=[%ld,%ld,%ld,%ld] type=%d name=%s\n",
+                (long)src0->ne[0], (long)src0->ne[1], (long)src0->ne[2], (long)src0->ne[3],
+                src0->type, src0->name);
+        fprintf(stderr, "[ROPE DEBUG] dst:  ne=[%ld,%ld,%ld,%ld] type=%d name=%s\n",
+                (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3],
+                dst->type, dst->name);
+        fprintf(stderr, "[ROPE DEBUG] src0->data=%p, dst->data=%p\n", src0->data, dst->data);
+        
+        // Read input values before ROPE
+        if (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
+            float vals[8];
+            size_t elem_size = (src0->type == GGML_TYPE_F16) ? 2 : 4;
+            if (src0->type == GGML_TYPE_F16) {
+                half hvals[8];
+                cudaMemcpy(hvals, src0->data, sizeof(hvals), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < 8; i++) vals[i] = __half2float(hvals[i]);
+            } else {
+                cudaMemcpy(vals, src0->data, sizeof(vals), cudaMemcpyDeviceToHost);
+            }
+            fprintf(stderr, "[ROPE DEBUG] INPUT row 0 [0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                    vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+            
+            // Check row 1
+            const char* row1_ptr = (const char*)src0->data + src0->nb[1];
+            if (src0->type == GGML_TYPE_F16) {
+                half hvals[4];
+                cudaMemcpy(hvals, row1_ptr, sizeof(hvals), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[ROPE DEBUG] INPUT row 1 [0..3]: %f, %f, %f, %f\n",
+                        __half2float(hvals[0]), __half2float(hvals[1]), 
+                        __half2float(hvals[2]), __half2float(hvals[3]));
+            } else {
+                float fvals[4];
+                cudaMemcpy(fvals, row1_ptr, sizeof(fvals), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[ROPE DEBUG] INPUT row 1 [0..3]: %f, %f, %f, %f\n",
+                        fvals[0], fvals[1], fvals[2], fvals[3]);
+            }
+        }
+        debug_printed = true;
+    }
+    
     ggml_cuda_op_rope_impl<true>(ctx, dst);
+    
+    // DEBUG: Verify ROPE output
+    static bool output_debug_printed = false;
+    if (!output_debug_printed) {
+        cudaStreamSynchronize(ctx.stream());
+        
+        if (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32) {
+            float vals[8];
+            if (dst->type == GGML_TYPE_F16) {
+                half hvals[8];
+                cudaMemcpy(hvals, dst->data, sizeof(hvals), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < 8; i++) vals[i] = __half2float(hvals[i]);
+            } else {
+                cudaMemcpy(vals, dst->data, sizeof(vals), cudaMemcpyDeviceToHost);
+            }
+            fprintf(stderr, "[ROPE DEBUG] OUTPUT row 0 [0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                    vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+            
+            // Check row 1
+            const char* row1_ptr = (const char*)dst->data + dst->nb[1];
+            if (dst->type == GGML_TYPE_F16) {
+                half hvals[4];
+                cudaMemcpy(hvals, row1_ptr, sizeof(hvals), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[ROPE DEBUG] OUTPUT row 1 [0..3]: %f, %f, %f, %f\n",
+                        __half2float(hvals[0]), __half2float(hvals[1]),
+                        __half2float(hvals[2]), __half2float(hvals[3]));
+                bool has_nan = false;
+                for (int i = 0; i < 4; i++) if (isnan(__half2float(hvals[i]))) has_nan = true;
+                if (has_nan) fprintf(stderr, "[ROPE DEBUG] *** WARNING: OUTPUT has NaN! ***\n");
+            } else {
+                float fvals[4];
+                cudaMemcpy(fvals, row1_ptr, sizeof(fvals), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[ROPE DEBUG] OUTPUT row 1 [0..3]: %f, %f, %f, %f\n",
+                        fvals[0], fvals[1], fvals[2], fvals[3]);
+            }
+        }
+        fprintf(stderr, "[ROPE DEBUG] ==========================================\n\n");
+        output_debug_printed = true;
+    }
 }
 
 void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -1771,13 +1771,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                (void*)K_src, k_VKQ_0, stride_K, k0_start);
                         
                         // Also print K rows 1-3 from GMEM to verify source data
+                        // NOTE: stride_K is in half2 units, so stride_K*2 = stride in halfs
+                        // K row N starts at K_src + N * stride_K (in half2), or K_src_half + N * stride_K * 2 (in halfs)
                         const half* k_row1 = k_src_half + stride_K * 2;  // stride_K is in half2, so *2 for halfs
                         const half* k_row2 = k_src_half + stride_K * 4;
                         const half* k_row3 = k_src_half + stride_K * 6;
+                        printf("[SM120 GMEM DEBUG] stride_K=%d half2 = %d bytes per row\n", stride_K, stride_K * 4);
+                        printf("[SM120 GMEM DEBUG] K_row1 ptr=%p (offset=%ld bytes from K_src)\n", 
+                               (void*)k_row1, (long)((char*)k_row1 - (char*)k_src_half));
                         printf("[SM120 GMEM DEBUG] K_row1[0..1]: (%f,%f), K_row2[0..1]: (%f,%f), K_row3[0..1]: (%f,%f)\n",
                                __half2float(k_row1[0]), __half2float(k_row1[1]),
                                __half2float(k_row2[0]), __half2float(k_row2[1]),
                                __half2float(k_row3[0]), __half2float(k_row3[1]));
+                        
+                        // Also print using nb11 (actual byte stride from kernel args)
+                        // nb11 is passed to kernel as K stride in bytes
+                        printf("[SM120 GMEM DEBUG] ne10=%ld (K head_dim), ne11=%ld (K seq_len)\n", 
+                               (long)ne10, (long)ne11);
                     }
                     // --- END SM_120 DEBUG ---
 
@@ -4315,6 +4325,35 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 K->data, (long)K->ne[0], (unsigned long)K_rows);
         fprintf(stderr, "[TMA DEBUG]   K->nb[1]=%ld (stride), tile_k_half=%u, nbatch_fa=%d\n", 
                 (long)K->nb[1], tile_k_half, nbatch_fa);
+        
+        // HOST SIDE: Read and verify K tensor values from GPU memory
+        {
+            half k_vals[16];  // Read first 16 halfs
+            cudaMemcpy(k_vals, K->data, sizeof(k_vals), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[K VERIFY HOST] K row 0 [0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                    __half2float(k_vals[0]), __half2float(k_vals[1]),
+                    __half2float(k_vals[2]), __half2float(k_vals[3]),
+                    __half2float(k_vals[4]), __half2float(k_vals[5]),
+                    __half2float(k_vals[6]), __half2float(k_vals[7]));
+            
+            // Read row 1 (stride_K bytes from start)
+            half k_row1[8];
+            cudaMemcpy(k_row1, (const char*)K->data + K->nb[1], sizeof(k_row1), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[K VERIFY HOST] K row 1 [0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                    __half2float(k_row1[0]), __half2float(k_row1[1]),
+                    __half2float(k_row1[2]), __half2float(k_row1[3]),
+                    __half2float(k_row1[4]), __half2float(k_row1[5]),
+                    __half2float(k_row1[6]), __half2float(k_row1[7]));
+            
+            // Check for NaN/zeros in first few rows
+            bool has_nan = false, has_zero_row = true;
+            for (int i = 0; i < 8; i++) {
+                if (isnan(__half2float(k_row1[i]))) has_nan = true;
+                if (__half2float(k_row1[i]) != 0.0f) has_zero_row = false;
+            }
+            if (has_nan) fprintf(stderr, "[K VERIFY HOST] *** WARNING: K row 1 has NaN! ***\n");
+            if (has_zero_row) fprintf(stderr, "[K VERIFY HOST] *** WARNING: K row 1 is all zeros! ***\n");
+        }
         
         // TMA alignment checks
         uintptr_t k_addr = reinterpret_cast<uintptr_t>(K->data);

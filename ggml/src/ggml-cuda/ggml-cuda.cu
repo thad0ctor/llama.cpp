@@ -2130,6 +2130,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // DEBUG: Check if this is a K or V projection
+    static bool kv_debug_printed = false;
+    const bool is_k_proj = src0->name && (strstr(src0->name, "attn_k") || strstr(src0->name, ".k."));
+    const bool is_v_proj = src0->name && (strstr(src0->name, "attn_v") || strstr(src0->name, ".v."));
+    
     fprintf(stderr, "[MUL_MAT_DEBUG] src0: ne=[%lld,%lld,%lld,%lld] type=%s name=%s\n",
             (long long)src0->ne[0], (long long)src0->ne[1],
             (long long)src0->ne[2], (long long)src0->ne[3],
@@ -2138,6 +2143,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             (long long)src1->ne[0], (long long)src1->ne[1],
             (long long)src1->ne[2], (long long)src1->ne[3],
             ggml_type_name(src1->type), src1->name);
+    
+    if ((is_k_proj || is_v_proj) && !kv_debug_printed) {
+        fprintf(stderr, "[KV PROJECTION] *** DETECTED %s PROJECTION ***\n", is_k_proj ? "K" : "V");
+        fprintf(stderr, "[KV PROJECTION] dst will have shape: [%lld,%lld,%lld,%lld]\n",
+                (long long)dst->ne[0], (long long)dst->ne[1],
+                (long long)dst->ne[2], (long long)dst->ne[3]);
+    }
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2216,6 +2228,40 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+    }
+    
+    // DEBUG: Verify K/V projection output after computation
+    if ((is_k_proj || is_v_proj) && !kv_debug_printed) {
+        cudaStreamSynchronize(ctx.stream());
+        
+        float row0[8], row1[8], row2[8], row3[8];
+        cudaMemcpy(row0, dst->data, sizeof(row0), cudaMemcpyDeviceToHost);
+        cudaMemcpy(row1, (const char*)dst->data + dst->nb[1], sizeof(row1), cudaMemcpyDeviceToHost);
+        cudaMemcpy(row2, (const char*)dst->data + 2*dst->nb[1], sizeof(row2), cudaMemcpyDeviceToHost);
+        cudaMemcpy(row3, (const char*)dst->data + 3*dst->nb[1], sizeof(row3), cudaMemcpyDeviceToHost);
+        
+        fprintf(stderr, "[%s PROJ OUTPUT] Row 0: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                is_k_proj ? "K" : "V",
+                row0[0], row0[1], row0[2], row0[3], row0[4], row0[5], row0[6], row0[7]);
+        fprintf(stderr, "[%s PROJ OUTPUT] Row 1: %f, %f, %f, %f | Row 2: %f, %f, %f, %f\n",
+                is_k_proj ? "K" : "V",
+                row1[0], row1[1], row1[2], row1[3],
+                row2[0], row2[1], row2[2], row2[3]);
+        fprintf(stderr, "[%s PROJ OUTPUT] Row 3: %f, %f, %f, %f\n",
+                is_k_proj ? "K" : "V",
+                row3[0], row3[1], row3[2], row3[3]);
+        
+        bool has_nan = false, has_zeros = true;
+        for (int i = 0; i < 8; i++) {
+            if (isnan(row1[i % 8]) || isnan(row2[i % 8]) || isnan(row3[i % 8])) has_nan = true;
+        }
+        for (int i = 0; i < 8; i++) {
+            if (row1[i % 8] != 0.0f) has_zeros = false;
+        }
+        if (has_nan) fprintf(stderr, "[%s PROJ OUTPUT] *** WARNING: Output has NaN! ***\n", is_k_proj ? "K" : "V");
+        if (has_zeros) fprintf(stderr, "[%s PROJ OUTPUT] *** WARNING: Row 1 is all zeros! ***\n", is_k_proj ? "K" : "V");
+        
+        kv_debug_printed = true;
     }
 }
 
@@ -2503,6 +2549,23 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
             break;
         case GGML_OP_CONT:
+            // DEBUG: Check CONT input/output for K/V tensors
+            {
+                const ggml_tensor * src = dst->src[0];
+                bool is_kv_cont = src->name && (strstr(src->name, "k") || strstr(src->name, "v") || 
+                                                 strstr(src->name, "K") || strstr(src->name, "V"));
+                static bool cont_debug_printed = false;
+                if (is_kv_cont && !cont_debug_printed) {
+                    fprintf(stderr, "\n[CONT DEBUG] ========== CONT for potential K/V ==========\n");
+                    fprintf(stderr, "[CONT DEBUG] src: ne=[%ld,%ld,%ld,%ld] name=%s\n",
+                            (long)src->ne[0], (long)src->ne[1], (long)src->ne[2], (long)src->ne[3], src->name);
+                    fprintf(stderr, "[CONT DEBUG] dst: ne=[%ld,%ld,%ld,%ld] name=%s\n",
+                            (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3], dst->name);
+                    fprintf(stderr, "[CONT DEBUG] src strides (nb): [%ld,%ld,%ld,%ld]\n",
+                            (long)src->nb[0], (long)src->nb[1], (long)src->nb[2], (long)src->nb[3]);
+                    cont_debug_printed = true;
+                }
+            }
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
@@ -2851,6 +2914,60 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+            // DEBUG: Verify K tensor before flash attention
+            {
+                const ggml_tensor * Q = dst->src[0];
+                const ggml_tensor * K = dst->src[1];
+                const ggml_tensor * V = dst->src[2];
+                
+                static bool fa_entry_debug = false;
+                if (!fa_entry_debug) {
+                    fprintf(stderr, "\n[FA ENTRY DEBUG] ========== Flash Attention Entry ==========\n");
+                    fprintf(stderr, "[FA ENTRY DEBUG] Q: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] type=%d\n",
+                            (long)Q->ne[0], (long)Q->ne[1], (long)Q->ne[2], (long)Q->ne[3],
+                            (long)Q->nb[0], (long)Q->nb[1], (long)Q->nb[2], (long)Q->nb[3], Q->type);
+                    fprintf(stderr, "[FA ENTRY DEBUG] K: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] type=%d data=%p\n",
+                            (long)K->ne[0], (long)K->ne[1], (long)K->ne[2], (long)K->ne[3],
+                            (long)K->nb[0], (long)K->nb[1], (long)K->nb[2], (long)K->nb[3], K->type, K->data);
+                    fprintf(stderr, "[FA ENTRY DEBUG] V: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] type=%d\n",
+                            (long)V->ne[0], (long)V->ne[1], (long)V->ne[2], (long)V->ne[3],
+                            (long)V->nb[0], (long)V->nb[1], (long)V->nb[2], (long)V->nb[3], V->type);
+                    
+                    // Read K tensor values from GPU
+                    if (K->type == GGML_TYPE_F16) {
+                        half k_row0[8], k_row1[8], k_row2[8], k_row3[8];
+                        cudaMemcpy(k_row0, K->data, sizeof(k_row0), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(k_row1, (const char*)K->data + K->nb[1], sizeof(k_row1), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(k_row2, (const char*)K->data + 2*K->nb[1], sizeof(k_row2), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(k_row3, (const char*)K->data + 3*K->nb[1], sizeof(k_row3), cudaMemcpyDeviceToHost);
+                        
+                        fprintf(stderr, "[FA ENTRY DEBUG] K row 0: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                                __half2float(k_row0[0]), __half2float(k_row0[1]), 
+                                __half2float(k_row0[2]), __half2float(k_row0[3]),
+                                __half2float(k_row0[4]), __half2float(k_row0[5]),
+                                __half2float(k_row0[6]), __half2float(k_row0[7]));
+                        fprintf(stderr, "[FA ENTRY DEBUG] K row 1: %f, %f, %f, %f\n",
+                                __half2float(k_row1[0]), __half2float(k_row1[1]),
+                                __half2float(k_row1[2]), __half2float(k_row1[3]));
+                        fprintf(stderr, "[FA ENTRY DEBUG] K row 2: %f, %f, %f, %f\n",
+                                __half2float(k_row2[0]), __half2float(k_row2[1]),
+                                __half2float(k_row2[2]), __half2float(k_row2[3]));
+                        fprintf(stderr, "[FA ENTRY DEBUG] K row 3: %f, %f, %f, %f\n",
+                                __half2float(k_row3[0]), __half2float(k_row3[1]),
+                                __half2float(k_row3[2]), __half2float(k_row3[3]));
+                        
+                        bool has_nan = false, row1_zero = true;
+                        for (int i = 0; i < 4; i++) {
+                            if (isnan(__half2float(k_row1[i])) || isnan(__half2float(k_row2[i])) || isnan(__half2float(k_row3[i]))) has_nan = true;
+                            if (__half2float(k_row1[i]) != 0.0f) row1_zero = false;
+                        }
+                        if (has_nan) fprintf(stderr, "[FA ENTRY DEBUG] *** WARNING: K tensor has NaN! ***\n");
+                        if (row1_zero) fprintf(stderr, "[FA ENTRY DEBUG] *** WARNING: K row 1 is all zeros! ***\n");
+                    }
+                    fprintf(stderr, "[FA ENTRY DEBUG] ==========================================\n\n");
+                    fa_entry_debug = true;
+                }
+            }
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:

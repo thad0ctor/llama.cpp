@@ -1052,6 +1052,38 @@ void launch_fattn(
                     dev_id, max_shmem, max_shmem / 1024.0);
             fprintf(stderr, "[LAUNCH DEBUG] Shared mem OK: %s\n", 
                     nbytes_shared <= (size_t)max_shmem ? "YES" : "NO - TOO LARGE!");
+            
+            // HOST SIDE: Verify K tensor values from GPU memory before kernel launch
+            fprintf(stderr, "[K VERIFY HOST] Reading K tensor from GPU memory...\n");
+            half k_row0[8], k_row1[8], k_row2[8], k_row3[8];
+            cudaMemcpy(k_row0, K_data, sizeof(k_row0), cudaMemcpyDeviceToHost);
+            cudaMemcpy(k_row1, (const char*)K_data + nb11, sizeof(k_row1), cudaMemcpyDeviceToHost);
+            cudaMemcpy(k_row2, (const char*)K_data + 2*nb11, sizeof(k_row2), cudaMemcpyDeviceToHost);
+            cudaMemcpy(k_row3, (const char*)K_data + 3*nb11, sizeof(k_row3), cudaMemcpyDeviceToHost);
+            
+            fprintf(stderr, "[K VERIFY HOST] K row 0: %f, %f, %f, %f | row 1: %f, %f, %f, %f\n",
+                    __half2float(k_row0[0]), __half2float(k_row0[1]), 
+                    __half2float(k_row0[2]), __half2float(k_row0[3]),
+                    __half2float(k_row1[0]), __half2float(k_row1[1]),
+                    __half2float(k_row1[2]), __half2float(k_row1[3]));
+            fprintf(stderr, "[K VERIFY HOST] K row 2: %f, %f, %f, %f | row 3: %f, %f, %f, %f\n",
+                    __half2float(k_row2[0]), __half2float(k_row2[1]), 
+                    __half2float(k_row2[2]), __half2float(k_row2[3]),
+                    __half2float(k_row3[0]), __half2float(k_row3[1]),
+                    __half2float(k_row3[2]), __half2float(k_row3[3]));
+            
+            bool k_has_nan = false, k_row1_zero = true, k_row2_zero = true, k_row3_zero = true;
+            for (int i = 0; i < 4; i++) {
+                if (isnan(__half2float(k_row1[i])) || isnan(__half2float(k_row2[i])) || isnan(__half2float(k_row3[i]))) k_has_nan = true;
+                if (__half2float(k_row1[i]) != 0.0f) k_row1_zero = false;
+                if (__half2float(k_row2[i]) != 0.0f) k_row2_zero = false;
+                if (__half2float(k_row3[i]) != 0.0f) k_row3_zero = false;
+            }
+            if (k_has_nan) fprintf(stderr, "[K VERIFY HOST] *** WARNING: K tensor has NaN! ***\n");
+            if (k_row1_zero) fprintf(stderr, "[K VERIFY HOST] *** WARNING: K row 1 is all zeros! ***\n");
+            if (k_row2_zero) fprintf(stderr, "[K VERIFY HOST] *** WARNING: K row 2 is all zeros! ***\n");
+            if (k_row3_zero) fprintf(stderr, "[K VERIFY HOST] *** WARNING: K row 3 is all zeros! ***\n");
+            
             fprintf(stderr, "[LAUNCH DEBUG] ==========================================\n\n");
             launch_debug_printed = true;
         }

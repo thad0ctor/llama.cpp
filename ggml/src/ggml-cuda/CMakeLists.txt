@@ -138,6 +138,11 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_DEBUG)
     endif()
 
+    option(GGML_CUDA_KERNEL_DEBUG "Enable CUDA kernel debug prints" OFF)
+    if (GGML_CUDA_KERNEL_DEBUG)
+        add_compile_definitions(GGML_CUDA_KERNEL_DEBUG)
+    endif()
+
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
         # Options are:
         # - none (not recommended)
