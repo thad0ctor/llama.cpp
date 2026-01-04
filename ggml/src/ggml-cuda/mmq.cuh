@@ -1153,6 +1153,12 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
     const float * y_df = (const float *) y;
     const half2 * y_ds = (const half2 *) y;
 
+    // Debug: verify Y-tile read stride (y_qs = y + 4, so y_qs[0] should match buf_A[4])
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k00 == 0) {
+        printf("[Y_DOT_SM120] stride=%d, y_qs[0]=%d, y_qs[stride]=%d, y_qs[2*stride]=%d (qs, col 0,1,2)\n",
+               MMQ_TILE_Y_K, y_qs[0], y_qs[MMQ_TILE_Y_K], y_qs[2*MMQ_TILE_Y_K]);
+    }
+
     const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
     // =========================================================================
@@ -1166,6 +1172,13 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_sm120(
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k00 == 0) {
         printf("[DOT_SM120] stride=%d, x_qs[0]=%d, x_qs[stride]=%d, x_qs[2*stride]=%d\n",
                MMQ_MMA_TILE_X_K_Q8_0_SM120, x_qs[0], x_qs[MMQ_MMA_TILE_X_K_Q8_0_SM120], x_qs[2*MMQ_MMA_TILE_X_K_Q8_0_SM120]);
+        printf("[DOT_SM120] i0=%d, ntx=%d, rows_per_warp=%d, granularity=%d\n",
+               i0, ntx, rows_per_warp, granularity);
+    }
+    // Debug: check what threads 4 and 8 see (these compute rows 1 and 2 which are zeros)
+    if ((threadIdx.x == 4 || threadIdx.x == 8) && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k00 == 0) {
+        printf("[DOT_SM120 thread %d] i0=%d, x_qs[i0*stride]=%d, row_computed=%d\n",
+               threadIdx.x, i0, x_qs[i0*MMQ_MMA_TILE_X_K_Q8_0_SM120], i0 + threadIdx.x/4);
     }
 
 #pragma unroll
@@ -3911,6 +3924,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 // Wait for Tile 0, compute it
                 cp_async_wait_group<1>();
                 __syncthreads();
+
+                // Debug: verify Y-tile strided copy (src stride=36, dst stride=40)
+                if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    printf("[Y_LOAD_SM120] src_stride=%d, dst_stride=%d\n", sz, MMQ_TILE_Y_K);
+                    printf("[Y_LOAD_SM120] buf_A[0]=%d, buf_A[stride]=%d, buf_A[2*stride]=%d (scales)\n",
+                           buf_A[0], buf_A[MMQ_TILE_Y_K], buf_A[2*MMQ_TILE_Y_K]);
+                    printf("[Y_LOAD_SM120] buf_A[4]=%d, buf_A[stride+4]=%d, buf_A[2*stride+4]=%d (qs, col 0,1,2)\n",
+                           buf_A[4], buf_A[MMQ_TILE_Y_K+4], buf_A[2*MMQ_TILE_Y_K+4]);
+                }
+
                 vec_dot(tile_x, buf_A, sum, 0);
 
                 // Wait for Tile 1, compute it
