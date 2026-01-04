@@ -117,46 +117,46 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     //   - num_consumers=0 means unified mode (no producer warp)
     //   - All warps cooperatively load K/V via cp.async
     //   - All warps compute attention in parallel
-    //   - nbatch_fa=128 to match reference BLOCK_Q=128
+    //   - nbatch_fa=64 to reduce register pressure (253 regs/thread with 128 hit limits)
 
     if (DKQ == 64 && DV == 64) {
-        // Shared mem: 128 × (32 + 32) × 4 × 2 = 64KB ✓
-        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
-        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
-        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
-        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 16, 2, true, 0);
+        // Shared mem: 64 × (32 + 32) × 4 × 2 = 32KB ✓
+        if (ncols <=  8) return fattn_mma_config(128, 1, 64, 32, 32, 16, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 64, 32, 32, 16, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 64, 32, 32, 16, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 64, 32, 32, 16, 2, true, 0);
     }
     if (DKQ == 80 && DV == 80) {
         // nbatch_combine=20 to satisfy (DV/2) % nbatch_combine == 0 → 40 % 20 = 0
-        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
-        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
-        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
-        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 20, 2, true, 0);
+        if (ncols <=  8) return fattn_mma_config(128, 1, 64, 32, 32, 20, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 64, 32, 32, 20, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 64, 32, 32, 20, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 64, 32, 32, 20, 2, true, 0);
     }
 
     // ========== Medium heads - 4 warps (128 threads) ==========
 
     if (DKQ == 96 && DV == 96) {
         // nbatch_combine=24 to satisfy (DV/2) % nbatch_combine == 0 → 48 % 24 = 0
-        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
-        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
-        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
-        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 24, 2, true, 0);
+        if (ncols <=  8) return fattn_mma_config(128, 1, 64, 32, 32, 24, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 64, 32, 32, 24, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 64, 32, 32, 24, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 64, 32, 32, 24, 2, true, 0);
     }
     if (DKQ == 112 && DV == 112) {
         // nbatch_combine=28 to satisfy (DV/2) % nbatch_combine == 0 → 56 % 28 = 0
-        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
-        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
-        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
-        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 28, 2, true, 0);
+        if (ncols <=  8) return fattn_mma_config(128, 1, 64, 32, 32, 28, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 64, 32, 32, 28, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 64, 32, 32, 28, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 64, 32, 32, 28, 2, true, 0);
     }
     if (DKQ == 128 && DV == 128) {
         // Most common: Llama, Mistral, Qwen, etc.
-        // This is the exact config from Gau-Nernst reference
-        if (ncols <=  8) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, true, 0);
-        if (ncols <= 16) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, true, 0);
-        if (ncols <= 32) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, true, 0);
-        if (ncols <= 64) return fattn_mma_config(128, 1, 128, 32, 32, 32, 2, false, 0);
+        // nbatch_fa=64 (not 128) to stay under 255 register limit
+        if (ncols <=  8) return fattn_mma_config(128, 1, 64, 32, 32, 32, 2, true, 0);
+        if (ncols <= 16) return fattn_mma_config(128, 1, 64, 32, 32, 32, 2, true, 0);
+        if (ncols <= 32) return fattn_mma_config(128, 1, 64, 32, 32, 32, 2, true, 0);
+        if (ncols <= 64) return fattn_mma_config(128, 1, 64, 32, 32, 32, 2, false, 0);
     }
     
     // ========== Large heads - Fall back to Ampere ==========
@@ -3815,8 +3815,9 @@ __global__ void flash_attn_ext_f16_blackwell(
         // Lightweight Q loading: cooperative across all warps, single stride to keep
         // register footprint down. Each warp handles strided columns, each lane
         // walks DKQ/2 in WARP_SIZE steps.
-        // nwarps_total = num_consumers + 1 (producer) = 5 for sm_120, 9 for sm_100
-        constexpr int nwarps_total = num_consumers + 1;
+        // nwarps_total: unified mode (num_consumers=0) uses all nwarps
+        //               producer/consumer mode uses num_consumers + 1 (producer)
+        constexpr int nwarps_total = (num_consumers > 0) ? (num_consumers + 1) : nwarps;
         const float2 *Q_base = Q_f2;
         for (int jc = threadIdx.y; jc < ncols; jc += nwarps_total) {
             const int j1 = jc / ncols2;
@@ -3862,34 +3863,28 @@ __global__ void flash_attn_ext_f16_blackwell(
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
          // =====================================================================
-         // SM_120 PATH: Consumer warps compute (producer warp idles)
+         // SM_120 PATH: UNIFIED MODE - All warps do both load and compute
          // =====================================================================
          // DEBUG: Unconditional print to confirm SM_120 path is taken
-         if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0) {
-             printf("[SM120 PATH] Block 0 entering SM_120 consumer path, calling process_tile\n");
+         if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+             printf("[SM120 PATH] Block 0 entering SM_120 UNIFIED mode, calling process_tile\n");
              printf("[SM120 PATH] kv_head_row_offset=%d, K_total_rows=%d\n", kv_head_row_offset, K_total_rows);
-             printf("[SM120 PATH] kb0_start=%d, kb0_stop=%d, jt=%d\n", kb0_start, kb0_stop, jt);
+             printf("[SM120 PATH] kb0_start=%d, kb0_stop=%d, jt=%d, nwarps=%d\n", kb0_start, kb0_stop, jt, nwarps);
          }
-         // On SM_120 (RTX 5090), TMA mbarrier.arrive crashes at runtime.
-         //
-         // The Blackwell kernel is structured for 1 producer + N consumer warps.
-         // For SM_120, we:
-         //   - Have producer warp (threadIdx.y=0) idle
-         //   - Have consumer warps (threadIdx.y=1-4) do all the work with cp.async
-         //   - Use num_consumers=4 so effective_nwarps=4 and warp_id mapping is correct
-         //
-         // This ensures the work distribution matches the Blackwell config (4 compute warps).
+         // SM_120 (RTX 5090) uses UNIFIED MODE (num_consumers=0):
+         //   - ALL 4 warps do both load AND compute (no producer/consumer split)
+         //   - Uses cp.async + __syncthreads() (no TMA, no mbarrier)
+         //   - warp_id = threadIdx.y directly (0-3)
+         //   - Aligned with Gau-Nernst reference: https://gau-nernst.github.io/fa-5090/
          // =====================================================================
-         if (threadIdx.y != 0) {
-             // Consumer warps only
+         {
+             // All warps participate in unified mode
              constexpr bool is_fixup = false;
              constexpr bool needs_fixup = false;
-             // Use num_consumers=4 (not 0) so warp_id = threadIdx.y - 1 maps correctly
              flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
                  Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
          }
-         // Producer warp (threadIdx.y=0) idles here for SM_120
 #else
          // =====================================================================
          // MBARRIER PATH (SM_90/SM_100/SM_103/SM_110)
