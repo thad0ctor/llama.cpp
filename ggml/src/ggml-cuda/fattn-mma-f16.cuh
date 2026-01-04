@@ -746,6 +746,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
         const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
         const int stride_i = WARP_SIZE / stride_k;
 
+        // DEBUG: Track which unroll iteration does work
+        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && k0_start != k0_stop) {
+            printf("[LOAD UNROLL] n=%d: stride_k=%d, k0=[%d,%d), stride_i=%d, nwarps=%d, warp_id=%d\n",
+                   (int)n, stride_k, k0_start, k0_stop, stride_i, nwarps, warp_id);
+        }
+
         if (k0_start == k0_stop) {
             return;
         }
@@ -789,6 +795,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
                 }
 
                 if (valid_row) {
+                    // DEBUG: Print for first 4 rows, first chunk, first K load
+                    if (blockIdx.x == 0 && threadIdx.y == 0 && i < 4 && k == 0) {
+                        printf("[CP_ASYNC] thr=%d row=%d k=%d: SMEM=0x%x, GMEM=%p, valid=%d\n",
+                               threadIdx.x, i, k, tile_KV_base + offset_bytes, 
+                               (const void*)(KV + i*stride_KV + k*h2_per_chunk), valid_row);
+                    }
                     cp_async_cg_16<preload>(tile_KV_base + offset_bytes, KV + i*stride_KV + k*h2_per_chunk);
                 } else {
                     // OOB row: write zeros to shared memory instead of issuing cp.async to invalid address
@@ -1804,28 +1816,58 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
                 __syncthreads();
 
-                // --- SM_120 DEBUG: Verify K tile in shared memory after load ---
+                // --- SM_120 DEBUG: Verify K tile rows in shared memory after load ---
                 if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && chunk == 0 && kb0 == 0) {
-                    // Read from tile_K (buffer 0 for first chunk)
-                    half* k_half = (half*)tile_K;
-                    printf("[SM120 SMEM DEBUG] K tile after load - tile_K[0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
-                           __half2float(k_half[0]), __half2float(k_half[1]),
-                           __half2float(k_half[2]), __half2float(k_half[3]),
-                           __half2float(k_half[4]), __half2float(k_half[5]),
-                           __half2float(k_half[6]), __half2float(k_half[7]));
-
-                    // Check for NaN/Inf in first 32 values
-                    bool has_nan = false;
-                    bool has_inf = false;
-                    for (int i = 0; i < 32; i++) {
-                        float v = __half2float(k_half[i]);
-                        if (isnan(v)) has_nan = true;
-                        if (isinf(v)) has_inf = true;
-                    }
-                    if (has_nan) printf("[SM120 SMEM DEBUG] *** NaN DETECTED in K tile! ***\n");
-                    if (has_inf) printf("[SM120 SMEM DEBUG] *** Inf DETECTED in K tile! ***\n");
-
-                    // Also print source address info
+                    half* smem_half = (half*)tile_K;
+                    constexpr int STRIDE_BYTES_LOCAL = stride_tile_K * sizeof(half2);  // 128 bytes
+                    
+                    printf("[SMEM VERIFY] STRIDE_BYTES=%d\n", STRIDE_BYTES_LOCAL);
+                    
+                    // Using write path's swizzle formula:
+                    // swizzle(row * STRIDE) = (row * STRIDE) ^ (row << 4)  [for STRIDE=128]
+                    // In halfs: divide byte offset by 2
+                    
+                    // Row 0: swizzle(0) = 0
+                    int off0 = 0;
+                    printf("[SMEM ROW 0] offset_bytes=0 → halfs[%d]: (%f,%f)\n", 
+                           off0/2, __half2float(smem_half[off0/2]), __half2float(smem_half[off0/2+1]));
+                    
+                    // Row 1: swizzle(128) = 128 ^ 16 = 144 bytes = 72 halfs
+                    int off1 = 128 ^ 16;  // 144
+                    printf("[SMEM ROW 1] offset_bytes=144 → halfs[%d]: (%f,%f)\n", 
+                           off1/2, __half2float(smem_half[off1/2]), __half2float(smem_half[off1/2+1]));
+                    
+                    // Row 2: swizzle(256) = 256 ^ 32 = 288 bytes = 144 halfs
+                    int off2 = 256 ^ 32;  // 288
+                    printf("[SMEM ROW 2] offset_bytes=288 → halfs[%d]: (%f,%f)\n", 
+                           off2/2, __half2float(smem_half[off2/2]), __half2float(smem_half[off2/2+1]));
+                    
+                    // Row 3: swizzle(384) = 384 ^ 48 = 432 bytes = 216 halfs
+                    int off3 = 384 ^ 48;  // 432
+                    printf("[SMEM ROW 3] offset_bytes=432 → halfs[%d]: (%f,%f)\n", 
+                           off3/2, __half2float(smem_half[off3/2]), __half2float(smem_half[off3/2+1]));
+                    
+                    // Also check LINEAR addresses (in case swizzle isn't being applied)
+                    printf("[SMEM LINEAR CHECK] If data is at LINEAR addresses instead:\n");
+                    printf("[SMEM LINEAR] halfs[0]: (%f,%f)   halfs[64]: (%f,%f)\n",
+                           __half2float(smem_half[0]), __half2float(smem_half[1]),
+                           __half2float(smem_half[64]), __half2float(smem_half[65]));
+                    printf("[SMEM LINEAR] halfs[128]: (%f,%f)  halfs[192]: (%f,%f)\n",
+                           __half2float(smem_half[128]), __half2float(smem_half[129]),
+                           __half2float(smem_half[192]), __half2float(smem_half[193]));
+                    
+                    // RAW BYTES: Check if row 0 spans beyond 128 bytes
+                    unsigned char* smem_bytes = (unsigned char*)tile_K;
+                    printf("[SMEM RAW] First 8 bytes of offset 0:   %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           smem_bytes[0], smem_bytes[1], smem_bytes[2], smem_bytes[3],
+                           smem_bytes[4], smem_bytes[5], smem_bytes[6], smem_bytes[7]);
+                    printf("[SMEM RAW] First 8 bytes of offset 144: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           smem_bytes[144], smem_bytes[145], smem_bytes[146], smem_bytes[147],
+                           smem_bytes[148], smem_bytes[149], smem_bytes[150], smem_bytes[151]);
+                    printf("[SMEM RAW] First 8 bytes of offset 128: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           smem_bytes[128], smem_bytes[129], smem_bytes[130], smem_bytes[131],
+                           smem_bytes[132], smem_bytes[133], smem_bytes[134], smem_bytes[135]);
+                    
                     printf("[SM120 SMEM DEBUG] K_h2=%p, k_VKQ_0=%d, stride_K=%d\n",
                            (void*)K_h2, k_VKQ_0, stride_K);
                 }

@@ -582,6 +582,15 @@ namespace ggml_cuda_mma {
     static __device__ __forceinline__ void load_ldmatrix_swizzle(
             tile<16, 8, T, dl> & t, uint32_t smem_base, int row_offset, int col_offset_bytes) {
 #ifdef TURING_MMA_AVAILABLE
+        // Entry debug (once per kernel)
+        if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+            static bool entry_printed = false;
+            if (!entry_printed) {
+                entry_printed = true;
+                printf("[LDMATRIX ENTRY] load_ldmatrix_swizzle<STRIDE=%d> called!\n", STRIDE_BYTES);
+            }
+        }
+        
         int * xi = (int *) t.x;
         
         // Thread position within 16x8 tile:
@@ -603,16 +612,19 @@ namespace ggml_cuda_mma {
             : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
             : "r"(addr));
         
-        // DEBUG: Print register values after ldmatrix (once per block)
-        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && row_offset == 0 && col_offset_bytes == 0) {
+        // DEBUG: Print register values for multiple threads to check swizzle pattern
+        if (blockIdx.x == 0 && threadIdx.y == 0 && row_offset == 0 && col_offset_bytes == 0) {
             half2* h2 = (half2*)xi;
             float v0 = __half2float(__low2half(h2[0]));
             float v1 = __half2float(__high2half(h2[0]));
-            printf("[LDMATRIX DEBUG] addr=0x%x, linear=0x%x, swizzled=0x%x, xor_col=0x%x\n",
-                   addr, linear_offset, swizzled_offset, col_offset_bytes);
-            printf("[LDMATRIX DEBUG] reg[0]=(%f, %f) isnan=%d\n", v0, v1, (isnan(v0) || isnan(v1)));
-            printf("[LDMATRIX DEBUG] STRIDE_BYTES=%d, thread_row=%d, thread_col_bytes=%d\n",
-                   STRIDE_BYTES, thread_row, thread_col_bytes);
+            bool is_nan = isnan(v0) || isnan(v1);
+            
+            // Print for threads 0, 1, 2, 3 (different rows with different swizzle XOR bits)
+            if (threadIdx.x < 4) {
+                printf("[LDMATRIX T%d] row=%d col=%d linear=0x%x swizzled=0x%x addr=0x%x val=(%f,%f) nan=%d\n",
+                       threadIdx.x, thread_row, thread_col_bytes, linear_offset, swizzled_offset, addr,
+                       v0, v1, is_nan);
+            }
         }
 #else
         GGML_UNUSED_VARS(t, smem_base, row_offset, col_offset_bytes);
