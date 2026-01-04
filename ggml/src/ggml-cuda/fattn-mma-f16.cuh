@@ -1615,7 +1615,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // NOTE: No stage offset - chunk buffers are reused each kb0 iteration (matches producer)
     half2 * consumer_tile_K_base = nullptr;
     if (consumer_mode) {
-#ifdef BLACKWELL_TMA_AVAILABLE
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        // SM_120: Use tile_K directly (no TMA producer, just shared memory)
+        consumer_tile_K_base = tile_K;
+#elif defined(BLACKWELL_TMA_AVAILABLE)
         consumer_tile_K_base = tile_K;
         // DEBUG: Print consumer K base setup (once per warp per block)
         if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0) {
@@ -1638,7 +1641,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         half2 * current_tile_K = tile_K;
 
         if (consumer_mode) {
-#ifdef BLACKWELL_TMA_AVAILABLE
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120 FALLBACK: Use __syncthreads__ instead of mbarrier_wait
             // Producer has already loaded K and hit SYNC 1 - data is ready
@@ -1648,7 +1650,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             // All K chunks are already loaded by producer - just point to data
             current_tile_K = consumer_tile_K_base + current_stage * (bytes_K_chunk / sizeof(half2));
-#else
+#elif defined(BLACKWELL_TMA_AVAILABLE)
             // Standard mbarrier path for SM_90/100/103/110
             if constexpr (needs_chunking) {
                 // DEBUG: Print before wait
@@ -1678,7 +1680,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     current_tile_K = consumer_tile_K_base + current_stage * (bytes_K_chunk / sizeof(half2));
                 }
             }
-#endif // SM_120 check
 #endif
         } else {
             current_tile_K = tile_K;
@@ -1846,7 +1847,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 
         if (consumer_mode) {
-#ifdef BLACKWELL_TMA_AVAILABLE
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+            // SM_120: No mbarrier signaling needed - __syncthreads handles coordination
+            (void)0;
+#elif defined(BLACKWELL_TMA_AVAILABLE)
             if constexpr (needs_chunking) {
                 // DEBUG: Print before signaling completion
                 if (threadIdx.x == 0 && threadIdx.y == 1 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
@@ -1855,12 +1859,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
 
                 // Signal we're done with this chunk
-                // NOTE: Using mbarrier_arrive instead of mbarrier_arrive_expect_tx(0) 
+                // NOTE: Using mbarrier_arrive instead of mbarrier_arrive_expect_tx(0)
                 // since we're not setting TMA byte expectations
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                // SM_120: No mbarrier_arrive needed - __syncthreads handles coordination
-                (void)0;
-#else
                 mbarrier_arrive(&pipeline_state->empty_K_chunk[chunk_stage]);
 
                 // Flip chunk phase after every 2 chunks
@@ -1870,16 +1870,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         printf("[CONSUMER DEBUG] K phase flip -> %d\n", consumer_chunk_phase_K);
                     }
                 }
-#endif
             } else {
                 // Legacy mode: signal once at the end (last chunk only)
                 if (chunk == num_K_chunks - 1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                    // SM_120: No mbarrier_arrive needed
-                    (void)0;
-#else
                     mbarrier_arrive(&pipeline_state->empty_K[current_stage]);
-#endif
                 }
             }
 #endif
@@ -2175,7 +2169,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // tile_V already points to V chunk base (after K chunks), so no additional offset needed
     const half2 * consumer_tile_V_base = nullptr;
     if (consumer_mode) {
-#ifdef BLACKWELL_TMA_AVAILABLE
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        // SM_120: Use tile_V directly (no TMA producer, just shared memory)
+        consumer_tile_V_base = tile_V;
+#elif defined(BLACKWELL_TMA_AVAILABLE)
         consumer_tile_V_base = tile_V;
 #endif
     }
@@ -2193,7 +2190,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const half2 * tile_V_i = tile_V;
 
         if (consumer_mode) {
-#ifdef BLACKWELL_TMA_AVAILABLE
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120 FALLBACK: Use __syncthreads__ instead of mbarrier_wait
             // Producer has already loaded V and hit SYNC 2 - data is ready
@@ -2202,7 +2198,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             // All V chunks are already loaded by producer - just point to data
             tile_V_i = consumer_tile_V_base + current_stage * (bytes_V_chunk / sizeof(half2));
-#else
+#elif defined(BLACKWELL_TMA_AVAILABLE)
             // Standard mbarrier path for SM_90/100/103/110
             if constexpr (needs_chunking) {
                 // DEBUG: Print before V wait
@@ -2232,7 +2228,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     tile_V_i = consumer_tile_V_base + current_stage * (bytes_V_chunk / sizeof(half2));
                 }
             }
-#endif // SM_120 check
 #endif
         } else {
             tile_V_i = tile_V;
@@ -2469,14 +2464,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(TURING_MMA_AVAILABLE)
 
         if (consumer_mode) {
-#ifdef BLACKWELL_TMA_AVAILABLE
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120 FALLBACK: Use __syncthreads__ instead of mbarrier_arrive
             // Signal tile processing complete after last V chunk
             if (v_chunk == num_V_chunks - 1) {
                 __syncthreads();  // SYNC 3: Tile processing complete
             }
-#else
+#elif defined(BLACKWELL_TMA_AVAILABLE)
             // Standard mbarrier path for SM_90/100/103/110
             if constexpr (needs_chunking) {
                 // DEBUG: Print before signaling V completion
@@ -2499,7 +2493,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     mbarrier_arrive(&pipeline_state->empty_V[current_stage]);
                 }
             }
-#endif // SM_120 check
 #endif
         } else {
             if constexpr (nstages <= 1) {
@@ -2896,13 +2889,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     if (!pipeline_state || num_consumers > 0) {
         if (pipeline_state) {
-#ifdef BLACKWELL_TMA_AVAILABLE
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
             // SM_120: No Q_loaded barrier - __syncthreads__ handles coordination
             (void)0;
-#else
+#elif defined(BLACKWELL_TMA_AVAILABLE)
             mbarrier_arrive(&pipeline_state->Q_loaded);
-#endif
 #endif
         } else {
             __syncthreads();
@@ -3601,7 +3592,9 @@ __global__ void flash_attn_ext_f16_blackwell(
     }
     __syncthreads();
 
-#ifdef BLACKWELL_TMA_AVAILABLE
+#ifdef BLACKWELL_MMA_AVAILABLE
+    // Blackwell kernel body - uses MMA (available on both sm_100 and sm_120)
+    // TMA vs cp.async is controlled by the use_tma template parameter, not this guard
     // EARLY DEBUG: Check if kernel even starts
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
         printf("[KERNEL DEBUG] Blackwell kernel ENTRY - block=(%d,%d,%d) thread=(%d,%d)\n",
@@ -4234,9 +4227,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     // Update Shared Memory Calculation for Blackwell with chunk double-buffering
     // New layout: [K chunk 0][K chunk 1][V chunk 0][V chunk 1][Q tiles][mask][pipeline_state][mbarriers]
-    // Only apply larger shared memory when we'll actually use the Blackwell kernel
+    // Apply for ALL Blackwell (including SM_120 which uses cp.async but same shared memory layout)
     const auto config_bw = ggml_cuda_fattn_mma_get_config_blackwell(DKQ, DV, ncols);
-    if (ggml_cuda_has_blackwell_features(cc) && use_tma_runtime && config_bw.num_consumers > 0) {
+    // SM_120: use_tma_runtime=false but still needs Blackwell shared memory layout
+    const bool use_blackwell_shmem = ggml_cuda_has_blackwell_features(cc) && config_bw.num_consumers > 0;
+    if (use_blackwell_shmem) {
         // K: 2 chunk buffers for double-buffering
         size_t bytes_K_chunk = config_bw.nbatch_fa * config_bw.nbatch_K2 * sizeof(half2);
         size_t bytes_K_total = 2 * bytes_K_chunk;
@@ -4263,9 +4258,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
-            // Only set shared memory limit if we're NOT on Blackwell running the Ampere kernel
-            // On Blackwell with Ampere kernel, use the default shared memory settings
-            const bool using_blackwell_kernel = tma && ggml_cuda_has_blackwell_features(cc);
+            // Only set shared memory limit if we're using the Blackwell kernel
+            // SM_120: tma=false but still uses Blackwell kernel with cp.async
+            // SM_100+: tma=true uses Blackwell kernel with TMA
+            const bool using_blackwell_kernel = use_blackwell_shmem;
             
             fprintf(stderr, "[FUNC DEBUG] Setting kernel attributes:\n");
             fprintf(stderr, "[FUNC DEBUG]   tma=%d, using_blackwell_kernel=%d\n", tma, using_blackwell_kernel);
@@ -4345,13 +4341,26 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 if (!debug_printed && DKQ == 128 && DV == 128) {
                     fprintf(stderr, "[FATTN DEBUG]   ==> LAUNCHING BLACKWELL KERNEL (chunks: K=%d, V=%d)!\n",
                             num_K_chunks, num_V_chunks);
+                    fprintf(stderr, "[FATTN DEBUG]   ==> use_tma_runtime=%d (template & launch param)\n", use_tma_runtime);
                     fprintf(stderr, "[FATTN DEBUG] ===================================\n\n");
                     debug_printed = true;
                 }
-                if (use_logit_softcap_kernel) {
-                     launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, true>, true);
+                // SM_120: use_tma_runtime=false, instantiate kernel with use_tma=false template
+                // Other Blackwell: use_tma_runtime=true, instantiate kernel with use_tma=true template
+                if (use_tma_runtime) {
+                    // TMA path for datacenter Blackwell (SM_100/103/110)
+                    if (use_logit_softcap_kernel) {
+                        launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, true>, true);
+                    } else {
+                        launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, false, mla, true>, true);
+                    }
                 } else {
-                     launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, false, mla, true>, true);
+                    // cp.async path for SM_120 (RTX 5090) - no TMA
+                    if (use_logit_softcap_kernel) {
+                        launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, true, mla, false>, false);
+                    } else {
+                        launch_kernel(flash_attn_ext_f16_blackwell<DKQ, DV, ncols1, ncols2, false, mla, false>, false);
+                    }
                 }
                 return;
             }

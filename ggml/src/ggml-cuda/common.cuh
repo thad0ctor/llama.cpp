@@ -190,12 +190,16 @@ static const char * cu_get_error_str(CUresult err) {
 #define CP_ASYNC_AVAILABLE
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
-// Blackwell MMA available for sm_120+
+// Blackwell MMA available for sm_100+ (datacenter) and sm_120+ (consumer)
+// Note: GGML_CUDA_CC_BLACKWELL = 1200 targets sm_120 (RTX 5090)
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
 #define BLACKWELL_MMA_AVAILABLE
-#define BLACKWELL_TMA_AVAILABLE
+// TMA is only reliable on datacenter Blackwell (sm_100/103/110), NOT consumer (sm_120)
+// sm_120 (RTX 5090) uses cp.async instead of TMA for memory loading
+// Since we're targeting sm_120 (CC 1200), do NOT define BLACKWELL_TMA_AVAILABLE
+// #define BLACKWELL_TMA_AVAILABLE  // DISABLED for sm_120
 // WGMMA is only available on Compute Blackwell (sm_100), not Consumer (sm_120)
-#if __CUDA_ARCH__ == 100
+#if __CUDA_ARCH__ == 1000
 #define BLACKWELL_WGMMA_AVAILABLE
 #endif
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
