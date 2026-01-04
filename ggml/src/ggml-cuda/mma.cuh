@@ -509,64 +509,97 @@ namespace ggml_cuda_mma {
     }
 
     // ============================================================================
-    // SM_120 Optimized ldmatrix with Swizzle Support
+    // SM_120 Optimized ldmatrix with Swizzle Support (Gau-Nernst V5 Style)
     // ============================================================================
-    // These functions apply XOR-based swizzling to eliminate bank conflicts
-    // when loading from shared memory. The swizzle pattern matches the layout
-    // used by the global_to_shared_swizzle() function in cp-async.cuh.
     //
-    // Key optimization: ldmatrix.x4 loads 4 8x8 tiles in a single instruction,
-    // reducing instruction count in the hot MMA loop.
-    // Gau-Nernst saw 91% → 93% throughput improvement from this optimization.
+    // BUG FIX SUMMARY (2026-01-03):
+    // -----------------------------
+    // This code fixes a critical NaN bug in SM_120 (RTX 5090) flash attention.
+    //
+    // ROOT CAUSE:
+    // The previous implementation had two bugs in the ldmatrix swizzle logic:
+    //
+    //   1. WRONG: Used ".shared.b16" modifier with "r" (32-bit) constraint
+    //      FIXED: Use NO .shared modifier, let hardware infer state space
+    //      The .shared.b16 variant appears buggy or has different semantics on SM_120.
+    //
+    //   2. WRONG: Used ADDITION for column offset navigation
+    //             addr = swizzle(row * STRIDE + col)  // computed each time
+    //      FIXED: Use XOR for column iteration (matches Gau-Nernst reference)
+    //             swizzled = swizzle(row * STRIDE + thread_col)
+    //             addr = smem_base + (swizzled ^ col_offset_bytes)
+    //
+    // WHY XOR WORKS:
+    // The XOR-based swizzle pattern has a key mathematical property:
+    //   swizzle(offset + col) == swizzle(offset) ^ col  (within same row)
+    //
+    // This allows efficient column iteration without recomputing the full swizzle.
+    // Example trace (STRIDE_BYTES=256):
+    //   - Write row 2, chunk 0: offset=512 → swizzle → 544, stored at smem+544
+    //   - Write row 2, chunk 2: offset=544 → swizzle → 512, stored at smem+512
+    //   - Read  row 2, col 0:   swizzle(512)=544, 544^0=544  ✓
+    //   - Read  row 2, col 32:  swizzle(512)=544, 544^32=512 ✓
+    //
+    // WRITE PATH (fattn-mma-f16.cuh::flash_attn_ext_f16_load_tile_swizzle):
+    //   offset = row * STRIDE_BYTES + chunk * 16
+    //   offset ^= (xor_bits << 4)  // where xor_bits = (row % 8) / rows_per_swizzle
+    //   cp_async(smem_base + offset, gmem_src)
+    //
+    // READ PATH (this file, load_ldmatrix_swizzle):
+    //   linear_offset = thread_row * STRIDE_BYTES + thread_col_bytes
+    //   swizzled_offset = swizzle(linear_offset)
+    //   addr = smem_base + (swizzled_offset ^ col_offset_bytes)  // XOR not ADD!
+    //   ldmatrix.sync.aligned.m8n8.x4.b16 [addr]  // NO .shared modifier!
+    //
+    // Reference: Gau-Nernst Flash Attention V5 implementation
+    // https://gau-nern.st/blog/flash-attention-from-scratch.html
     // ============================================================================
 
-    // Swizzle function for ldmatrix address calculation
+    // Swizzle function matching the write path in flash_attn_ext_f16_load_tile_swizzle
+    // This applies XOR to bits [4:6] based on row index for bank conflict avoidance
     // STRIDE_BYTES = row stride in bytes (e.g., DIM * sizeof(half))
     template <int STRIDE_BYTES>
-    static __device__ __forceinline__ uint32_t ldmatrix_swizzle_addr(uint32_t base_addr, int row, int col_bytes) {
-        // Calculate linear offset
-        uint32_t offset = row * STRIDE_BYTES + col_bytes;
-        uint32_t offset_before_swizzle = offset;  // Save for debug
-
-        // Apply swizzle: XOR bits [4:6] with row-derived pattern
-        if constexpr (STRIDE_BYTES > 16) {
+    static __device__ __forceinline__ uint32_t swizzle_addr(uint32_t addr) {
+        if constexpr (STRIDE_BYTES <= 16) {
+            return addr;  // No swizzling for small strides
+        } else {
+            // XOR pattern: bits_to_xor = (row_idx / rows_per_swizzle_group) & 0x7
+            // Then XOR with bits [4:6] of address
             constexpr int rows_per_swizzle = (64 / STRIDE_BYTES) > 0 ? (64 / STRIDE_BYTES) : 1;
-            uint32_t row_mod8 = (offset / STRIDE_BYTES) % 8;
-            uint32_t xor_bits = row_mod8 / rows_per_swizzle;
-            offset ^= (xor_bits << 4);
+            uint32_t row_idx = (addr / STRIDE_BYTES) % 8;
+            uint32_t xor_bits = row_idx / rows_per_swizzle;
+            return addr ^ (xor_bits << 4);
         }
-
-        // DEBUG: Print swizzle calculation for thread 0
-        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-            static bool printed = false;
-            if (!printed) {
-                printf("[SWIZZLE ADDR] STRIDE_BYTES=%d, row=%d, col_bytes=%d\n", STRIDE_BYTES, row, col_bytes);
-                printf("[SWIZZLE ADDR] offset_before=0x%x, offset_after=0x%x, final_addr=0x%x\n",
-                       offset_before_swizzle, offset, base_addr + offset);
-                printed = true;
-            }
-        }
-
-        return base_addr + offset;
     }
 
     // ldmatrix.x4 with swizzle for 16x8 tile (most common in Flash Attention)
-    // Loads directly from swizzled shared memory layout
+    // Uses Gau-Nernst style: pre-computed swizzled base + XOR for column iteration
+    //
+    // CRITICAL: Uses 32-bit address with "r" constraint but NO .shared modifier!
+    // This matches the reference code and allows hardware to infer state space.
+    // The .shared.b16 variant has issues on SM_120.
     template <int STRIDE_BYTES, typename T, data_layout dl>
     static __device__ __forceinline__ void load_ldmatrix_swizzle(
             tile<16, 8, T, dl> & t, uint32_t smem_base, int row_offset, int col_offset_bytes) {
 #ifdef TURING_MMA_AVAILABLE
-        int * xi = (int * ) t.x;
+        int * xi = (int *) t.x;
         
-        // Calculate thread's address in swizzled layout
-        // ldmatrix requires 16-byte alignment. Each thread loads 4 bytes (one int = half2).
-        // t.J/2 = 4 elements, times sizeof(int) = 16 bytes = proper alignment
+        // Thread position within 16x8 tile:
+        // - Threads 0-15: rows 0-15, col group 0
+        // - Threads 16-31: rows 0-15, col group 1 (offset by 8 half = 16 bytes)
         const int thread_row = (threadIdx.x % t.I) + row_offset;
-        const int thread_col = (threadIdx.x / t.I) * (t.J / 2) * sizeof(int);  // FIX: was sizeof(half)
+        const int thread_col_bytes = (threadIdx.x / t.I) * (t.J / 2) * sizeof(int);  // 0 or 16 bytes
         
-        uint32_t addr = ldmatrix_swizzle_addr<STRIDE_BYTES>(smem_base, thread_row, col_offset_bytes + thread_col);
+        // Compute linear offset, then apply swizzle (matching write path)
+        uint32_t linear_offset = thread_row * STRIDE_BYTES + thread_col_bytes;
+        uint32_t swizzled_offset = swizzle_addr<STRIDE_BYTES>(linear_offset);
         
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+        // For column iteration: XOR with col_offset_bytes (NOT addition!)
+        // This correctly navigates the swizzled memory layout
+        uint32_t addr = smem_base + (swizzled_offset ^ col_offset_bytes);
+        
+        // Use 32-bit address with "r" constraint, NO .shared modifier (matches Gau-Nernst reference)
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
             : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
             : "r"(addr));
 #else
@@ -580,16 +613,17 @@ namespace ggml_cuda_mma {
     static __device__ __forceinline__ void load_ldmatrix_trans_swizzle(
             tile<16, 8, T> & t, uint32_t smem_base, int row_offset, int col_offset_bytes) {
 #ifdef TURING_MMA_AVAILABLE
-        int * xi = (int * ) t.x;
+        int * xi = (int *) t.x;
         
-        // ldmatrix requires 16-byte alignment. t.J/2 * sizeof(int) = 4 * 4 = 16 bytes
         const int thread_row = (threadIdx.x % t.I) + row_offset;
-        const int thread_col = (threadIdx.x / t.I) * (t.J / 2) * sizeof(int);  // FIX: was sizeof(half)
+        const int thread_col_bytes = (threadIdx.x / t.I) * (t.J / 2) * sizeof(int);
         
-        uint32_t addr = ldmatrix_swizzle_addr<STRIDE_BYTES>(smem_base, thread_row, col_offset_bytes + thread_col);
+        uint32_t linear_offset = thread_row * STRIDE_BYTES + thread_col_bytes;
+        uint32_t swizzled_offset = swizzle_addr<STRIDE_BYTES>(linear_offset);
+        uint32_t addr = smem_base + (swizzled_offset ^ col_offset_bytes);
         
-        // Note: .trans variant reorders output registers for transposed load
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+        // .trans variant reorders output registers for transposed load
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
             : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
             : "r"(addr));
 #else
@@ -605,19 +639,27 @@ namespace ggml_cuda_mma {
 #ifdef TURING_MMA_AVAILABLE
         int * xi = (int *) t.x;
         
-        // ldmatrix requires 16-byte alignment. t.J/2 * sizeof(int) = 4 * 4 = 16 bytes
         const int thread_row = (threadIdx.x % t.I) + row_offset;
-        const int thread_col = ((threadIdx.x / t.I) * (t.J / 2)) * sizeof(int);  // FIX: was sizeof(half)
+        const int thread_col_bytes = ((threadIdx.x / t.I) * (t.J / 2)) * sizeof(int);
         
-        uint32_t addr = ldmatrix_swizzle_addr<STRIDE_BYTES>(smem_base, thread_row, col_offset_bytes + thread_col);
+        uint32_t linear_offset = thread_row * STRIDE_BYTES + thread_col_bytes;
+        uint32_t swizzled_offset = swizzle_addr<STRIDE_BYTES>(linear_offset);
+        uint32_t addr = smem_base + (swizzled_offset ^ col_offset_bytes);
         
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
             : "=r"(xi[0]), "=r"(xi[1])
             : "r"(addr));
 #else
         GGML_UNUSED_VARS(t, smem_base, row_offset, col_offset_bytes);
         NO_DEVICE_CODE;
 #endif // TURING_MMA_AVAILABLE
+    }
+    
+    // Legacy function name for compatibility
+    template <int STRIDE_BYTES>
+    static __device__ __forceinline__ uint32_t ldmatrix_swizzle_addr(uint32_t base_addr, int row, int col_bytes) {
+        uint32_t linear_offset = row * STRIDE_BYTES + col_bytes;
+        return base_addr + swizzle_addr<STRIDE_BYTES>(linear_offset);
     }
 
     // ============================================================================
