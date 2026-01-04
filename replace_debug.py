@@ -35,17 +35,16 @@ def process_file(filepath):
     #   \[                  : literal [
     # )                     : end capture group 1
     
-    # Using a function for replacement to handle the exact string start
     def repl_fprintf(match):
         return f'DEBUG_PRINT("{match.group(1)}'
 
-    content = re.sub(r'fprintf\(stderr,\s*"((\\n)?\[)\'', repl_fprintf, content)
+    content = re.sub(r'fprintf\(stderr,\s*"((\\n)?\[)', repl_fprintf, content)
 
     # Pattern 2: printf("[\n]..."
     def repl_printf(match):
         return f'DEBUG_PRINT("{match.group(1)}'
 
-    content = re.sub(r'printf\("((?:\\n)?\[)\'', repl_printf, content)
+    content = re.sub(r'printf\("((?:\\n)?\[)', repl_printf, content)
 
     # Special cases
     content = content.replace('printf("cuda pool', 'DEBUG_PRINT("cuda pool')
