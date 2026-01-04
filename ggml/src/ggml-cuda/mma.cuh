@@ -602,6 +602,18 @@ namespace ggml_cuda_mma {
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
             : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
             : "r"(addr));
+        
+        // DEBUG: Print register values after ldmatrix (once per block)
+        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && row_offset == 0 && col_offset_bytes == 0) {
+            half2* h2 = (half2*)xi;
+            float v0 = __half2float(__low2half(h2[0]));
+            float v1 = __half2float(__high2half(h2[0]));
+            printf("[LDMATRIX DEBUG] addr=0x%x, linear=0x%x, swizzled=0x%x, xor_col=0x%x\n",
+                   addr, linear_offset, swizzled_offset, col_offset_bytes);
+            printf("[LDMATRIX DEBUG] reg[0]=(%f, %f) isnan=%d\n", v0, v1, (isnan(v0) || isnan(v1)));
+            printf("[LDMATRIX DEBUG] STRIDE_BYTES=%d, thread_row=%d, thread_col_bytes=%d\n",
+                   STRIDE_BYTES, thread_row, thread_col_bytes);
+        }
 #else
         GGML_UNUSED_VARS(t, smem_base, row_offset, col_offset_bytes);
         NO_DEVICE_CODE;
