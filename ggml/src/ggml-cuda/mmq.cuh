@@ -3571,11 +3571,10 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                // Debug: check what's being written to rows 0-3
-                // Include i_max to identify which MMQ call (4096 for Q, 512 for V)
-                if ((i == 0 || i == 1 || i == 2 || i == 3) && j == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-                    printf("[WRITE_BACK i_max=%d] thread=%d,%d i=%d j=%d sum_val=%f\n",
-                           i_max, threadIdx.x, threadIdx.y, i, j,
+                // Debug: check ALL blocks writing to rows 0-3 for V projection (i_max < 200)
+                if ((i == 0 || i == 1 || i == 2 || i == 3) && j == 0 && i_max < 200) {
+                    printf("[WRITE row %d] block=(%d,%d) thread=(%d,%d) sum=%f\n",
+                           i, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y,
                            sum[(j0/tile_C::J + n)*tile_C::ne + l]);
                 }
 
@@ -4038,8 +4037,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 
     if (fixup) {
+        // Debug: show when fixup path is used
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[FIXUP PATH] blockIdx=(%d,%d) writing to tmp_fixup\n", blockIdx.x, blockIdx.y);
+        }
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
+        // Debug: show when direct path is used
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("[DIRECT PATH] blockIdx=(%d,%d) writing to dst, tile_x_max_i=%d\n", blockIdx.x, blockIdx.y, tile_x_max_i);
+        }
         write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
     }
 }
