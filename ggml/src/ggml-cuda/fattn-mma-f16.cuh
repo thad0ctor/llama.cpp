@@ -2646,14 +2646,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // to match the pointers calculated in flash_attn_ext_f16_blackwell.
     //
     // Other Blackwell (SM_100): Uses producer/consumer pipelining with mbarrier (consumer_mode = true).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120: Force chunked layout so process_tile finds tile_Q/K/V where the kernel put them
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // All Blackwell kernels (SM_100, SM_120) use the chunked layout
     constexpr bool use_chunked_layout = true;
-    constexpr bool set_pipeline_state = false;  // No consumer mode - all warps load and compute
 #else
-    constexpr bool use_chunked_layout = (num_consumers > 0);  // Other archs only when pipelined
-    constexpr bool set_pipeline_state = (num_consumers > 0);  // Use consumer mode when pipelined
+    constexpr bool use_chunked_layout = (num_consumers > 0);
 #endif
+    constexpr bool set_pipeline_state = (num_consumers > 0);  // Use consumer mode when pipelined
     if (use_chunked_layout) {
         // ================================================================
         // Shared memory layout for SM_120 Gau-Nernst V5 pipelining:
@@ -2853,60 +2852,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Q in registers is faster, but register pressure is the biggest bottleneck.
     // The loading is done with decreasing granularity for D for better memory bandwidth.
     //
-    // SKIP Q loading when:
-    // 1. pipeline_state is set (Blackwell consumer mode) - Q already loaded by producer
-    // 2. SM_120 unified mode - Q already loaded by blackwell kernel before calling process_tile
-    // The __syncthreads() calls are also already done by the caller in these cases.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-    // SM_120: Q is always pre-loaded by flash_attn_ext_f16_blackwell before calling process_tile
-    constexpr bool skip_q_load = true;
-#else
-    constexpr bool skip_q_load = false;
-#endif
-    if (!pipeline_state && !skip_q_load) {
-        const half2 scale_h2 = make_half2(scale, scale);
-#pragma unroll
-        for (int stride_k : {WARP_SIZE, WARP_SIZE/2, WARP_SIZE/4}) {
-            const int k0_start  = stride_k == WARP_SIZE ? 0 : DKQ/2 - (DKQ/2) % (2*stride_k);
-            const int k0_stop   =                             DKQ/2 - (DKQ/2) % (1*stride_k);
-            const int stride_jc = WARP_SIZE / stride_k;
-
-            if (k0_start == k0_stop) {
-                continue;
-            }
-
-#pragma unroll
-            for (int jc0 = 0; jc0 < ncols; jc0 += effective_nwarps*stride_jc) {
-                const int jc = jc0 + warp_id*stride_jc + (stride_k == WARP_SIZE ? 0 : threadIdx.x / stride_k);
-
-                if (jc0 + effective_nwarps*stride_jc > ncols && jc >= ncols) {
-                    break;
-                }
-
-                const int j = jc / ncols2;
-                const int c = jc % ncols2;
-
-                if (jt*ncols1 + j < int(ne01.z)) {
-#pragma unroll
-                    for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
-                        const int k = k0 + (stride_k == WARP_SIZE ? threadIdx.x : threadIdx.x % stride_k);
-
-                        const float2 tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
-                        tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
-                    }
-                } else {
-#pragma unroll
-                    for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
-                        const int k = k0 + (stride_k == WARP_SIZE ? threadIdx.x : threadIdx.x % stride_k);
-
-                        tile_Q[jc*stride_tile_Q + k] = make_half2(0.0f, 0.0f);
-                    }
-                }
-            }
-        }
-
-        __syncthreads();
-    }
+    // Q loading is now handled exclusively by the flash_attn_ext_f16_blackwell kernel
+    // before this function is called. This block is intentionally left empty.
 
     if (Q_in_reg) {
         const int j0 = (warp_id / np) * cols_per_warp;
@@ -2917,18 +2864,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 
-    if (!pipeline_state || num_consumers > 0) {
-        if (pipeline_state) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-            // SM_120: No Q_loaded barrier - __syncthreads__ handles coordination
-            (void)0;
-#elif defined(BLACKWELL_TMA_AVAILABLE)
-            mbarrier_arrive(&pipeline_state->Q_loaded);
-#endif
-        } else {
-            __syncthreads();
-        }
-    }
+    // The Q data is now guaranteed to be loaded and synced by the calling _blackwell kernel.
+    // The original Q-loading logic and its associated sync points inside this function
+    // have been removed to prevent race conditions.
+    __syncthreads();
 
     int kb0 = kb0_start;
 
@@ -2973,20 +2912,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    // OOB check is not compatible with multi-stage pipeline, so disable it when nstages > 1.
     //
     // For consumer mode (pipeline_state != nullptr):
     // - Stage is computed as (kb0 - kb0_start) % nstages
     // - Phase flips when stage wraps from (nstages-1) to 0
+    //
+    // OOB check strategy:
+    // - Main loop (full tiles): oob_check=false - all rows are valid
+    // - Last iteration (potentially partial): oob_check=true - may have fewer valid rows
     if constexpr (ncols2 == 1) {
-        constexpr bool oob_check = (nstages == 1);
         for (; kb0 < kb0_stop-1; ++kb0) {
             // Compute stage for this iteration (consumer mode only)
             const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
+                <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, /* oob_check= */ false, use_tma,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -2997,26 +2938,25 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 phase_V ^= 1;
             }
         }
-        // Last iteration
+        // Last iteration - enable OOB check for potentially partial tile
         const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
+            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, /* oob_check= */ true, use_tma,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
     } else {
-        // ncols2 > 1: Enable OOB check when nstages == 1 (same logic as ncols2 == 1)
-        constexpr bool oob_check = (nstages == 1);
+        // ncols2 > 1
         for (; kb0 < kb0_stop-1; ++kb0) {
             // Compute stage for this iteration (consumer mode only)
             const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
+                <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, /* oob_check= */ false, use_tma,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -3027,12 +2967,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 phase_V ^= 1;
             }
         }
-        // Last iteration - calculate actual remaining rows for OOB check
+        // Last iteration - enable OOB check for potentially partial tile
         const int current_stage = (pipeline_state && nstages > 0) ? ((kb0 - kb0_start) % nstages) : pipeline_stage;
         constexpr bool last_iter = true;
-        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;  // FIXED: was constexpr nbatch_fa
+        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, oob_check, use_tma,
+            <DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, last_iter, /* oob_check= */ true, use_tma,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
