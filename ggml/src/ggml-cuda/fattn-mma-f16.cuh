@@ -2821,9 +2821,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
-    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)] = {};
 #else // Volta
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)] = {};
 #endif // defined(TURING_MMA_AVAILABLE)
 
     float KQ_rowsum[cols_per_thread] = {0.0f};
@@ -3460,7 +3460,7 @@ __global__ void flash_attn_ext_f16_ampere(
     int kb0_start = kbc % iter_k;
     int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
 
-    while (kbc < kbc_stop && kb0_stop == iter_k) {
+    while (kbc < kbc_stop) {
         const int sequence = kbc / (iter_k*iter_j*(ne02/ncols2));
         const int zt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence) / (iter_k*iter_j); // head in units of ncols2
         const int jt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence - iter_k*iter_j*zt) / iter_k; // j index of current tile.
@@ -3770,9 +3770,16 @@ __global__ void flash_attn_ext_f16_blackwell(
     }
 
     uint32_t q_phase = 0;
-    
+
+    // Define stride variables at function scope (needed by both while loop and tail processing)
+    const int stride_Q1   = nb01 / sizeof(float2);
+    const int stride_Q2   = nb02 / sizeof(float2);
+    const int stride_K    = nb11 / sizeof(half2);
+    const int stride_mask = nb31 / sizeof(half);
+    const int stride_V    = mla ? stride_K : nb21 / sizeof(half2);
+
     // Check loop condition
-    const bool loop_cond = (kbc < kbc_stop && kb0_stop == iter_k);
+    const bool loop_cond = (kbc < kbc_stop);
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         printf("[ALL BLOCKS] Block %d: loop_cond=%d (kbc<kbc_stop=%d, kb0_stop==iter_k=%d)\n", 
                blockIdx.x, loop_cond, kbc < kbc_stop, kb0_stop == iter_k);
@@ -3799,12 +3806,9 @@ __global__ void flash_attn_ext_f16_blackwell(
          // We iterate the full sequence chunk assigned to this block.
          // Actually, if kbc dispatch is granular, we might need fixup logic.
          // For optimization prototype, we assume blocks align to tiles.
-         
-         const int stride_Q1   = nb01 / sizeof(float2);
-         const int stride_Q2   = nb02 / sizeof(float2);
-         const int stride_K    = nb11 / sizeof(half2);
-         const int stride_mask = nb31 / sizeof(half);
-         const int stride_V    = mla ? stride_K : nb21 / sizeof(half2);
+
+         // Note: stride_Q1, stride_Q2, stride_K, stride_mask, stride_V are now defined
+         // at function scope (before while loop) so they're available to tail processing.
 
          // =====================================================================
          // CRITICAL: Q Loading Phase - ALL warps must participate in __syncthreads()
