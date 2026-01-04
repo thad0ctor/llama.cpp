@@ -3946,11 +3946,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
                 // Debug: verify Y-tile strided copy (src stride=36, dst stride=40)
                 if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0 && kb0 == 0) {
+                    const float * y_df_dbg = (const float *) buf_A;
                     printf("[Y_LOAD_SM120] src_stride=%d, dst_stride=%d\n", sz, MMQ_TILE_Y_K);
-                    printf("[Y_LOAD_SM120] buf_A[0]=%d, buf_A[stride]=%d, buf_A[2*stride]=%d (scales)\n",
-                           buf_A[0], buf_A[MMQ_TILE_Y_K], buf_A[2*MMQ_TILE_Y_K]);
-                    printf("[Y_LOAD_SM120] buf_A[4]=%d, buf_A[stride+4]=%d, buf_A[2*stride+4]=%d (qs, col 0,1,2)\n",
-                           buf_A[4], buf_A[MMQ_TILE_Y_K+4], buf_A[2*MMQ_TILE_Y_K+4]);
+                    // Check ALL 4 scales for column 0 (d4[0], d4[1], d4[2], d4[3])
+                    printf("[Y_LOAD_SM120] col0 scales: y_df[0]=%f, y_df[1]=%f, y_df[2]=%f, y_df[3]=%f\n",
+                           y_df_dbg[0], y_df_dbg[1], y_df_dbg[2], y_df_dbg[3]);
+                    // Check scales for column 1
+                    printf("[Y_LOAD_SM120] col1 scales: y_df[40]=%f, y_df[41]=%f\n",
+                           y_df_dbg[MMQ_TILE_Y_K], y_df_dbg[MMQ_TILE_Y_K+1]);
                 }
 
                 vec_dot(tile_x, buf_A, sum, 0);
