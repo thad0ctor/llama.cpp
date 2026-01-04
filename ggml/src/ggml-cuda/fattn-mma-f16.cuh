@@ -1783,11 +1783,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                __half2float(k_row1[0]), __half2float(k_row1[1]),
                                __half2float(k_row2[0]), __half2float(k_row2[1]),
                                __half2float(k_row3[0]), __half2float(k_row3[1]));
-                        
-                        // Also print using nb11 (actual byte stride from kernel args)
-                        // nb11 is passed to kernel as K stride in bytes
-                        printf("[SM120 GMEM DEBUG] ne10=%ld (K head_dim), ne11=%ld (K seq_len)\n", 
-                               (long)ne10, (long)ne11);
                     }
                     // --- END SM_120 DEBUG ---
 
