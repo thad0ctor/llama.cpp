@@ -3571,6 +3571,14 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
+                // Debug: check what's being written to rows 0-3
+                if ((i == 0 || i == 1 || i == 2 || i == 3) && j == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+                    printf("[WRITE_BACK] thread=%d,%d i=%d j=%d sum_idx=%d sum_val=%f\n",
+                           threadIdx.x, threadIdx.y, i, j,
+                           (j0/tile_C::J + n)*tile_C::ne + l,
+                           sum[(j0/tile_C::J + n)*tile_C::ne + l]);
+                }
+
                 dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
             }
         }
