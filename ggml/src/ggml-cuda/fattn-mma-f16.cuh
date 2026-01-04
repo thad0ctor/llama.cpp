@@ -3698,14 +3698,19 @@ __global__ void flash_attn_ext_f16_ampere(
         if (KV_max) {
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
-        constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0) {
-            constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
+        if (kb0_start == 0 && kb0_stop >= iter_k) {
+            // Case 1: Complete Tile (No Split-K)
+            // Write directly to output, no metadata needed
+            constexpr bool needs_fixup = false;
+            constexpr bool is_fixup = false;
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, 0, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
         } else {
-            constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
+            // Case 2 & 3: Partial Tile (Split-K start or middle)
+            // ALL partial blocks MUST write to fixup buffer so fixup kernel can merge them
+            constexpr bool needs_fixup = true;
+            constexpr bool is_fixup = true;
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, 0, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
@@ -4140,11 +4145,23 @@ __global__ void flash_attn_ext_f16_blackwell(
          // =====================================================================
          {
              // All warps participate in unified mode
-             constexpr bool is_fixup = false;
-             constexpr bool needs_fixup = false;
-             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
-                 Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             if (kb0_start == 0 && kb0_stop >= iter_k) {
+                 // Case 1: Complete Tile (No Split-K)
+                 // Write directly to output, no metadata needed
+                 constexpr bool needs_fixup = false;
+                 constexpr bool is_fixup = false;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
+                     Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                     ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             } else {
+                 // Case 2 & 3: Partial Tile (Split-K start or middle)
+                 // ALL partial blocks MUST write to fixup buffer so fixup kernel can merge them
+                 constexpr bool needs_fixup = true;
+                 constexpr bool is_fixup = true;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
+                     Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                     ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             }
          }
 #else
          // =====================================================================
@@ -4176,14 +4193,25 @@ __global__ void flash_attn_ext_f16_blackwell(
              if (threadIdx.x == 0 && threadIdx.y == 1) {
                  printf("[CONSUMER] Block %d: Consumer warp %d entering\n", blockIdx.x, threadIdx.y);
              }
-             constexpr bool is_fixup = false;
-             constexpr bool needs_fixup = false;
 
-             // Call process_tile with Q already in shared memory
-             // The function will skip Q loading phase since pipeline_state is set
-             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
-                 Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             if (kb0_start == 0 && kb0_stop >= iter_k) {
+                 // Case 1: Complete Tile (No Split-K)
+                 // Write directly to output, no metadata needed
+                 constexpr bool needs_fixup = false;
+                 constexpr bool is_fixup = false;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
+                     Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                     ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             } else {
+                 // Case 2 & 3: Partial Tile (Split-K start or middle)
+                 // ALL partial blocks MUST write to fixup buffer so fixup kernel can merge them
+                 constexpr bool needs_fixup = true;
+                 constexpr bool is_fixup = true;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
+                     Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                     ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             }
+
              if (threadIdx.x == 0 && threadIdx.y == 1) {
                  printf("[CONSUMER] Block %d: process_tile returned\n", blockIdx.x);
              }
