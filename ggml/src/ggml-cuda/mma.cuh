@@ -526,7 +526,8 @@ namespace ggml_cuda_mma {
     static __device__ __forceinline__ uint32_t ldmatrix_swizzle_addr(uint32_t base_addr, int row, int col_bytes) {
         // Calculate linear offset
         uint32_t offset = row * STRIDE_BYTES + col_bytes;
-        
+        uint32_t offset_before_swizzle = offset;  // Save for debug
+
         // Apply swizzle: XOR bits [4:6] with row-derived pattern
         if constexpr (STRIDE_BYTES > 16) {
             constexpr int rows_per_swizzle = (64 / STRIDE_BYTES) > 0 ? (64 / STRIDE_BYTES) : 1;
@@ -534,7 +535,18 @@ namespace ggml_cuda_mma {
             uint32_t xor_bits = row_mod8 / rows_per_swizzle;
             offset ^= (xor_bits << 4);
         }
-        
+
+        // DEBUG: Print swizzle calculation for thread 0
+        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+            static bool printed = false;
+            if (!printed) {
+                printf("[SWIZZLE ADDR] STRIDE_BYTES=%d, row=%d, col_bytes=%d\n", STRIDE_BYTES, row, col_bytes);
+                printf("[SWIZZLE ADDR] offset_before=0x%x, offset_after=0x%x, final_addr=0x%x\n",
+                       offset_before_swizzle, offset, base_addr + offset);
+                printed = true;
+            }
+        }
+
         return base_addr + offset;
     }
 

@@ -776,6 +776,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_swizzle(
                     offset_bytes ^= (xor_bits << 4);
                 }
 
+                // ==========================================================================
+                // DEBUG POINT 3: Check source and destination addresses
+                // ==========================================================================
+                if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && i == 0 && k == k0_start) {
+                    uint32_t smem_addr = tile_KV_base + offset_bytes;
+                    const void* gmem_addr = (const void*)(KV + i*stride_KV + k*h2_per_chunk);
+                    printf("[LOAD ADDR CHECK] i=%d, k=%d: SMEM_addr=0x%x, GMEM_addr=%p, offset_bytes=%u\n",
+                           i, k, smem_addr, gmem_addr, offset_bytes);
+                    printf("[LOAD ADDR CHECK] tile_KV_base=0x%x, stride_KV=%d, D2=%d, valid_row=%d\n",
+                           tile_KV_base, stride_KV, D2, valid_row);
+                }
+
                 if (valid_row) {
                     cp_async_cg_16<preload>(tile_KV_base + offset_bytes, KV + i*stride_KV + k*h2_per_chunk);
                 } else {
@@ -1732,6 +1744,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Gau-Nernst V5: Issue K[0], K[1], and V loads together
                     // ============================================================
 
+                    // --- SM_120 DEBUG: Print source K data BEFORE load ---
+                    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && kb0 == 0) {
+                        const half2* K_src = K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start;
+                        const half* k_src_half = (const half*)K_src;
+                        printf("[SM120 GMEM DEBUG] K source BEFORE load - K_src[0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                               __half2float(k_src_half[0]), __half2float(k_src_half[1]),
+                               __half2float(k_src_half[2]), __half2float(k_src_half[3]),
+                               __half2float(k_src_half[4]), __half2float(k_src_half[5]),
+                               __half2float(k_src_half[6]), __half2float(k_src_half[7]));
+                        printf("[SM120 GMEM DEBUG] K_src=%p, k_VKQ_0=%d, stride_K=%d, k0_start=%d\n",
+                               (void*)K_src, k_VKQ_0, stride_K, k0_start);
+                    }
+                    // --- END SM_120 DEBUG ---
+
                     // 1. Issue first K load (K[0] into buffer 0)
                     flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, oob_check>(
                         K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K_buf0, nbatch_K2, stride_K, k_VKQ_sup);
@@ -1777,6 +1803,34 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
 
                 __syncthreads();
+
+                // --- SM_120 DEBUG: Verify K tile in shared memory after load ---
+                if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && chunk == 0 && kb0 == 0) {
+                    // Read from tile_K (buffer 0 for first chunk)
+                    half* k_half = (half*)tile_K;
+                    printf("[SM120 SMEM DEBUG] K tile after load - tile_K[0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                           __half2float(k_half[0]), __half2float(k_half[1]),
+                           __half2float(k_half[2]), __half2float(k_half[3]),
+                           __half2float(k_half[4]), __half2float(k_half[5]),
+                           __half2float(k_half[6]), __half2float(k_half[7]));
+
+                    // Check for NaN/Inf in first 32 values
+                    bool has_nan = false;
+                    bool has_inf = false;
+                    for (int i = 0; i < 32; i++) {
+                        float v = __half2float(k_half[i]);
+                        if (isnan(v)) has_nan = true;
+                        if (isinf(v)) has_inf = true;
+                    }
+                    if (has_nan) printf("[SM120 SMEM DEBUG] *** NaN DETECTED in K tile! ***\n");
+                    if (has_inf) printf("[SM120 SMEM DEBUG] *** Inf DETECTED in K tile! ***\n");
+
+                    // Also print source address info
+                    printf("[SM120 SMEM DEBUG] K_h2=%p, k_VKQ_0=%d, stride_K=%d\n",
+                           (void*)K_h2, k_VKQ_0, stride_K);
+                }
+                // --- END SM_120 DEBUG ---
+
                 // Point to correct K chunk buffer (alternating)
                 current_tile_K = (chunk % 2 == 0) ? tile_K : (half2*)((char*)tile_K + bytes_K_chunk_local);
             }
@@ -1830,6 +1884,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // SM_120 check
         }
 
+        // ==========================================================================
+        // DEBUG POINT 4: Extra synchronization before MMA to rule out race conditions
+        // ==========================================================================
+        __syncthreads();  // Extra barrier - if NaN disappears, we have a sync bug
+
         // Calculate tile of KQ:
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
         // SM_120 OPTIMIZED: Use swizzled ldmatrix to read from swizzled shared memory
@@ -1845,8 +1904,30 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     T_A_KQ K_A;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
                     // SM_120: Use swizzled ldmatrix read
-                    ggml_cuda_mma::load_ldmatrix_swizzle<STRIDE_BYTES_K>(K_A, current_tile_K_base, 
+                    ggml_cuda_mma::load_ldmatrix_swizzle<STRIDE_BYTES_K>(K_A, current_tile_K_base,
                         i_KQ_0, (k_KQ_0 - k0_start) * sizeof(half2));
+
+                    // ==========================================================================
+                    // DEBUG: Verify K_A register content after ldmatrix_swizzle
+                    // ==========================================================================
+                    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 &&
+                        i_KQ_00 == 0 && k_KQ_0 == k0_start && kb0 == 0 && chunk == 0) {
+                        // K_A.x is an array of half2. Print values to compare with SMEM debug.
+                        half2 k_val = K_A.x[0];
+                        printf("[REG K CHECK] After ldmatrix_swizzle: K_A.x[0] = (%f, %f)\n",
+                               __half2float(__low2half(k_val)), __half2float(__high2half(k_val)));
+
+                        // Check for NaN
+                        float v0 = __half2float(__low2half(k_val));
+                        float v1 = __half2float(__high2half(k_val));
+                        if (isnan(v0) || isnan(v1)) {
+                            printf("[REG K CHECK] *** NaN DETECTED in K_A register! ***\n");
+                        }
+
+                        // Also print the address we loaded from
+                        printf("[REG K CHECK] current_tile_K_base=0x%x, i_KQ_0=%d, col_offset=%d\n",
+                               current_tile_K_base, i_KQ_0, (int)((k_KQ_0 - k0_start) * sizeof(half2)));
+                    }
 #else
                     load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
 #endif
@@ -3563,6 +3644,18 @@ __global__ void flash_attn_ext_f16_blackwell(
                             const char * __restrict__ tensor_maps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    // ==========================================================================
+    // DEBUG POINT 1: Verify kernel input pointers match host-side launch
+    // ==========================================================================
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("[KERNEL ENTRY PTRS] Q_ptr=%p, K_ptr=%p, V_ptr=%p, mask_ptr=%p\n",
+               (void*)Q, (void*)K, (void*)V, (void*)mask);
+        printf("[KERNEL ENTRY PTRS] dst=%p, dst_meta=%p\n", (void*)dst, (void*)dst_meta);
+        printf("[KERNEL ENTRY PTRS] nb01=%d, nb02=%d, nb03=%d\n", nb01, nb02, nb03);
+        printf("[KERNEL ENTRY PTRS] nb11=%d, nb12=%zu, nb13=%ld\n", nb11, (size_t)nb12, (long)nb13);
+    }
+    __syncthreads();
+
     // DEBUG: Confirm kernel entry on SM_120
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
         printf("[BLACKWELL KERNEL ENTRY] flash_attn_ext_f16_blackwell called! __CUDA_ARCH__=%d\n", __CUDA_ARCH__);
@@ -3575,7 +3668,7 @@ __global__ void flash_attn_ext_f16_blackwell(
     if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
         printf("[KERNEL DEBUG] Blackwell kernel ENTRY - block=(%d,%d,%d) thread=(%d,%d)\n",
                blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y);
-        printf("[KERNEL DEBUG] K dims: ne10=%d (head_dim), ne11=%d (K_seq_len), ne12=%d (kv_heads), ne13=%d\n", 
+        printf("[KERNEL DEBUG] K dims: ne10=%d (head_dim), ne11=%d (K_seq_len), ne12=%d (kv_heads), ne13=%d\n",
                ne10, ne11, ne12, ne13);
         printf("[KERNEL DEBUG] K_total_rows = ne11 * ne12 = %d * %d = %d\n", ne11, ne12, ne11 * ne12);
     }
@@ -3828,6 +3921,33 @@ __global__ void flash_attn_ext_f16_blackwell(
         }
         
         __syncthreads();  // Q loaded to shared memory, all warps ready
+
+        // --- SM_120 DEBUG: Verify Q tile in shared memory after load ---
+        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && kbc == 0) {
+            half* q_half = (half*)tile_Q;
+            printf("[SM120 Q DEBUG] Q tile after load - tile_Q[0..7]: %f, %f, %f, %f, %f, %f, %f, %f\n",
+                   __half2float(q_half[0]), __half2float(q_half[1]),
+                   __half2float(q_half[2]), __half2float(q_half[3]),
+                   __half2float(q_half[4]), __half2float(q_half[5]),
+                   __half2float(q_half[6]), __half2float(q_half[7]));
+
+            // Check for NaN/Inf in first 32 Q values
+            bool has_nan = false;
+            bool has_inf = false;
+            for (int i = 0; i < 32; i++) {
+                float v = __half2float(q_half[i]);
+                if (isnan(v)) has_nan = true;
+                if (isinf(v)) has_inf = true;
+            }
+            if (has_nan) printf("[SM120 Q DEBUG] *** NaN DETECTED in Q tile! ***\n");
+            if (has_inf) printf("[SM120 Q DEBUG] *** Inf DETECTED in Q tile! ***\n");
+
+            // Print source info
+            printf("[SM120 Q DEBUG] Q_f2=%p, stride_Q1=%d, stride_Q2=%d, scale=%f\n",
+                   (void*)Q_f2, stride_Q1, stride_Q2, scale);
+        }
+        __syncthreads();
+        // --- END SM_120 Q DEBUG ---
 
          // =====================================================================
          // WARP DIVERGENCE: Producer vs Consumer paths
