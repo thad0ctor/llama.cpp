@@ -1693,14 +1693,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             // ================================================================
             // This path runs REGARDLESS of nstages value - SM_120 always uses
             // its own cp.async pipelining with swizzled shared memory layout.
+            //
+            // Memory layout (chunked): [K chunk 0][K chunk 1][V chunk 0][V chunk 1]
+            // K buf1 is at tile_K + 1 chunk size, NOT at tile_V!
             // ================================================================
             {
                 constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
-                
-                // Double buffer addresses
+                constexpr int bytes_K_chunk_local = nbatch_fa * stride_tile_K * sizeof(half2);
+
+                // Double buffer addresses - K buf1 is 1 chunk after K buf0, NOT tile_V
                 const uint32_t tile_K_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);
-                const uint32_t tile_K_buf1 = ggml_cuda_cvta_generic_to_shared(tile_V);
-                
+                const uint32_t tile_K_buf1 = tile_K_buf0 + bytes_K_chunk_local;
+
                 // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
                 if (chunk == 0) {
                     // Issue first K load (K[0] into buffer 0)
@@ -1735,9 +1739,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         cp_async_wait_group<0>();
                     }
                 }
-                
+
                 __syncthreads();
-                current_tile_K = (chunk % 2 == 0) ? tile_K : tile_V;
+                // Point to correct K chunk buffer (chunk 0 or chunk 1), NOT tile_V
+                current_tile_K = (chunk % 2 == 0) ? tile_K : (half2*)((char*)tile_K + bytes_K_chunk_local);
             }
 #else
             // Non-SM_120 path: Use if constexpr based on nstages
@@ -2256,24 +2261,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // SM_120 OPTIMIZED: Two-Stage V Pipelining with Swizzled cp.async
                     // ================================================================
                     // Phase 2B: Overlap V[n+1] prefetch with V[n] computation
-                    // 
-                    // Memory layout: Reuse tile_K and tile_V as V double buffers
-                    // (K processing is complete, so tile_K is available)
+                    //
+                    // Memory layout (chunked): [K chunk 0][K chunk 1][V chunk 0][V chunk 1]
+                    // V buf0 is at tile_V (V chunk 0), V buf1 is at tile_V + bytes_V_chunk
                     //
                     // Pipeline flow:
                     //   V chunk 0: Load V[0], commit; prefetch V[1], commit; wait_group<1>
                     //   V chunk n: Prefetch V[n+1], wait_group<1>, compute V[n]
                     //   Final: wait_group<0> for last chunk
-                    //
-                    // Performance: Additional ~2-3% throughput improvement
                     // ================================================================
-                    
+
                     constexpr int STRIDE_BYTES_V_inner = stride_tile_V * sizeof(half2);
-                    
-                    // Double buffer addresses - reuse K buffers since K is done
-                    const uint32_t tile_V_buf0 = ggml_cuda_cvta_generic_to_shared(tile_K);  // K is done
-                    const uint32_t tile_V_buf1 = ggml_cuda_cvta_generic_to_shared(tile_V);
-                    
+                    constexpr int bytes_V_chunk_local = nbatch_fa * stride_tile_V * sizeof(half2);
+
+                    // Double buffer addresses - V uses its own chunk buffers, NOT K's memory
+                    const uint32_t tile_V_buf0 = ggml_cuda_cvta_generic_to_shared(tile_V);
+                    const uint32_t tile_V_buf1 = tile_V_buf0 + bytes_V_chunk_local;
+
                     // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
                     if (v_chunk == 0) {
                         // Issue first V load (V[0] into buffer 0)
@@ -2320,11 +2324,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                             cp_async_wait_group<0>();
                         }
                     }
-                    
+
                     __syncthreads();
-                    
-                    // Update tile_V_i to point to correct buffer
-                    tile_V_i = (v_chunk % 2 == 0) ? tile_K : tile_V;
+
+                    // Update tile_V_i to point to correct V chunk buffer (chunk 0 or chunk 1)
+                    tile_V_i = (v_chunk % 2 == 0) ? tile_V : (half2*)((char*)tile_V + bytes_V_chunk_local);
 #else
                     flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                         (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
@@ -2818,10 +2822,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Q in registers is faster, but register pressure is the biggest bottleneck.
     // The loading is done with decreasing granularity for D for better memory bandwidth.
     //
-    // SKIP Q loading when pipeline_state is set (Blackwell consumer mode):
-    // Q is already loaded by the Blackwell kernel before producer/consumer divergence.
-    // The __syncthreads() calls are also already done by the Blackwell kernel.
-    if (!pipeline_state) {
+    // SKIP Q loading when:
+    // 1. pipeline_state is set (Blackwell consumer mode) - Q already loaded by producer
+    // 2. SM_120 unified mode - Q already loaded by blackwell kernel before calling process_tile
+    // The __syncthreads() calls are also already done by the caller in these cases.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    // SM_120: Q is always pre-loaded by flash_attn_ext_f16_blackwell before calling process_tile
+    constexpr bool skip_q_load = true;
+#else
+    constexpr bool skip_q_load = false;
+#endif
+    if (!pipeline_state && !skip_q_load) {
         const half2 scale_h2 = make_half2(scale, scale);
 #pragma unroll
         for (int stride_k : {WARP_SIZE, WARP_SIZE/2, WARP_SIZE/4}) {
