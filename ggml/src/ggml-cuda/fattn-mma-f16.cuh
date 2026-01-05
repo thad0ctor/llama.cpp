@@ -1576,9 +1576,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(TURING_MMA_AVAILABLE)
-    T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
+    // CRITICAL FIX: Initialize KQ_C to zero. MMA accumulates into this array (D = A*B + C),
+    // so uninitialized values cause garbage results. This was the root cause of is_fixup
+    // blocks producing KQ_max=-FLT_MAX/2 (attention never computed correctly).
+    T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))] = {};
 #else // Volta
-    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
+    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)] = {};
 #endif // defined(TURING_MMA_AVAILABLE)
 
     bool consumer_mode = (pipeline_state != nullptr);
@@ -2188,8 +2191,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
-                    KQ_C[k0/(np*T_C_KQ::I)].x[l] = expf(KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[l % 2]);
-                    KQ_rowsum_add[l % 2] += KQ_C[k0/(np*T_C_KQ::I)].x[l];
+                    // Guard against softmax overflow when all attention entries are masked
+                    // (KQ_max_new still at initialization value -FLT_MAX/2)
+                    if (KQ_max_new[l % 2] <= -FLT_MAX/4.0f) {
+                        KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
+                    } else {
+                        KQ_C[k0/(np*T_C_KQ::I)].x[l] = expf(KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[l % 2]);
+                        KQ_rowsum_add[l % 2] += KQ_C[k0/(np*T_C_KQ::I)].x[l];
+                    }
                 } else {
                     KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
                 }
@@ -2250,8 +2259,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             for (int l = 0; l < T_C_KQ::ne; ++l) {
                 // Turing + Volta:
                 if (!oob_check || k0 + (warp_id % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
-                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[(l/2) % 2]);
-                    KQ_rowsum_add[(l/2) % 2] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
+                    // Guard against softmax overflow when all attention entries are masked
+                    // (KQ_max_new still at initialization value -FLT_MAX/2)
+                    if (KQ_max_new[(l/2) % 2] <= -FLT_MAX/4.0f) {
+                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
+                    } else {
+                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[(l/2) % 2]);
+                        KQ_rowsum_add[(l/2) % 2] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
+                    }
                 } else {
                     KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
                 }
@@ -2290,35 +2305,82 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 #if defined(TURING_MMA_AVAILABLE)
         if constexpr (cols_per_warp == 8) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[1]);
+            // FIX: When both KQ_max_scale values are 0 (no valid attention computed),
+            // we must ASSIGN zero instead of MULTIPLY, because VKQ_C may contain NaN
+            // from garbage V data and 0 * NaN = NaN.
+            const bool all_invalid = (KQ_max_scale[0] == 0.0f && KQ_max_scale[1] == 0.0f);
+            if (all_invalid) {
+                // Zero out VKQ_C to prevent NaN propagation
 #pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
 #pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] = half2{};
+                    }
+                }
+            } else {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[1]);
+#pragma unroll
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+#pragma unroll
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    }
                 }
             }
         } else {
+            // Check if all columns have zero scale (no valid attention)
+            bool all_invalid = true;
 #pragma unroll
             for (int col = 0; col < cols_per_thread; ++col) {
-                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+                if (KQ_max_scale[col] != 0.0f) {
+                    all_invalid = false;
+                    break;
+                }
+            }
+            if (all_invalid) {
+                // Zero out VKQ_C to prevent NaN propagation
 #pragma unroll
                 for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
-                    for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
-                        VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] = half2{};
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int col = 0; col < cols_per_thread; ++col) {
+                    const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+#pragma unroll
+                    for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+#pragma unroll
+                        for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
+                            VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                        }
                     }
                 }
             }
         }
 #else // Volta
-        const half2 KQ_max_scale_h2 = make_half2(
-            KQ_max_scale[(threadIdx.x / 2) % 2], KQ_max_scale[(threadIdx.x / 2) % 2]);
+        // FIX: Same protection for Volta path
+        const float volta_scale = KQ_max_scale[(threadIdx.x / 2) % 2];
+        if (volta_scale == 0.0f) {
+            // Zero out VKQ_C to prevent NaN propagation
 #pragma unroll
-        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+            for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] = half2{};
+                }
+            }
+        } else {
+            const half2 KQ_max_scale_h2 = make_half2(volta_scale, volta_scale);
+#pragma unroll
+            for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+#pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                }
             }
         }
 #endif // defined(TURING_MMA_AVAILABLE)
@@ -3298,35 +3360,77 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 #if defined(TURING_MMA_AVAILABLE)
         if constexpr (cols_per_warp == 8) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[1]);
+            // FIX: When both scales are 0, ASSIGN zero instead of MULTIPLY to prevent 0*NaN=NaN
+            const bool all_zero = (KQ_max_scale[0] == 0.0f && KQ_max_scale[1] == 0.0f);
+            if (all_zero) {
 #pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
 #pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] = half2{};
+                    }
+                }
+            } else {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[1]);
+#pragma unroll
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+#pragma unroll
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    }
                 }
             }
         } else {
+            // Check if all columns have zero scale
+            bool all_zero = true;
 #pragma unroll
             for (int col = 0; col < cols_per_thread; ++col) {
-                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+                if (KQ_max_scale[col] != 0.0f) {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if (all_zero) {
 #pragma unroll
                 for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
-                    for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
-                        VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] = half2{};
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int col = 0; col < cols_per_thread; ++col) {
+                    const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+#pragma unroll
+                    for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+#pragma unroll
+                        for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
+                            VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                        }
                     }
                 }
             }
         }
 #else // Volta
         const int col = (threadIdx.x / 2) % 2;
-        const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+        const float volta_scale = KQ_max_scale[col];
+        if (volta_scale == 0.0f) {
 #pragma unroll
-        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+            for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] = half2{};
+                }
+            }
+        } else {
+            const half2 KQ_max_scale_h2 = make_half2(volta_scale, volta_scale);
+#pragma unroll
+            for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+#pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                }
             }
         }
 #endif // defined(TURING_MMA_AVAILABLE)

@@ -703,6 +703,18 @@ static __global__ void flash_attn_stream_k_fixup(
         rowsum  = tmp.y;
     }
 
+    // FIX: If the starter block had no valid attention (KQ_max at sentinel),
+    // the entire tile is invalid. Write 0 and return early.
+    if (max_val <= -FLT_MAX/4.0f) {
+        *dst = 0.0f;
+        return;
+    }
+
+    // FIX: Also handle NaN in dst_val from garbage data
+    if (isnan(dst_val)) {
+        dst_val = 0.0f;
+    }
+
     // DEBUG: Show loaded values for first thread
     if (j == 0 && c == 0 && tid == 0) {
         printf("[FIXUP LOAD] bidx0=%d bidx_starter=%d: dst_val=%f max_val=%f rowsum=%f\n",
@@ -723,9 +735,26 @@ static __global__ void flash_attn_stream_k_fixup(
             continue;
         }
 
+        const float2 tmp = dst_fixup[(gridDim.x + bidx)*ncols + jc];
+
+        // FIX: Skip blocks that had no valid attention (KQ_max still at sentinel value).
+        // These blocks wrote -FLT_MAX/2 as their KQ_max, indicating all K positions were OOB/masked.
+        // Their partial results are garbage and should not be combined.
+        // Threshold -FLT_MAX/4 catches init value -FLT_MAX/2 with margin for floating-point.
+        if (tmp.x <= -FLT_MAX/4.0f) {
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
         const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
 
-        const float2 tmp = dst_fixup[(gridDim.x + bidx)*ncols + jc];
+        // FIX: Also skip if dst_add is NaN (can happen from garbage V data)
+        if (isnan(dst_add)) {
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
 
         // Scale the current and new value accumulators depending on the max. values.
         const float max_val_new = fmaxf(max_val, tmp.x);
@@ -759,11 +788,12 @@ static __global__ void flash_attn_stream_k_fixup(
 
     // DEBUG: Show final values before write
     if (j == 0 && c == 0 && tid == 0) {
-        const float final_val = dst_val / rowsum;
+        const float final_val = fabsf(rowsum) > 1e-20f ? dst_val / rowsum : 0.0f;
         printf("[FIXUP WRITE] bidx0=%d: dst_val=%f rowsum=%f final=%f\n",
                bidx0, dst_val, rowsum, final_val);
-        if (isnan(final_val) || isinf(final_val) || fabsf(final_val) < 1e-20f) {
-            printf("[FIXUP WRITE] *** WARNING: Writing bad value! ***\n");
+        // Only warn for actual NaN/Inf, not for small/zero values (which are valid for sparse attention)
+        if (isnan(final_val) || isinf(final_val)) {
+            printf("[FIXUP WRITE] *** WARNING: Writing NaN/Inf value! ***\n");
         }
     }
 
