@@ -24,15 +24,19 @@ echo "GGML_CUDA_FORCE_MMQ=$GGML_CUDA_FORCE_MMQ"
 echo "GGML_CUDA_F16=$GGML_CUDA_F16"
 echo "GGML_CUDA_GRAPH_FORCE=$GGML_CUDA_GRAPH_FORCE"
 
-# Output filenames
+# Create timestamped output directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-PROFILE_OUTPUT="mmq_profile_${TIMESTAMP}"
-LOG_OUTPUT="server_log_${TIMESTAMP}.txt"
+OUTPUT_DIR="$SCRIPT_DIR/logs/profile_mmq/$TIMESTAMP"
+mkdir -p "$OUTPUT_DIR"
+PROFILE_OUTPUT="$OUTPUT_DIR/profile"
+LOG_OUTPUT="$OUTPUT_DIR/server.log"
 
 # Add CUDA 13.1 bin to PATH for ncu
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 
 echo "Launching NCU Profiler..."
+echo "Output Dir:     ${OUTPUT_DIR}"
 echo "Profile Report: ${PROFILE_OUTPUT}.ncu-rep"
 echo "Server Logs:    ${LOG_OUTPUT}"
 echo "----------------------------------------------------------------"
