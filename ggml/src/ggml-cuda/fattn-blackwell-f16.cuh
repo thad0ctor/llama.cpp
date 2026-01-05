@@ -154,8 +154,10 @@ __global__ void flash_attn_blackwell_f16(
     const float logit_softcap,
     const uint3 ne01, const int32_t ne02,
     const int32_t nb01, const int32_t nb02, const int32_t nb03,
-    const int32_t nb11, const int32_t nb12, const int64_t nb13,
-    const int32_t nb21, const int32_t nb22, const int64_t nb23,
+    const int32_t nb11, const int32_t nb12,
+    const int32_t nb21, const int32_t nb22,
+    // Group all int64_t strides together at end for proper 8-byte alignment
+    const int64_t nb13, const int64_t nb23,
     const char * __restrict__ tensor_maps
 ) {
     using Config = blackwell_config<DKQ, DV>;

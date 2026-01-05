@@ -2919,7 +2919,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             printf("[SMEM BOUNDS]   bytes_KV_total=%d\n", bytes_KV_total);
             printf("[SMEM BOUNDS]   bytes_Q=%d, bytes_mask=%d\n", bytes_Q, bytes_mask);
             printf("[SMEM BOUNDS]   sizeof(fattn_pipeline_state)=%d\n", (int)sizeof(fattn_pipeline_state));
-            printf("[SMEM BOUNDS]   expected_total=%zu (%.1f KB)\n", expected_smem_size, expected_smem_size/1024.0);
+            printf("[SMEM BOUNDS]   expected_total=%lu (%.1f KB)\n", (unsigned long)expected_smem_size, expected_smem_size/1024.0);
             printf("[SMEM BOUNDS] Pointer layout:\n");
             printf("[SMEM BOUNDS]   K_chunk[0] = smem+0 = %p\n", smem);
             printf("[SMEM BOUNDS]   K_chunk[1] = smem+%d = %p\n", bytes_K_chunk, smem + bytes_K_chunk);
@@ -3461,7 +3461,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             const int max_j_dst = ncols1 - 1;
             const int max_c_dst = ncols2 - 1;
             const size_t max_offset = ((jt*ncols1 + max_j_dst)*ne02 + max_c_dst)*(DV/2) + (DV/2 - 1);
-            printf("[OUTPUT DEBUG] Max dst offset: %zu elements (%zu bytes)\n", max_offset, max_offset * sizeof(float2));
+            printf("[OUTPUT DEBUG] Max dst offset: %lu elements (%lu bytes)\n", (unsigned long)max_offset, (unsigned long)(max_offset * sizeof(float2)));
             printf("[OUTPUT DEBUG] =============================================\n\n");
             output_debug_done = true;
         }
@@ -3659,10 +3659,12 @@ __global__ void flash_attn_ext_f16_ampere(
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
-                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
-                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t nb11, const int32_t nb12,
+                            const int32_t nb21, const int32_t nb22,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t nb31, const int32_t nb32,
+        // Group all int64_t strides together at end for proper 8-byte alignment
+        const int64_t nb13, const int64_t nb23, const int64_t nb33,
                             const char * __restrict__ tensor_maps) {
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE))
 
@@ -3838,10 +3840,12 @@ __global__ void flash_attn_ext_f16_blackwell(
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
-                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
-                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t nb11, const int32_t nb12,
+                            const int32_t nb21, const int32_t nb22,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t nb31, const int32_t nb32,
+        // Group all int64_t strides together at end for proper 8-byte alignment
+        const int64_t nb13, const int64_t nb23, const int64_t nb33,
                             const char * __restrict__ tensor_maps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
@@ -3853,7 +3857,7 @@ __global__ void flash_attn_ext_f16_blackwell(
                (void*)Q, (void*)K, (void*)V, (void*)mask);
         printf("[KERNEL ENTRY PTRS] dst=%p, dst_meta=%p\n", (void*)dst, (void*)dst_meta);
         printf("[KERNEL ENTRY PTRS] nb01=%d, nb02=%d, nb03=%d\n", nb01, nb02, nb03);
-        printf("[KERNEL ENTRY PTRS] nb11=%d, nb12=%zu, nb13=%ld\n", nb11, (size_t)nb12, (long)nb13);
+        printf("[KERNEL ENTRY PTRS] nb11=%d, nb12=%d, nb13=%ld\n", nb11, nb12, (long)nb13);
     }
     __syncthreads();
 
