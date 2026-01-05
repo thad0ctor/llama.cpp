@@ -3583,7 +3583,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             printf("  - Writing value: (%f, %f)\n", dstk_val.x, dstk_val.y);
                             printf("  - Index calculation: jt=%d ncols1=%d j_dst=%d ne02=%d c_dst=%d DV=%d k00=%d k=%d\n",
                                    jt, ncols1, j_dst, ne02, c_dst, DV, k00, k);
-                            printf("  - Final index: %zu\n", final_idx);
+                            printf("  - Final index: %lu\n", (unsigned long)final_idx);
                             printf("  - Base Pointer (dstk): %p\n", (void*)dstk);
                             printf("  - Final Pointer: %p\n", (void*)final_ptr);
                             printf("  - Fixup Base (dstk_fixup): %p\n\n", (void*)dstk_fixup);
@@ -3600,8 +3600,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             __threadfence(); // Ensure write is visible
                             const size_t final_idx = ((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k;
                             float2 readback = dstk[final_idx];
-                            printf("!! KERNEL WRITE VERIFY !! Readback at idx %zu: (%f, %f)\n\n",
-                                   final_idx, readback.x, readback.y);
+                            printf("!! KERNEL WRITE VERIFY !! Readback at idx %lu: (%f, %f)\n\n",
+                                   (unsigned long)final_idx, readback.x, readback.y);
                         }
                     }
                 }
