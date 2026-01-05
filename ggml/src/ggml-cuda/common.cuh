@@ -1210,6 +1210,96 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // Persistent MMQ buffers for CUDA graph compatibility
+    // These buffers survive across graph captures/replays, solving the pool allocation lifetime issue
+    struct mmq_persistent_buffers {
+        void *  src1_q8_1      = nullptr;  // Main quantized input buffer
+        size_t  src1_q8_1_size = 0;
+        void *  ids_src1       = nullptr;  // MUL_MAT_ID: source indices
+        size_t  ids_src1_size  = 0;
+        void *  ids_dst        = nullptr;  // MUL_MAT_ID: destination indices
+        size_t  ids_dst_size   = 0;
+        void *  expert_bounds  = nullptr;  // MUL_MAT_ID: expert boundary offsets
+        size_t  expert_bounds_size = 0;
+
+        void free_all() {
+            if (src1_q8_1)     { cudaFree(src1_q8_1);     src1_q8_1 = nullptr;     src1_q8_1_size = 0; }
+            if (ids_src1)      { cudaFree(ids_src1);      ids_src1 = nullptr;      ids_src1_size = 0; }
+            if (ids_dst)       { cudaFree(ids_dst);       ids_dst = nullptr;       ids_dst_size = 0; }
+            if (expert_bounds) { cudaFree(expert_bounds); expert_bounds = nullptr; expert_bounds_size = 0; }
+        }
+    };
+
+    mmq_persistent_buffers mmq_buffers;
+
+    // Helper to invalidate CUDA graph when MMQ buffers are reallocated
+    // This forces graph recapture on the next compute pass
+    void mmq_invalidate_cuda_graph() {
+#ifdef USE_CUDA_GRAPH
+        if (cuda_graph && cuda_graph->instance != nullptr) {
+            // Destroy the executable graph instance to force recapture
+            // The graph itself will be recreated during the next capture
+            CUDA_CHECK(cudaGraphExecDestroy(cuda_graph->instance));
+            cuda_graph->instance = nullptr;
+        }
+#endif
+    }
+
+    // Ensure buffer is allocated with at least the required size
+    // Returns pointer to the buffer. Reallocates with 2x headroom if too small.
+    // IMPORTANT: Invalidates CUDA graph on reallocation since captured pointers become stale
+    void * mmq_get_src1_q8_1(size_t required_size) {
+        if (mmq_buffers.src1_q8_1 == nullptr || mmq_buffers.src1_q8_1_size < required_size) {
+            if (mmq_buffers.src1_q8_1) {
+                CUDA_CHECK(cudaFree(mmq_buffers.src1_q8_1));
+                mmq_invalidate_cuda_graph();  // Pointer changed, graph must be recaptured
+            }
+            mmq_buffers.src1_q8_1_size = required_size * 2;  // 2x headroom
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&mmq_buffers.src1_q8_1, mmq_buffers.src1_q8_1_size));
+        }
+        return mmq_buffers.src1_q8_1;
+    }
+
+    void * mmq_get_ids_src1(size_t required_size) {
+        if (mmq_buffers.ids_src1 == nullptr || mmq_buffers.ids_src1_size < required_size) {
+            if (mmq_buffers.ids_src1) {
+                CUDA_CHECK(cudaFree(mmq_buffers.ids_src1));
+                mmq_invalidate_cuda_graph();
+            }
+            mmq_buffers.ids_src1_size = required_size * 2;
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&mmq_buffers.ids_src1, mmq_buffers.ids_src1_size));
+        }
+        return mmq_buffers.ids_src1;
+    }
+
+    void * mmq_get_ids_dst(size_t required_size) {
+        if (mmq_buffers.ids_dst == nullptr || mmq_buffers.ids_dst_size < required_size) {
+            if (mmq_buffers.ids_dst) {
+                CUDA_CHECK(cudaFree(mmq_buffers.ids_dst));
+                mmq_invalidate_cuda_graph();
+            }
+            mmq_buffers.ids_dst_size = required_size * 2;
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&mmq_buffers.ids_dst, mmq_buffers.ids_dst_size));
+        }
+        return mmq_buffers.ids_dst;
+    }
+
+    void * mmq_get_expert_bounds(size_t required_size) {
+        if (mmq_buffers.expert_bounds == nullptr || mmq_buffers.expert_bounds_size < required_size) {
+            if (mmq_buffers.expert_bounds) {
+                CUDA_CHECK(cudaFree(mmq_buffers.expert_bounds));
+                mmq_invalidate_cuda_graph();
+            }
+            mmq_buffers.expert_bounds_size = required_size * 2;
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&mmq_buffers.expert_bounds, mmq_buffers.expert_bounds_size));
+        }
+        return mmq_buffers.expert_bounds;
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
