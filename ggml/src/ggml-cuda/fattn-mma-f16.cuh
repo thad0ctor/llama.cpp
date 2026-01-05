@@ -1392,7 +1392,10 @@ static __device__ __forceinline__ void fattn_producer_loop_sm120(
         __syncthreads();  // SYNC 2: K prefetch issued, safe to proceed
         
         // ========== LOAD V TILE (overlapped with K compute in consumer) ==========
-        load_V_tile(stage, row_offset);
+        // SM_120 uses single-buffered V (Gau-Nernst V5 optimization).
+        // Always write to stage 0. Using 'stage' (0/1) would write to the second V buffer
+        // (which isn't allocated) and overwrite tile_Q/metadata, causing NaNs.
+        load_V_tile(0, row_offset);
         cp_async_commit_group();
         cp_async_wait_group<0>();
         __syncthreads();  // SYNC 3: V[stage] ready
