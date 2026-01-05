@@ -3458,7 +3458,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int jc_cwm = col_offset + warp_id*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
         const float2 KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
 
-        if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < 2*T_C_VKQ::J) {
+        // FIX: Bounds check - jc_cwm can exceed ncols when nwarps > ncols/cols_per_warp
+        if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < 2*T_C_VKQ::J && jc_cwm < ncols) {
             // Use the 16 bytes of padding in each row to store the meta data: KQ max, KQ rowsum, KQ max scale.
             ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
         }
@@ -3467,11 +3468,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         if (np == 1) {
             // No combination is needed, the meta data can be directly written from registers to VRAM.
-            if (needs_fixup && threadIdx.x < T_B_KQ::I) {
+            // FIX: Add bounds check for jc_cwm
+            if (needs_fixup && threadIdx.x < T_B_KQ::I && jc_cwm < ncols) {
                 float2 * dstk_fixup_meta = dstk_fixup + blockIdx.x*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (is_fixup && threadIdx.x < T_B_KQ::I) {
+            if (is_fixup && threadIdx.x < T_B_KQ::I && jc_cwm < ncols) {
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
                 // DEBUG: Track Region 2 metadata writes (cols_per_warp==8 path)
@@ -3495,7 +3497,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const bool thread_should_write = T_C_KQ::J == 8 || T_C_KQ::get_j(threadIdx.x & 2) < 8;
 #endif // defined(TURING_MMA_AVAILABLE)
 
-        if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write) {
+        // FIX: Add bounds check for jc_cwm
+        if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write && jc_cwm < ncols) {
             ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
         }
 
@@ -3503,11 +3506,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         if (np == 1) {
             // No combination is needed, the meta data can be directly written from registers to VRAM.
-            if (needs_fixup && thread_should_write) {
+            // FIX: Add bounds check for jc_cwm
+            if (needs_fixup && thread_should_write && jc_cwm < ncols) {
                 float2 * dstk_fixup_meta = dstk_fixup + blockIdx.x*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
-            if (is_fixup && thread_should_write) {
+            if (is_fixup && thread_should_write && jc_cwm < ncols) {
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
                 // DEBUG: Track Region 2 metadata writes
@@ -3533,11 +3537,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int nmeta = np*cols_per_warp >= WARP_SIZE ? np*cols_per_warp/WARP_SIZE : 1;
 
         const int jc_meta = col_offset + warp_id*cols_per_warp + (np*cols_per_warp < WARP_SIZE ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
-        float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
+        // FIX: Only access tile_Q if jc_meta is in bounds
+        const bool jc_meta_valid = (jc_meta < ncols);
+        float2 * const meta_ptr = jc_meta_valid ? (((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2) : nullptr;
         float2 meta[nmeta];
 #pragma unroll
         for (int imeta = 0; imeta < nmeta; ++imeta) {
-            meta[imeta] = meta_ptr[imeta * WARP_SIZE * tile_stride/2];
+            // FIX: Only read if pointer is valid
+            meta[imeta] = jc_meta_valid ? meta_ptr[imeta * WARP_SIZE * tile_stride/2] : make_float2(-FLT_MAX/2.0f, 0.0f);
         }
 
         float KQ_cmn = meta[0].x; // KQ combine max new, max between all parallel warps.
@@ -3575,7 +3582,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // Write back combined meta data:
 #pragma unroll
         for (int imeta = 0; imeta < nmeta; ++imeta) {
-            if (np*cols_per_warp >= WARP_SIZE || threadIdx.x < np*cols_per_warp) {
+            // FIX: Only write if pointer is valid
+            if ((np*cols_per_warp >= WARP_SIZE || threadIdx.x < np*cols_per_warp) && jc_meta_valid) {
                 // Combined KQ max scale + rowsum.
                 meta_ptr[imeta * WARP_SIZE * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
             }
@@ -3583,18 +3591,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         // Combined KQ max + rowsum.
         static_assert(cols_per_warp <= WARP_SIZE);
-        if (needs_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp)) {
+        // FIX: Add bounds check for dstk_fixup writes
+        const int fixup_idx = col_offset + (warp_id/np)*cols_per_warp + threadIdx.x;
+        if (needs_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp) && fixup_idx < ncols) {
             float2 * dstk_fixup_meta = dstk_fixup + blockIdx.x*ncols;
-            dstk_fixup_meta[col_offset + (warp_id/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
+            dstk_fixup_meta[fixup_idx] = make_float2(KQ_cmn, KQ_crs);
         }
-        if (is_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp)) {
+        if (is_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp) && fixup_idx < ncols) {
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
-            const int jc_idx = col_offset + (warp_id/np)*cols_per_warp + threadIdx.x;
-            dstk_fixup_meta[jc_idx] = make_float2(KQ_cmn, KQ_crs);
+            dstk_fixup_meta[fixup_idx] = make_float2(KQ_cmn, KQ_crs);
             // DEBUG: Track Region 2 metadata writes for np > 1
             if (threadIdx.x == 0 && warp_id == 0) {
-                printf("[FA REGION2 WRITE np>1] block=%d jc_idx=%d KQ_max=%f KQ_rowsum=%f\n",
-                       blockIdx.x, jc_idx, KQ_cmn, KQ_crs);
+                printf("[FA REGION2 WRITE np>1] block=%d fixup_idx=%d KQ_max=%f KQ_rowsum=%f\n",
+                       blockIdx.x, fixup_idx, KQ_cmn, KQ_crs);
             }
         }
     } else if (np > 1) {
@@ -3630,27 +3639,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
         if constexpr (cols_per_warp == 8) {
             const int jc_cwd = col_offset + warp_id*T_B_KQ::I + T_B_KQ::get_i(-1); // jc combine write data
+            // FIX: Bounds check - with ncols=8 and cols_per_warp=8, only warp 0 has valid indices
+            // Warps 1-3 would write to jc_cwd >= ncols (out of bounds in tile_Q)
+            if (jc_cwd < ncols) {
 #pragma unroll
-            for (int k1 = 0; k1 < nbatch_combine; k1 += T_B_KQ::J) {
-                const T_B_KQ B = get_transposed(VKQ_C[(k00 + k1)/T_B_KQ::J]); // Conversion of C to B matrix puts it in column-major format.
+                for (int k1 = 0; k1 < nbatch_combine; k1 += T_B_KQ::J) {
+                    const T_B_KQ B = get_transposed(VKQ_C[(k00 + k1)/T_B_KQ::J]); // Conversion of C to B matrix puts it in column-major format.
 
 #pragma unroll
-                for (int l = 0; l < T_B_KQ::ne; ++l) {
-                    const int k = k1 + T_B_KQ::get_j(l);
+                    for (int l = 0; l < T_B_KQ::ne; ++l) {
+                        const int k = k1 + T_B_KQ::get_j(l);
 
-                    tile_Q[jc_cwd*tile_stride + k] = B.x[l];
+                        tile_Q[jc_cwd*tile_stride + k] = B.x[l];
+                    }
                 }
             }
         } else {
             const int j0 = col_offset + warp_id*cols_per_warp;
+            // FIX: Bounds check - only warps with valid column ranges should write
+            if (j0 < ncols) {
 #pragma unroll
-            for (int k1 = 0; k1 < nbatch_combine; k1 += T_C_VKQ::J) {
+                for (int k1 = 0; k1 < nbatch_combine; k1 += T_C_VKQ::J) {
 #pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    const int j = j0 + T_C_VKQ::get_i(l);
-                    const int k = k1 + T_C_VKQ::get_j(l);
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        const int j = j0 + T_C_VKQ::get_i(l);
+                        const int k = k1 + T_C_VKQ::get_j(l);
 
-                    tile_Q[j*tile_stride + k] = VKQ_C[(k00 + k1)/T_C_VKQ::J].x[l];
+                        if (j < ncols) {
+                            tile_Q[j*tile_stride + k] = VKQ_C[(k00 + k1)/T_C_VKQ::J].x[l];
+                        }
+                    }
                 }
             }
         }
@@ -3674,8 +3692,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
 
                 // Write only this col_iter's columns (col_offset to col_offset + effective_nwarps*cols_per_warp)
+                // FIX: Bound col_range_end by ncols to prevent out-of-bounds access
+                // With ncols=8, cols_per_warp=8, effective_nwarps=4, col_range_end would be 32 without this fix
                 const int col_range_start = col_offset;
-                const int col_range_end = col_offset + effective_nwarps * cols_per_warp;
+                const int col_range_end = min(ncols, col_offset + effective_nwarps * cols_per_warp);
 
 #pragma unroll
                 for (int jc0_dst = col_range_start; jc0_dst < col_range_end; jc0_dst += (effective_nwarps/np)*stride_jc) {
@@ -3702,6 +3722,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         float2 dstk_val = make_float2(0.0f, 0.0f);
 #pragma unroll
                         for (int ip = 0; ip < np; ++ip) {
+                            // FIX: Skip partitions that didn't write valid data (OOB for tile_Q)
+                            // When ncols < nwarps*cols_per_warp, only some warps have valid columns
+                            if (jc_tile_K + ip*cols_per_warp >= ncols) {
+                                continue;
+                            }
                             const float KQ_crs = np == 1 ? 1.0f : meta_j[ip*cols_per_warp * tile_stride + 0];
                             const float2 dstk_val_add = __half22float2(tile_Q[(jc_tile_K + ip*cols_per_warp) * tile_stride + k]);
                             dstk_val.x += dstk_val_add.x*KQ_crs;
