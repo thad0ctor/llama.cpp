@@ -2,6 +2,7 @@
 
 # Stop on error
 set -e
+set -o pipefail
 
 # Activate conda base environment
 source /home/rgilbreth/miniconda3/etc/profile.d/conda.sh
@@ -49,4 +50,4 @@ export CUDA_LAUNCH_BLOCKING=1
         --port 5001 \
         --no-warmup \
         --jinja
-} 2>&1 | tee -a "$LOG_FILE"
+} 2>&1 | stdbuf -oL tee -a "$LOG_FILE"
