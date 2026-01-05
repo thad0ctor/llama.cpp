@@ -4219,8 +4219,14 @@ __global__ void flash_attn_ext_f16_blackwell(
     }
 
     while (kbc < kbc_stop) {
+        // FIX: Recalculate kb0_start/kb0_stop each iteration from current kbc
+        // This ensures correct tile boundaries for Stream-K fixup blocks
+        kb0_start = kbc % iter_k;
+        kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
+        
         if (threadIdx.x == 0 && threadIdx.y == 0) {
-            printf("[LOOP] Block %d: ENTERED while loop, kbc=%d\n", blockIdx.x, kbc);
+            printf("[LOOP] Block %d: ENTERED while loop, kbc=%d, kb0_start=%d, kb0_stop=%d\n", 
+                   blockIdx.x, kbc, kb0_start, kb0_stop);
         }
          const int sequence = kbc / (iter_k*iter_j*(ne02/ncols2));
          const int zt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence) / (iter_k*iter_j); 

@@ -605,7 +605,12 @@ namespace ggml_cuda_mma {
         
         // For column iteration: XOR with col_offset_bytes (NOT addition!)
         // This correctly navigates the swizzled memory layout
+        // SM_120 (RTX 5090) with single-buffered V: XOR can wrap out-of-bounds, use ADD instead
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        uint32_t addr = smem_base + swizzled_offset + col_offset_bytes;
+#else
         uint32_t addr = smem_base + (swizzled_offset ^ col_offset_bytes);
+#endif
         
         // Use 32-bit address with "r" constraint, NO .shared modifier (matches Gau-Nernst reference)
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
@@ -644,7 +649,13 @@ namespace ggml_cuda_mma {
         
         uint32_t linear_offset = thread_row * STRIDE_BYTES + thread_col_bytes;
         uint32_t swizzled_offset = swizzle_addr<STRIDE_BYTES>(linear_offset);
+        // SM_120 (RTX 5090) with single-buffered V: XOR can produce out-of-bounds addresses
+        // Use ADD instead to avoid wraparound into K/Q buffers
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        uint32_t addr = smem_base + swizzled_offset + col_offset_bytes;
+#else
         uint32_t addr = smem_base + (swizzled_offset ^ col_offset_bytes);
+#endif
         
         // .trans variant reorders output registers for transposed load
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
@@ -668,7 +679,12 @@ namespace ggml_cuda_mma {
         
         uint32_t linear_offset = thread_row * STRIDE_BYTES + thread_col_bytes;
         uint32_t swizzled_offset = swizzle_addr<STRIDE_BYTES>(linear_offset);
+        // SM_120 (RTX 5090) with single-buffered V: XOR can wrap out-of-bounds, use ADD instead
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        uint32_t addr = smem_base + swizzled_offset + col_offset_bytes;
+#else
         uint32_t addr = smem_base + (swizzled_offset ^ col_offset_bytes);
+#endif
         
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
             : "=r"(xi[0]), "=r"(xi[1])
