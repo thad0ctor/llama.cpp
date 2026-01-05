@@ -975,7 +975,10 @@ void launch_fattn(
         const int total_work_stream_k = ntiles_KQ * ntiles_total;     // iter_k * iter_j * heads * batch
         const int nblocks_stream_k = std::min(max_blocks, total_work_stream_k);
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
+        // WORKAROUND: Disable Stream-K for Blackwell (sm_120) until fixup kernel is fixed for split-K
+        // The stream_k_fixup kernel has a design flaw: it reads metadata from dst_fixup[bidx0*ncols]
+        // but expects Block 0's metadata, which is at dst_fixup[0*ncols]. This causes garbage metadata.
+        const bool use_stream_k = (cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_BLACKWELL) || tiles_efficiency_percent < 75;
 
         blocks_num.x = use_stream_k ? nblocks_stream_k : ntiles_total;
         blocks_num.y = 1;

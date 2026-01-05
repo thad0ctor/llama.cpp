@@ -3706,9 +3706,16 @@ __global__ void flash_attn_ext_f16_ampere(
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, 0, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+        } else if (kb0_start == 0) {
+            // Case 2: Split-K START - write data to dst, metadata to Region 1
+            // Fixup kernel reads this block's data from dst via initial load
+            constexpr bool needs_fixup = true;
+            constexpr bool is_fixup = false;
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, 0, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
+                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                 ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
         } else {
-            // Case 2 & 3: Partial Tile (Split-K start or middle)
-            // ALL partial blocks MUST write to fixup buffer so fixup kernel can merge them
+            // Case 3: Split-K CONTINUATION/END - write to fixup buffer
             constexpr bool needs_fixup = true;
             constexpr bool is_fixup = true;
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, 0, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>
@@ -4147,15 +4154,20 @@ __global__ void flash_attn_ext_f16_blackwell(
              // All warps participate in unified mode
              if (kb0_start == 0 && kb0_stop >= iter_k) {
                  // Case 1: Complete Tile (No Split-K)
-                 // Write directly to output, no metadata needed
                  constexpr bool needs_fixup = false;
                  constexpr bool is_fixup = false;
                  flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
                      Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                      ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             } else if (kb0_start == 0) {
+                 // Case 2: Split-K START - write data to dst, metadata to Region 1
+                 constexpr bool needs_fixup = true;
+                 constexpr bool is_fixup = false;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
+                     Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                     ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
              } else {
-                 // Case 2 & 3: Partial Tile (Split-K start or middle)
-                 // ALL partial blocks MUST write to fixup buffer so fixup kernel can merge them
+                 // Case 3: Split-K CONTINUATION/END - write to fixup buffer
                  constexpr bool needs_fixup = true;
                  constexpr bool is_fixup = true;
                  flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, false>(
@@ -4196,15 +4208,20 @@ __global__ void flash_attn_ext_f16_blackwell(
 
              if (kb0_start == 0 && kb0_stop >= iter_k) {
                  // Case 1: Complete Tile (No Split-K)
-                 // Write directly to output, no metadata needed
                  constexpr bool needs_fixup = false;
                  constexpr bool is_fixup = false;
                  flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
                      Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                      ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
+             } else if (kb0_start == 0) {
+                 // Case 2: Split-K START - write data to dst, metadata to Region 1
+                 constexpr bool needs_fixup = true;
+                 constexpr bool is_fixup = false;
+                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
+                     Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                     ne01, ne02, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, kb0_start, kb0_stop, tensor_maps);
              } else {
-                 // Case 2 & 3: Partial Tile (Split-K start or middle)
-                 // ALL partial blocks MUST write to fixup buffer so fixup kernel can merge them
+                 // Case 3: Split-K CONTINUATION/END - write to fixup buffer
                  constexpr bool needs_fixup = true;
                  constexpr bool is_fixup = true;
                  flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, num_consumers, use_logit_softcap, mla, needs_fixup, is_fixup, use_tma>(
