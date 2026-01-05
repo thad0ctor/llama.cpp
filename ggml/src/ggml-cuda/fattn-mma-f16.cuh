@@ -1981,6 +1981,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
                     const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
+
+                    // FIX: Skip MMA if this warp's K row is out of bounds (prevents garbage attention)
+                    // With np > 1, warps process different K rows. For short sequences, warps 1+ may be OOB.
+                    if (i_KQ_0 >= k_VKQ_sup) continue;
+
 #pragma unroll
                     for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
                         T_A_KQ K_A;
@@ -2033,6 +2038,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                     for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
                         const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
+
+                        // FIX: Skip MMA if this warp's K row is out of bounds
+                        if (i_KQ_0 >= k_VKQ_sup) continue;
 
                         T_A_KQ K_A;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
