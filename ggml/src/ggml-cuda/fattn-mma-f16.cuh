@@ -1982,9 +1982,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
                     const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
 
-                    // FIX: Skip MMA if this warp's K row is out of bounds (prevents garbage attention)
-                    // With np > 1, warps process different K rows. For short sequences, warps 1+ may be OOB.
-                    if (i_KQ_0 >= k_VKQ_sup) continue;
+                    // Note: OOB K rows are zeroed during loading when oob_check=true,
+                    // so MMA produces zeros naturally. No need for runtime skip.
 
 #pragma unroll
                     for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
@@ -2039,8 +2038,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
                         const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
 
-                        // FIX: Skip MMA if this warp's K row is out of bounds
-                        if (i_KQ_0 >= k_VKQ_sup) continue;
+                        // Note: OOB K rows are zeroed during loading when oob_check=true,
+                        // so MMA produces zeros naturally. No need for runtime skip.
 
                         T_A_KQ K_A;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
@@ -2196,6 +2195,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
+                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
+                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
+                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::I;
+                if (warp_k_row >= k_VKQ_sup) continue;
+
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + T_C_KQ::get_i(l) < k_VKQ_sup) {
@@ -2216,6 +2220,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
+                // Skip OOB warp iterations to exclude zeros from softmax calculation
+                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::I;
+                if (warp_k_row >= k_VKQ_sup) continue;
+
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
@@ -2258,6 +2266,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
+                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
+                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
+                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::J;
+                if (warp_k_row >= k_VKQ_sup) continue;
+
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + T_C_KQ::get_j(l) < k_VKQ_sup) {
@@ -2287,6 +2300,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
+                // Skip OOB warp iterations to exclude zeros from softmax calculation
+                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::J;
+                if (warp_k_row >= k_VKQ_sup) continue;
+
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     // Turing + Volta:
@@ -2434,43 +2451,48 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
-    if (!consumer_mode && nstages > 1) {
-        // Preload K/mask tile for next iteration:
-        constexpr bool use_cp_async = true;
-        
-        if (!last_iter) {
-            if (ncols2 > 1 || mask_h) {
-                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
-            }
-        }
+    // Use if constexpr for nstages check to prevent template instantiation when nstages <= 1.
+    // This avoids static_assert failure in flash_attn_ext_f16_load_mask when oob_check=true
+    // (which requires use_cp_async=false, but this block hardcodes use_cp_async=true).
+    if constexpr (nstages > 1) {
+        if (!consumer_mode) {
+            // Preload K/mask tile for next iteration:
+            constexpr bool use_cp_async = true;
 
-        if constexpr (use_tma) {
-             if (!last_iter && !mla) { // Only for non-MLA here
-                 #ifdef BLACKWELL_TMA_AVAILABLE
-                 // Preload K for next iteration via TMA (full tile)
-                 uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
-                 if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
-                 #endif
-                 flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
-                     tensor_maps, 0, tile_K, mbar_ptr, 0, k_VKQ_0 + nbatch_fa);
-             }
-        } else {
-            cp_async_wait_all();
-            __syncthreads();
             if (!last_iter) {
+                if (ncols2 > 1 || mask_h) {
+                    flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+                }
+            }
+
+            if constexpr (use_tma) {
+                if (!last_iter && !mla) { // Only for non-MLA here
+                    #ifdef BLACKWELL_TMA_AVAILABLE
+                    // Preload K for next iteration via TMA (full tile)
+                    uint32_t bytes_K = nbatch_fa * nbatch_K2 * sizeof(half2);
+                    if (threadIdx.x == 0) mbarrier_arrive_expect_tx(mbar_ptr, bytes_K);
+                    #endif
+                    flash_attn_ext_f16_load_tile_tma_chunked<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, chunks_K, chunk_size_K>(
+                        tensor_maps, 0, tile_K, mbar_ptr, 0, k_VKQ_0 + nbatch_fa);
+                }
+            } else {
+                cp_async_wait_all();
+                __syncthreads();
+                if (!last_iter) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                // SM_120: Use swizzled cp.async for K (next iteration preload)
-                // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
-                // Note: oob_check=false for prefetch since !last_iter guarantees next iter has full batch
-                constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
-                const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
-                flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, false>(
-                    K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K_base, nbatch_K2, stride_K);
+                    // SM_120: Use swizzled cp.async for K (next iteration preload)
+                    // warp_id_offset=0 for unified mode (all warps load, threadIdx.y = 0..nwarps-1)
+                    // Note: oob_check=false for prefetch since !last_iter guarantees next iter has full batch
+                    constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
+                    const uint32_t tile_K_base = ggml_cuda_cvta_generic_to_shared(tile_K);
+                    flash_attn_ext_f16_load_tile_swizzle<stride_tile_K, STRIDE_BYTES_K, nwarps, nbatch_fa, 0, false>(
+                        K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K_base, nbatch_K2, stride_K);
 #else
-                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                    flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
 #endif
+                }
             }
         }
     }
@@ -3300,11 +3322,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     //
     // OOB check strategy:
     // - Main loop (full tiles): oob_check=false - all rows are valid
-    // - Last iteration (potentially partial): oob_check=true when nstages==1
+    // - Last iteration (potentially partial): oob_check=true when nstages <= 1
+    //   This includes nstages==0 (SM_120 with ncols2==1) and nstages==1.
     //   Note: oob_check is incompatible with multi-stage pipeline (nstages > 1),
-    //   so we can only enable it when nstages == 1. For nstages > 1, bounds are
+    //   so we can only enable it when nstages <= 1. For nstages > 1, bounds are
     //   handled via the k_VKQ_sup runtime parameter.
-    constexpr bool oob_check_last = (nstages == 1);
+    //
+    //   With oob_check enabled, the load functions zero OOB K rows, which means:
+    //   - KQ MMA produces zeros for OOB rows (K_zeros @ Q = 0)
+    //   - Softmax: exp(0 + mask) = exp(-inf) = 0 for masked positions
+    //   - VKQ MMA: zero softmax weights contribute nothing
+    //   This eliminates the need for runtime OOB checks in the compute loops.
+    constexpr bool oob_check_last = (nstages <= 1);
 
     if constexpr (ncols2 == 1) {
         for (; kb0 < kb0_stop-1; ++kb0) {
