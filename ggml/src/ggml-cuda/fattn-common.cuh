@@ -709,9 +709,11 @@ static __global__ void flash_attn_stream_k_fixup(
 
     // Iterate over previous blocks and compute the combined results.
     // All CUDA blocks that get here must have a previous block that needs a fixup.
+    // IMPORTANT: We must NOT read Region 2 for bidx_starter - it only wrote to Region 1,
+    // and we already loaded that data above. Stop the loop before reaching starter.
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
-    while(true) {
+    while(bidx > bidx_starter) {
         const int kbc = int64_t(bidx)*(iter_k*iter_j*(ne02/ncols2)*ne03) / gridDim.x;
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
