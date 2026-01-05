@@ -2196,14 +2196,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
-                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
-                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::I;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
-                    if (!oob_check || k0 + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                    // FIX: Added (warp_id % np)*T_C_KQ::I to match softmax loop check
+                    if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
                         KQ_max_new[l % 2] = fmaxf(KQ_max_new[l % 2], KQ_C[k0/(np*T_C_KQ::I)].x[l] + FATTN_KQ_MAX_OFFSET);
                     }
                 }
@@ -2221,11 +2217,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
-                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
-                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::I;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
@@ -2268,14 +2259,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
-                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
-                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::J;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
-                    if (!oob_check || k0 + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                    // FIX: Added (warp_id % np)*T_C_KQ::J to match softmax loop check
+                    if (!oob_check || k0 + (warp_id % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
                         // Turing + Volta:
                         KQ_max_new[(l/2) % 2] = fmaxf(KQ_max_new[(l/2) % 2], KQ_C[(k0/(np*T_C_KQ::J))].x[l] + FATTN_KQ_MAX_OFFSET);
                     }
@@ -2302,11 +2289,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
-                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
-                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::J;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     // Turing + Volta:
