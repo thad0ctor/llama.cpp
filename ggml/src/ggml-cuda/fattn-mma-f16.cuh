@@ -1516,7 +1516,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  effective_nwarps = (num_consumers > 0) ? num_consumers : nwarps;
     const int      warp_id          = (num_consumers > 0) ? (threadIdx.y - 1) : threadIdx.y;
 
-    constexpr int  np              = effective_nwarps * (cols_per_warp/ncols2) / ncols1; // Number of parallel CUDA warps per Q column.
+    // Number of parallel CUDA warps per Q column.
+    // Guard against np=0 which causes division-by-zero UB when ncols > nwarps*cols_per_warp
+    constexpr int  np_calculated   = effective_nwarps * (cols_per_warp/ncols2) / ncols1;
+    constexpr int  np              = np_calculated > 0 ? np_calculated : 1;
+
+    // Column iteration: when ncols > nwarps*cols_per_warp, warps iterate over column chunks
+    // This allows 4 warps with cols_per_warp=8 to handle ncols=64 (2 iterations of 32 each)
+    constexpr int  col_iters       = (ncols > effective_nwarps * cols_per_warp) ?
+                                     (ncols / (effective_nwarps * cols_per_warp)) : 1;
     // Config selection:
     // - SM_120 (__CUDA_ARCH__ >= 1200): Use SM_120 configs (unified mode, 4 warps, nbatch_fa=128)
     // - Other Blackwell (use_tma=true): Use Blackwell TMA configs
@@ -2835,7 +2843,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = 2; // This is specifically KQ columns, Volta only has a single VKQ column.
-    constexpr int  np              = effective_nwarps * (cols_per_warp/ncols2) / ncols1; // Number of parallel CUDA warps per Q column.
+
+    // Number of parallel CUDA warps per Q column.
+    // Guard against np=0 which causes division-by-zero UB when ncols > nwarps*cols_per_warp
+    constexpr int  np_calculated   = effective_nwarps * (cols_per_warp/ncols2) / ncols1;
+    constexpr int  np              = np_calculated > 0 ? np_calculated : 1;
+
+    // Column iteration: when ncols > nwarps*cols_per_warp, warps iterate over column chunks
+    // This allows 4 warps with cols_per_warp=8 to handle ncols=64 (2 iterations of 32 each)
+    constexpr int  col_iters       = (ncols > effective_nwarps * cols_per_warp) ?
+                                     (ncols / (effective_nwarps * cols_per_warp)) : 1;
     // Config selection:
     // - SM_120 (__CUDA_ARCH__ >= 1200): Use SM_120 configs (unified mode, 4 warps, nbatch_fa=128)
     // - Other Blackwell (use_tma=true): Use Blackwell TMA configs
@@ -3077,8 +3094,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Q loading is now handled exclusively by the flash_attn_ext_f16_blackwell kernel
     // before this function is called. This block is intentionally left empty.
 
+    // Column iteration loop: when ncols > nwarps*cols_per_warp, warps iterate over column chunks.
+    // With col_iters=2: first iteration handles cols 0-31, second handles cols 32-63.
+    for (int col_iter = 0; col_iter < col_iters; ++col_iter) {
+        const int col_offset = col_iter * effective_nwarps * cols_per_warp;
+
     if (Q_in_reg) {
-        const int j0 = (warp_id / np) * cols_per_warp;
+        const int j0 = col_offset + (warp_id / np) * cols_per_warp;
 
 #pragma unroll
         for (int k0 = 0; k0 < DKQ/2; k0 += T_B_KQ::J) {
@@ -3296,7 +3318,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     if constexpr (cols_per_warp == 8) {
         const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
-        const int jc_cwm = warp_id*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
+        const int jc_cwm = col_offset + warp_id*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
         const float2 KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
 
         if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < 2*T_C_VKQ::J) {
@@ -3327,11 +3349,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // KQ_cmr = KQ combine max rowsum
         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
 #if defined(TURING_MMA_AVAILABLE)
-        const int jc_cwm = warp_id*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
+        const int jc_cwm = col_offset + warp_id*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
         const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
 #else // Volta
-        const int jc_cwm = warp_id*cols_per_warp + T_C_KQ::get_i(threadIdx.x & 2);
+        const int jc_cwm = col_offset + warp_id*cols_per_warp + T_C_KQ::get_i(threadIdx.x & 2);
         const float2 KQ_cmr = make_float2(KQ_max[(threadIdx.x & 2) / 2], KQ_rowsum[(threadIdx.x & 2) / 2]);
         const bool thread_should_write = T_C_KQ::J == 8 || T_C_KQ::get_j(threadIdx.x & 2) < 8;
 #endif // defined(TURING_MMA_AVAILABLE)
@@ -3373,7 +3395,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         constexpr int nmeta = np*cols_per_warp >= WARP_SIZE ? np*cols_per_warp/WARP_SIZE : 1;
 
-        const int jc_meta = warp_id*cols_per_warp + (np*cols_per_warp < WARP_SIZE ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
+        const int jc_meta = col_offset + warp_id*cols_per_warp + (np*cols_per_warp < WARP_SIZE ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
         float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
         float2 meta[nmeta];
 #pragma unroll
@@ -3426,11 +3448,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         static_assert(cols_per_warp <= WARP_SIZE);
         if (needs_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp)) {
             float2 * dstk_fixup_meta = dstk_fixup + blockIdx.x*ncols;
-            dstk_fixup_meta[(warp_id/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
+            dstk_fixup_meta[col_offset + (warp_id/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
         }
         if (is_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp)) {
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
-            const int jc_idx = (warp_id/np)*cols_per_warp + threadIdx.x;
+            const int jc_idx = col_offset + (warp_id/np)*cols_per_warp + threadIdx.x;
             dstk_fixup_meta[jc_idx] = make_float2(KQ_cmn, KQ_crs);
             // DEBUG: Track Region 2 metadata writes for np > 1
             if (threadIdx.x == 0 && warp_id == 0) {
@@ -3470,7 +3492,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #pragma unroll
     for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
         if constexpr (cols_per_warp == 8) {
-            const int jc_cwd = warp_id*T_B_KQ::I + T_B_KQ::get_i(-1); // jc combine write data
+            const int jc_cwd = col_offset + warp_id*T_B_KQ::I + T_B_KQ::get_i(-1); // jc combine write data
 #pragma unroll
             for (int k1 = 0; k1 < nbatch_combine; k1 += T_B_KQ::J) {
                 const T_B_KQ B = get_transposed(VKQ_C[(k00 + k1)/T_B_KQ::J]); // Conversion of C to B matrix puts it in column-major format.
@@ -3483,7 +3505,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         } else {
-            const int j0 = warp_id*cols_per_warp;
+            const int j0 = col_offset + warp_id*cols_per_warp;
 #pragma unroll
             for (int k1 = 0; k1 < nbatch_combine; k1 += T_C_VKQ::J) {
 #pragma unroll
@@ -3495,9 +3517,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-
         __syncthreads();
 
+        // Global write for this k00 chunk - all ncols columns
+        // Since col_iter writes to different tile_Q columns (via col_offset), all columns are valid
         if (np == 1 || warp_id % np == 0) {
             // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
             // The values after that are for the partial results of the individual blocks.
@@ -3513,11 +3536,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     continue;
                 }
 
+                // Write only this col_iter's columns (col_offset to col_offset + effective_nwarps*cols_per_warp)
+                const int col_range_start = col_offset;
+                const int col_range_end = col_offset + effective_nwarps * cols_per_warp;
+
 #pragma unroll
-                for (int jc0_dst = 0; jc0_dst < ncols; jc0_dst += (effective_nwarps/np)*stride_jc) {
+                for (int jc0_dst = col_range_start; jc0_dst < col_range_end; jc0_dst += (effective_nwarps/np)*stride_jc) {
                     const int jc_dst = jc0_dst + (warp_id/np)*stride_jc + (stride_k == WARP_SIZE ? 0 : threadIdx.x / stride_k);
 
-                    if (jc0_dst + (effective_nwarps/np)*stride_jc > ncols && jc_dst >= ncols) {
+                    if (jc0_dst + (effective_nwarps/np)*stride_jc > col_range_end && jc_dst >= col_range_end) {
                         break;
                     }
 
@@ -3562,8 +3589,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             if (threadIdx.x < 4) {
                                 printf("[FA KERNEL NaN] Block=%d Warp=%d Thread=%d: NaN/Inf in dstk_val! x=%f y=%f\n",
                                        blockIdx.x, warp_id, threadIdx.x, dstk_val.x, dstk_val.y);
-                                printf("[FA KERNEL NaN]   jc_dst=%d k=%d j_dst=%d c_dst=%d jt=%d\n",
-                                       jc_dst, k, j_dst, c_dst, jt);
+                                printf("[FA KERNEL NaN]   jc_dst=%d k00=%d k=%d j_dst=%d c_dst=%d jt=%d\n",
+                                       jc_dst, k00, k, j_dst, c_dst, jt);
                                 printf("[FA KERNEL NaN]   tile_Q read index: %d, dstk_val_add source\n",
                                        (jc_tile_K)*tile_stride + k);
                                 if constexpr (!needs_fixup && !is_fixup) {
@@ -3574,12 +3601,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         }
 
                         // DEBUG: Comprehensive kernel write check - shows pointer comparison
-                        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && k00 == 0 && k0 == k0_start && jc0_dst == 0) {
+                        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && k00 == 0 && k0 == k0_start && jc0_dst == col_range_start) {
                             const size_t final_idx = ((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k;
                             float2* final_ptr = &dstk[final_idx];
 
                             printf("\n!! KERNEL WRITE CHECK !!\n");
-                            printf("  - is_fixup: %d\n", is_fixup);
+                            printf("  - is_fixup: %d, col_iter: %d\n", is_fixup, col_iter);
                             printf("  - Writing value: (%f, %f)\n", dstk_val.x, dstk_val.y);
                             printf("  - Index calculation: jt=%d ncols1=%d j_dst=%d ne02=%d c_dst=%d DV=%d k00=%d k=%d\n",
                                    jt, ncols1, j_dst, ne02, c_dst, DV, k00, k);
@@ -3596,7 +3623,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         }
 
                         // DEBUG: Verify write by reading back (only for first element)
-                        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && k00 == 0 && k0 == k0_start && jc0_dst == 0 && !is_fixup) {
+                        if (blockIdx.x == 0 && warp_id == 0 && threadIdx.x == 0 && k00 == 0 && k0 == k0_start && jc0_dst == col_range_start && !is_fixup) {
                             __threadfence(); // Ensure write is visible
                             const size_t final_idx = ((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k;
                             float2 readback = dstk[final_idx];
@@ -3610,7 +3637,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         if (np > 1) {
             __syncthreads();
         }
-    }
+    } // End k00 loop
+    } // End col_iter loop
 #else
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02,
