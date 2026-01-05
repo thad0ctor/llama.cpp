@@ -4232,12 +4232,17 @@ __global__ void flash_attn_ext_f16_blackwell(
          const int zt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence) / (iter_k*iter_j); 
          const int jt = (kbc - iter_k*iter_j*(ne02/ncols2)*sequence - iter_k*iter_j*zt) / iter_k;
 
-         const int head0 = zt * ncols2;
+         const int head0 = zt * ncols2;  // Q head index (0 to ne02-1)
+         // GQA: Map Q head index to KV head index
+         // With 32 Q heads and 4 KV heads, heads 0-7 map to KV head 0, 8-15 to KV head 1, etc.
+         const int gqa_ratio = ne02 / ne12;
+         const int kv_head_idx = head0 / gqa_ratio;  // KV head index (0 to ne12-1)
+         
          const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02* head0);
-         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*(head0)); 
+         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*kv_head_idx);  // FIX: Use kv_head_idx
          const half   * mask_h = ncols2 == 1 && !mask ? nullptr : (const half *) (mask + nb33*(sequence % ne33));
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + head0) * (DV/2);
-         const half2  * V_h2   = mla ? K_h2 + (DKQ/2 - DV/2) : (const half2 *) (V + nb23*sequence + nb22*(head0));
+         const half2  * V_h2   = mla ? K_h2 + (DKQ/2 - DV/2) : (const half2 *) (V + nb23*sequence + nb22*kv_head_idx);  // FIX: Use kv_head_idx
          const float  * sinks_f = sinks ? (const float *) sinks + head0 : nullptr;
          const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
          
