@@ -768,7 +768,13 @@ static __global__ void flash_attn_stream_k_fixup(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    // Guard against division by zero (can happen when all K rows are masked in causal attention)
+    if (fabsf(rowsum) > 1e-20f) {
+        *dst = dst_val / rowsum;
+    } else {
+        // Zero output for invalid/empty attention (prevents NaN)
+        *dst = 0.0f;
+    }
 }
 
 template<int D> // D == head size
@@ -821,7 +827,12 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    // Guard against division by zero (can happen when all K rows are masked)
+    if (fabsf(VKQ_denominator) > 1e-20f) {
+        dst[tid] = VKQ_numerator / VKQ_denominator;
+    } else {
+        dst[tid] = 0.0f;
+    }
 }
 
 template <int DV, int ncols1, int ncols2, typename KernelFunc, typename... Args>
