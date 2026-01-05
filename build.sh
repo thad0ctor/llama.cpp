@@ -40,8 +40,21 @@ $CMAKE .. \
     -DGGML_CUDA_FORCE_MMQ=ON \
     -DGGML_CUDA_GRAPHS=ON \
     -DCMAKE_CUDA_COMPILER=$CUDACXX \
-    -DCMAKE_CUDA_ARCHITECTURES="120a-real" \
-    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_CUDA_ARCHITECTURES="120a-real;86-real" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_FLAGS="--use_fast_math -O3" \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DGGML_CUDA_FA=ON \
+    -DGGML_CUDA_FA_ALL_QUANTS=ON \
+    -DGGML_LTO=ON \
+    -DGGML_CUDA_COMPRESSION_MODE=speed \
+    -DGGML_CUDA_PEER_MAX_BATCH_SIZE=512 \
+    -DGGML_CUDA_NO_PEER_COPY=OFF \
+    -DGGML_CUDA_NO_VMM=OFF \
+    -DGGML_NATIVE=OFF \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_STATIC=OFF 
 
 echo "Building..."
 $CMAKE --build . --config Release -j $(nproc) --target llama-server

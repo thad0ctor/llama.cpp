@@ -108,14 +108,13 @@ fi
     $LAUNCH_CMD \
     "$SERVER_PATH" \
         -m "$MODEL" \
-        --threads 12 \
-        --threads-batch 24 \
+        --threads 24 \
+        --threads-batch 48 \
         --ctx-size 24000 \
         --temp 0.6 \
         --min-p 0.01 \
         --tensor-split 1,1 \
         --n-gpu-layers 999 \
-        --fit off \
         --flash-attn on \
         --parallel 1 \
         --port 5001 \
