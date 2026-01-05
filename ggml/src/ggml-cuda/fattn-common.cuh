@@ -676,6 +676,18 @@ static __global__ void flash_attn_stream_k_fixup(
 
     dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + head*(ncols2*D) + (j*ne02 + c)*D + tid;
 
+    // FIX: Find the block that started this tile (had kb0_start == 0).
+    // That block wrote metadata to Region 1 at dst_fixup[bidx_starter*ncols + jc].
+    // We need to read from THAT location, not from bidx0's location.
+    //
+    // Direct computation (O(1) instead of O(n) loop):
+    // Each block b processes kbc range: [b * total_work / gridDim.x, (b+1) * total_work / gridDim.x)
+    // The tile starts at: tile_kbc_start = (kbc0 / iter_k) * iter_k
+    // So: bidx_starter = tile_kbc_start * gridDim.x / total_work
+    const int total_work = iter_k * iter_j * (ne02/ncols2) * ne03;
+    const int tile_kbc_start = (kbc0 / iter_k) * iter_k;
+    const int bidx_starter = int64_t(tile_kbc_start) * gridDim.x / total_work;
+
     // Load the partial result that needs a fixup:
     float dst_val = 0.0f;
     float max_val = 0.0f;
@@ -683,15 +695,16 @@ static __global__ void flash_attn_stream_k_fixup(
     {
         dst_val = *dst;
 
-        const float2 tmp = dst_fixup[bidx0*ncols + jc];
+        // FIX: Read metadata from the starter block's Region 1 location, not bidx0's location
+        const float2 tmp = dst_fixup[bidx_starter*ncols + jc];
         max_val = tmp.x;
         rowsum  = tmp.y;
     }
 
     // DEBUG: Show loaded values for first thread
     if (j == 0 && c == 0 && tid == 0) {
-        printf("[FIXUP LOAD] bidx0=%d: dst_val=%f max_val=%f rowsum=%f\n",
-               bidx0, dst_val, max_val, rowsum);
+        printf("[FIXUP LOAD] bidx0=%d bidx_starter=%d: dst_val=%f max_val=%f rowsum=%f\n",
+               bidx0, bidx_starter, dst_val, max_val, rowsum);
     }
 
     // Iterate over previous blocks and compute the combined results.
@@ -975,10 +988,8 @@ void launch_fattn(
         const int total_work_stream_k = ntiles_KQ * ntiles_total;     // iter_k * iter_j * heads * batch
         const int nblocks_stream_k = std::min(max_blocks, total_work_stream_k);
 
-        // WORKAROUND: Disable Stream-K for Blackwell (sm_120) until fixup kernel is fixed for split-K
-        // The stream_k_fixup kernel has a design flaw: it reads metadata from dst_fixup[bidx0*ncols]
-        // but expects Block 0's metadata, which is at dst_fixup[0*ncols]. This causes garbage metadata.
-        const bool use_stream_k = cc < GGML_CUDA_CC_BLACKWELL && (cc >= GGML_CUDA_CC_ADA_LOVELACE || tiles_efficiency_percent < 75);
+        // Stream-K is enabled for Ada Lovelace+ or when tile efficiency is low
+        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
 
         blocks_num.x = use_stream_k ? nblocks_stream_k : ntiles_total;
         blocks_num.y = 1;

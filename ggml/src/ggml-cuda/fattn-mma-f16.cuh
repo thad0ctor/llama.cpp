@@ -1504,7 +1504,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         fattn_pipeline_state* pipeline_state = nullptr,
         int pipeline_stage = -1,
         int nstages_pipeline = 0) {
-#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = 2; // This is specifically KQ columns, Volta only has a single VKQ column.
@@ -2754,10 +2754,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         tile_Q, tile_K, tile_V, tile_mask,
         Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
     NO_DEVICE_CODE;
-#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
 }
 
-#if defined(TURING_MMA_AVAILABLE)
+#if defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
 template<int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile<16,  8, half2>; // column-major
@@ -2783,7 +2783,7 @@ template<int ncols> struct mma_tile_sizes {
     using T_B_VKQ = tile<32,  4, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_C_VKQ = tile<32,  4, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
-#endif // defined(TURING_MMA_AVAILABLE)
+#endif // defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, int num_consumers, bool use_logit_softcap, bool mla, bool needs_fixup, bool is_fixup, bool use_tma>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
@@ -2809,7 +2809,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int kb0_start,
         const int kb0_stop,
         const char * __restrict__ tensor_maps) {
-#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
+    // DEBUG: Track which template instance is being called for intermediate blocks
+    if (is_fixup && threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("[FA PROCESS_TILE] block=%d is_fixup=%d needs_fixup=%d kb0=[%d,%d)\n",
+               blockIdx.x, is_fixup, needs_fixup, kb0_start, kb0_stop);
+    }
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
     constexpr int ncols = ncols1 * ncols2;
@@ -3310,6 +3315,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             if (is_fixup && threadIdx.x < T_B_KQ::I) {
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
+                // DEBUG: Track Region 2 metadata writes (cols_per_warp==8 path)
+                if (threadIdx.x == 0 && threadIdx.y == 0) {
+                    printf("[FA REGION2 WRITE cpw8] block=%d jc_cwm=%d KQ_max=%f KQ_rowsum=%f\n",
+                           blockIdx.x, jc_cwm, KQ_cmr.x, KQ_cmr.y);
+                }
             }
         }
     } else {
@@ -3341,6 +3351,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             if (is_fixup && thread_should_write) {
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
+                // DEBUG: Track Region 2 metadata writes
+                if (threadIdx.x == 0 && threadIdx.y == 0) {
+                    printf("[FA REGION2 WRITE np=1] block=%d jc_cwm=%d KQ_max=%f KQ_rowsum=%f\n",
+                           blockIdx.x, jc_cwm, KQ_cmr.x, KQ_cmr.y);
+                }
+            }
+        } else {
+            // DEBUG: np > 1 path - metadata written via different code path
+            if (is_fixup && threadIdx.x == 0 && threadIdx.y == 0) {
+                printf("[FA REGION2 np>1] block=%d np=%d - metadata via shared mem path\n",
+                       blockIdx.x, np);
             }
         }
     }
@@ -3409,7 +3430,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
         if (is_fixup && (cols_per_warp == WARP_SIZE || threadIdx.x < cols_per_warp)) {
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
-            dstk_fixup_meta[(warp_id/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
+            const int jc_idx = (warp_id/np)*cols_per_warp + threadIdx.x;
+            dstk_fixup_meta[jc_idx] = make_float2(KQ_cmn, KQ_crs);
+            // DEBUG: Track Region 2 metadata writes for np > 1
+            if (threadIdx.x == 0 && warp_id == 0) {
+                printf("[FA REGION2 WRITE np>1] block=%d jc_idx=%d KQ_max=%f KQ_rowsum=%f\n",
+                       blockIdx.x, jc_idx, KQ_cmn, KQ_crs);
+            }
         }
     } else if (np > 1) {
         // Warps with warp_id % np == 0 execute a __syncthreads() in the if branch.
@@ -3590,7 +3617,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
         jt, kb0_start, kb0_stop);
     NO_DEVICE_CODE;
-#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 // ------------------------------------------------------------------------------------------------------------------
