@@ -1506,7 +1506,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         uint32_t& consumer_chunk_phase_V,
         fattn_pipeline_state* pipeline_state = nullptr,
         int pipeline_stage = -1,
-        int nstages_pipeline = 0) {
+        int nstages_pipeline = 0,
+        int col_offset = 0) {  // FIX: Added col_offset to determine valid columns per warp
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -1523,6 +1524,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // Guard against np=0 which causes division-by-zero UB when ncols > nwarps*cols_per_warp
     constexpr int  np_calculated   = effective_nwarps * (cols_per_warp/ncols2) / ncols1;
     constexpr int  np              = np_calculated > 0 ? np_calculated : 1;
+
+    // FIX: Determine if this warp has valid columns to process for this col_iter.
+    // When ncols < nwarps*cols_per_warp (e.g., ncols=8 with 4 warps × 8 cols = 32),
+    // warps 1-3 would compute on non-existent columns, producing zero KQ_rowsum.
+    // These warps must still participate in __syncthreads() but skip MMA computation.
+    const int  warp_col_start = col_offset + (warp_id / np) * cols_per_warp;
+    const bool has_valid_cols = (warp_col_start < ncols);
 
     // Column iteration: when ncols > nwarps*cols_per_warp, warps iterate over column chunks
     // This allows 4 warps with cols_per_warp=8 to handle ncols=64 (2 iterations of 32 each)
@@ -1967,71 +1975,77 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr int STRIDE_BYTES_K = stride_tile_K * sizeof(half2);
         const uint32_t current_tile_K_base = ggml_cuda_cvta_generic_to_shared((void*)current_tile_K);
 #endif
+        // FIX: Only compute KQ MMA if this warp has valid columns
         if constexpr (Q_in_reg) {
+            if (has_valid_cols) {
 #pragma unroll
-            for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
-                const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
+                for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
+                    const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
 #pragma unroll
-                for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
-                    T_A_KQ K_A;
+                    for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
+                        T_A_KQ K_A;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                    // SM_120: Use swizzled ldmatrix read
-                    ggml_cuda_mma::load_ldmatrix_swizzle<STRIDE_BYTES_K>(K_A, current_tile_K_base,
-                        i_KQ_0, (k_KQ_0 - k0_start) * sizeof(half2));
+                        // SM_120: Use swizzled ldmatrix read
+                        ggml_cuda_mma::load_ldmatrix_swizzle<STRIDE_BYTES_K>(K_A, current_tile_K_base,
+                            i_KQ_0, (k_KQ_0 - k0_start) * sizeof(half2));
 
-                    // ==========================================================================
-                    // DEBUG: Verify K_A register content after ldmatrix_swizzle
-                    // ==========================================================================
-                    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 &&
-                        i_KQ_00 == 0 && k_KQ_0 == k0_start && kb0 == 0 && chunk == 0) {
-                        // K_A.x is an array of half2. Print values to compare with SMEM debug.
-                        half2 k_val = K_A.x[0];
-                        printf("[REG K CHECK] After ldmatrix_swizzle: K_A.x[0] = (%f, %f)\n",
-                               __half2float(__low2half(k_val)), __half2float(__high2half(k_val)));
+                        // ==========================================================================
+                        // DEBUG: Verify K_A register content after ldmatrix_swizzle
+                        // ==========================================================================
+                        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 &&
+                            i_KQ_00 == 0 && k_KQ_0 == k0_start && kb0 == 0 && chunk == 0) {
+                            // K_A.x is an array of half2. Print values to compare with SMEM debug.
+                            half2 k_val = K_A.x[0];
+                            printf("[REG K CHECK] After ldmatrix_swizzle: K_A.x[0] = (%f, %f)\n",
+                                   __half2float(__low2half(k_val)), __half2float(__high2half(k_val)));
 
-                        // Check for NaN
-                        float v0 = __half2float(__low2half(k_val));
-                        float v1 = __half2float(__high2half(k_val));
-                        if (isnan(v0) || isnan(v1)) {
-                            printf("[REG K CHECK] *** NaN DETECTED in K_A register! ***\n");
+                            // Check for NaN
+                            float v0 = __half2float(__low2half(k_val));
+                            float v1 = __half2float(__high2half(k_val));
+                            if (isnan(v0) || isnan(v1)) {
+                                printf("[REG K CHECK] *** NaN DETECTED in K_A register! ***\n");
+                            }
+
+                            // Also print the address we loaded from
+                            printf("[REG K CHECK] current_tile_K_base=0x%x, i_KQ_0=%d, col_offset=%d\n",
+                                   current_tile_K_base, i_KQ_0, (int)((k_KQ_0 - k0_start) * sizeof(half2)));
                         }
-
-                        // Also print the address we loaded from
-                        printf("[REG K CHECK] current_tile_K_base=0x%x, i_KQ_0=%d, col_offset=%d\n",
-                               current_tile_K_base, i_KQ_0, (int)((k_KQ_0 - k0_start) * sizeof(half2)));
-                    }
 #else
-                    load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                        load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
 #endif
-                    if constexpr (cols_per_warp == 8) {
-                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
-                    } else {
-                        // Wide version of KQ_C is column-major => swap A and B.
-                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
+                        if constexpr (cols_per_warp == 8) {
+                            mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
+                        } else {
+                            // Wide version of KQ_C is column-major => swap A and B.
+                            mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
+                        }
                     }
                 }
             }
         } else {
             static_assert(cols_per_warp != 8, "cols_per_warp == 8 not implemented");
+            // FIX: Only compute if this warp has valid columns
+            if (has_valid_cols) {
 #pragma unroll
-            for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
-                load_ldmatrix(Q_B[0], tile_Q + (warp_id / np)*(T_B_KQ::I*stride_tile_Q) + k_KQ_0, stride_tile_Q);
+                for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
+                    load_ldmatrix(Q_B[0], tile_Q + (warp_id / np)*(T_B_KQ::I*stride_tile_Q) + k_KQ_0, stride_tile_Q);
 
 #pragma unroll
-                for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
-                    const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
+                    for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
+                        const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
 
-                    T_A_KQ K_A;
+                        T_A_KQ K_A;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                    // SM_120: Use swizzled ldmatrix read
-                    ggml_cuda_mma::load_ldmatrix_swizzle<STRIDE_BYTES_K>(K_A, current_tile_K_base,
-                        i_KQ_0, (k_KQ_0 - k0_start) * sizeof(half2));
+                        // SM_120: Use swizzled ldmatrix read
+                        ggml_cuda_mma::load_ldmatrix_swizzle<STRIDE_BYTES_K>(K_A, current_tile_K_base,
+                            i_KQ_0, (k_KQ_0 - k0_start) * sizeof(half2));
 #else
-                    load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                        load_ldmatrix(K_A, current_tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
 #endif
 
-                    // Wide version of KQ_C is column-major => swap A and B.
-                    mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
+                        // Wide version of KQ_C is column-major => swap A and B.
+                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
+                    }
                 }
             }
         }
@@ -2152,7 +2166,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (!consumer_mode && (ncols2 > 1 || mask_h)) {
+        // FIX: Only apply mask if this warp has valid columns (prevents OOB mask read)
+        if (!consumer_mode && (ncols2 > 1 || mask_h) && has_valid_cols) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (warp_id % np)*T_C_KQ::I;
@@ -2168,47 +2183,51 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         // Calculate softmax for each KQ column using the current max. value.
         // The divisor is stored in KQ_rowsum and will be applied at the end.
-        static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
+        // FIX: Only compute softmax if this warp has valid columns (prevents garbage KQ_C values)
+        if (has_valid_cols) {
+            static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
-        for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
+            for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
 #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + T_C_KQ::get_i(l) < k_VKQ_sup) {
-                    KQ_max_new[l % 2] = fmaxf(KQ_max_new[l % 2], KQ_C[k0/(np*T_C_KQ::I)].x[l] + FATTN_KQ_MAX_OFFSET);
+                for (int l = 0; l < T_C_KQ::ne; ++l) {
+                    if (!oob_check || k0 + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                        KQ_max_new[l % 2] = fmaxf(KQ_max_new[l % 2], KQ_C[k0/(np*T_C_KQ::I)].x[l] + FATTN_KQ_MAX_OFFSET);
+                    }
                 }
             }
-        }
 
-        // Values per KQ column are spread across 8 threads:
+            // Values per KQ column are spread across 8 threads:
 #pragma unroll
-        for (int col = 0; col < cols_per_thread; ++col) {
+            for (int col = 0; col < cols_per_thread; ++col) {
 #pragma unroll
-            for (int offset = 16; offset >= 4; offset >>= 1) {
-                KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[col], offset, WARP_SIZE));
+                for (int offset = 16; offset >= 4; offset >>= 1) {
+                    KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[col], offset, WARP_SIZE));
+                }
             }
-        }
 
-        static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
+            static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
-        for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
+            for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
 #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
-                    // Guard against softmax overflow when all attention entries are masked
-                    // (KQ_max_new still at initialization value -FLT_MAX/2)
-                    if (KQ_max_new[l % 2] <= -FLT_MAX/4.0f) {
-                        KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
+                for (int l = 0; l < T_C_KQ::ne; ++l) {
+                    if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                        // Guard against softmax overflow when all attention entries are masked
+                        // (KQ_max_new still at initialization value -FLT_MAX/2)
+                        if (KQ_max_new[l % 2] <= -FLT_MAX/4.0f) {
+                            KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
+                        } else {
+                            KQ_C[k0/(np*T_C_KQ::I)].x[l] = expf(KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[l % 2]);
+                            KQ_rowsum_add[l % 2] += KQ_C[k0/(np*T_C_KQ::I)].x[l];
+                        }
                     } else {
-                        KQ_C[k0/(np*T_C_KQ::I)].x[l] = expf(KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[l % 2]);
-                        KQ_rowsum_add[l % 2] += KQ_C[k0/(np*T_C_KQ::I)].x[l];
+                        KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
                     }
-                } else {
-                    KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
                 }
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (!consumer_mode && (ncols2 > 1 || mask_h)) {
+        // FIX: Only apply mask if this warp has valid columns (prevents OOB mask read)
+        if (!consumer_mode && (ncols2 > 1 || mask_h) && has_valid_cols) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (warp_id % np)*T_C_KQ::J;
@@ -2226,52 +2245,55 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         // Calculate softmax for each KQ column using the current max. value.
         // The divisor is stored in KQ_rowsum and will be applied at the end.
-        static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
+        // FIX: Only compute softmax if this warp has valid columns (prevents garbage KQ_C values)
+        if (has_valid_cols) {
+            static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
-        for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
+            for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + T_C_KQ::get_j(l) < k_VKQ_sup) {
-                    // Turing + Volta:
-                    KQ_max_new[(l/2) % 2] = fmaxf(KQ_max_new[(l/2) % 2], KQ_C[(k0/(np*T_C_KQ::J))].x[l] + FATTN_KQ_MAX_OFFSET);
+                for (int l = 0; l < T_C_KQ::ne; ++l) {
+                    if (!oob_check || k0 + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                        // Turing + Volta:
+                        KQ_max_new[(l/2) % 2] = fmaxf(KQ_max_new[(l/2) % 2], KQ_C[(k0/(np*T_C_KQ::J))].x[l] + FATTN_KQ_MAX_OFFSET);
+                    }
                 }
             }
-        }
 
 #pragma unroll
-        for (int col = 0; col < cols_per_thread; ++col) {
+            for (int col = 0; col < cols_per_thread; ++col) {
 #if defined(TURING_MMA_AVAILABLE)
-            // Values per KQ column are spread across 4 threads:
-            constexpr int offset_first = 2;
-            constexpr int offset_last  = 1;
+                // Values per KQ column are spread across 4 threads:
+                constexpr int offset_first = 2;
+                constexpr int offset_last  = 1;
 #else
-            // Values per KQ column are spread across 2 threads:
-            constexpr int offset_first = 2;
-            constexpr int offset_last  = 2;
+                // Values per KQ column are spread across 2 threads:
+                constexpr int offset_first = 2;
+                constexpr int offset_last  = 2;
 #endif // defined(TURING_MMA_AVAILABLE)
 #pragma unroll
-            for (int offset = offset_first; offset >= offset_last; offset >>= 1) {
-                KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[col], offset, WARP_SIZE));
+                for (int offset = offset_first; offset >= offset_last; offset >>= 1) {
+                    KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[col], offset, WARP_SIZE));
+                }
             }
-        }
 
-        static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
+            static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
-        for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
+            for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                // Turing + Volta:
-                if (!oob_check || k0 + (warp_id % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
-                    // Guard against softmax overflow when all attention entries are masked
-                    // (KQ_max_new still at initialization value -FLT_MAX/2)
-                    if (KQ_max_new[(l/2) % 2] <= -FLT_MAX/4.0f) {
-                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
+                for (int l = 0; l < T_C_KQ::ne; ++l) {
+                    // Turing + Volta:
+                    if (!oob_check || k0 + (warp_id % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                        // Guard against softmax overflow when all attention entries are masked
+                        // (KQ_max_new still at initialization value -FLT_MAX/2)
+                        if (KQ_max_new[(l/2) % 2] <= -FLT_MAX/4.0f) {
+                            KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
+                        } else {
+                            KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[(l/2) % 2]);
+                            KQ_rowsum_add[(l/2) % 2] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
+                        }
                     } else {
-                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[(l/2) % 2]);
-                        KQ_rowsum_add[(l/2) % 2] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
+                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
                     }
-                } else {
-                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
                 }
             }
         }
@@ -2301,8 +2323,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             // DEBUG: Check for NaN/zero in KQ_rowsum (division by this causes NaN later)
             if ((isnan(KQ_rowsum[col]) || KQ_rowsum[col] == 0.0f || isinf(KQ_rowsum[col])) &&
                 threadIdx.x == 0 && blockIdx.x == 0) {
-                printf("[FA SOFTMAX NaN] warp %d col %d: KQ_rowsum=%f KQ_max_scale=%f KQ_rowsum_add=%f\n",
-                       warp_id, col, KQ_rowsum[col], KQ_max_scale[col], KQ_rowsum_add[col]);
+                printf("[FA SOFTMAX NaN] warp %d col %d: KQ_rowsum=%f KQ_max_scale=%f KQ_rowsum_add=%f KQ_max_new=%f has_valid_cols=%d np=%d\n",
+                       warp_id, col, KQ_rowsum[col], KQ_max_scale[col], KQ_rowsum_add[col],
+                       KQ_max_new[col], (int)has_valid_cols, np);
             }
         }
 
@@ -2692,42 +2715,48 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
 #endif
+        // FIX: Only compute VKQ MMA if this warp has valid columns
+        if (has_valid_cols) {
 #pragma unroll
-        for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
-            static_assert((nbatch_fa/2) % (np*T_A_VKQ::J) == 0, "bad loop size");
+            for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
+                static_assert((nbatch_fa/2) % (np*T_A_VKQ::J) == 0, "bad loop size");
 #pragma unroll
-            for (int k00 = 0; k00 < nbatch_fa/2; k00 += np*T_A_VKQ::J) {
-                const int k0 = k00 + (warp_id % np)*T_A_VKQ::J;
+                for (int k00 = 0; k00 < nbatch_fa/2; k00 += np*T_A_VKQ::J) {
+                    const int k0 = k00 + (warp_id % np)*T_A_VKQ::J;
 
-                T_A_VKQ A; // Transposed in SRAM but not in registers, gets transposed on load.
+                    T_A_VKQ A; // Transposed in SRAM but not in registers, gets transposed on load.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-                // SM_120: Use swizzled ldmatrix_trans read
-                ggml_cuda_mma::load_ldmatrix_trans_swizzle<STRIDE_BYTES_V_iter>(A, tile_V_i_base,
-                    2*k0, (i_VKQ_0 - i0_start)/2 * sizeof(half2));
+                    // SM_120: Use swizzled ldmatrix_trans read
+                    ggml_cuda_mma::load_ldmatrix_trans_swizzle<STRIDE_BYTES_V_iter>(A, tile_V_i_base,
+                        2*k0, (i_VKQ_0 - i0_start)/2 * sizeof(half2));
 #else
-                load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+                    load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
 #endif
-                if constexpr (T_B_KQ::I == 8) {
-                    mma(VKQ_C[i_VKQ_0/i0_stride], A, B[k00/(np*T_A_VKQ::J)]);
-                } else {
-                    // Wide version of VKQ_C is column-major => swap A and B.
-                    mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::J)], A);
+                    if constexpr (T_B_KQ::I == 8) {
+                        mma(VKQ_C[i_VKQ_0/i0_stride], A, B[k00/(np*T_A_VKQ::J)]);
+                    } else {
+                        // Wide version of VKQ_C is column-major => swap A and B.
+                        mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::J)], A);
+                    }
                 }
             }
         }
 #else // Volta
         constexpr int i0_stride = 2*T_C_VKQ::J;
+        // FIX: Only compute VKQ MMA if this warp has valid columns
+        if (has_valid_cols) {
 #pragma unroll
-        for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
-            static_assert(nbatch_fa % (np*T_A_VKQ::I) == 0, "bad loop size");
-            static_assert(2*T_B_VKQ::J == T_A_VKQ::I, "bad tile sizes");
+            for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
+                static_assert(nbatch_fa % (np*T_A_VKQ::I) == 0, "bad loop size");
+                static_assert(2*T_B_VKQ::J == T_A_VKQ::I, "bad tile sizes");
 #pragma unroll
-            for (int k00 = 0; k00 < nbatch_fa; k00 += np*T_A_VKQ::I) {
-                const int k0 = k00 + (warp_id % np)*T_A_VKQ::I;
+                for (int k00 = 0; k00 < nbatch_fa; k00 += np*T_A_VKQ::I) {
+                    const int k0 = k00 + (warp_id % np)*T_A_VKQ::I;
 
-                T_A_VKQ A; // Transposed in both SRAM and registers, load normally.
-                load_ldmatrix(A, tile_V_i + k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
-                mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::I)], A);
+                    T_A_VKQ A; // Transposed in both SRAM and registers, load normally.
+                    load_ldmatrix(A, tile_V_i + k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+                    mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::I)], A);
+                }
             }
         }
 #endif // defined(TURING_MMA_AVAILABLE)
@@ -3179,6 +3208,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     for (int col_iter = 0; col_iter < col_iters; ++col_iter) {
         const int col_offset = col_iter * effective_nwarps * cols_per_warp;
 
+        // FIX: Determine if this warp has valid columns to process.
+        // When ncols < nwarps*cols_per_warp (e.g., ncols=8 with 4 warps × 8 cols = 32),
+        // warps 1-3 would compute on non-existent columns, producing zero KQ_rowsum.
+        // These warps must still participate in __syncthreads() but skip computation.
+        const int warp_col_start = col_offset + (warp_id / np) * cols_per_warp;
+        const bool has_valid_cols = (warp_col_start < ncols);
+
         // CRITICAL FIX: Reset accumulators for each col_iter iteration.
         // Without this, col_iter=1 inherits stale values from col_iter=0,
         // causing attention heads to bleed into each other (garbage output).
@@ -3194,7 +3230,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             }
         }
 
-    if (Q_in_reg) {
+    if (Q_in_reg && has_valid_cols) {
         const int j0 = col_offset + (warp_id / np) * cols_per_warp;
 
 #pragma unroll
@@ -3273,7 +3309,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages, col_offset);
             // Flip phase when stage wraps (consumer mode only)
             if (pipeline_state && current_stage == nstages - 1) {
                 phase_K ^= 1;
@@ -3289,7 +3325,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages, col_offset);
     } else {
         // ncols2 > 1
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -3302,7 +3338,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages, col_offset);
             // Flip phase when stage wraps (consumer mode only)
             if (pipeline_state && current_stage == nstages - 1) {
                 phase_K ^= 1;
@@ -3318,7 +3354,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, tensor_maps, mbar_ptr, phase_K, phase_V, consumer_chunk_phase_K, consumer_chunk_phase_V, pipeline_state, current_stage, nstages, col_offset);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
