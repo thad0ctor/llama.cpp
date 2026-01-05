@@ -211,8 +211,10 @@ void ggml_cuda_mul_mat_q(
     // Stream-K decomposition provides better load balancing but has fixup overhead.
     // For single-token decode (ne1=1) and small batches, the fixup overhead dominates.
     // Only use stream-k when batch size is large enough to amortize the overhead.
+    // WORKAROUND: Disable Stream-K for Blackwell until fixup issues are resolved.
     constexpr int64_t MMQ_STREAM_K_MIN_BATCH = 8;  // Threshold: skip stream-k for ne1 < 8
-    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA
+                                && cc < GGML_CUDA_CC_BLACKWELL)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && ne1 >= MMQ_STREAM_K_MIN_BATCH;
 
@@ -560,8 +562,10 @@ void ggml_cuda_op_mul_mat_q(
     // Also its fixup needs to allocate a temporary buffer in the memory pool.
     // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
     // Skip stream-k for small batches where fixup overhead dominates.
+    // WORKAROUND: Disable Stream-K for Blackwell until fixup issues are resolved.
     constexpr int64_t MMQ_STREAM_K_MIN_BATCH_OP = 8;  // Same threshold as main path
-    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA
+                                && cc < GGML_CUDA_CC_BLACKWELL)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11
                             && src1_ncols >= MMQ_STREAM_K_MIN_BATCH_OP;
