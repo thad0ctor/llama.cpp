@@ -2263,11 +2263,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float KQ_max_scale[cols_per_thread];
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
-            const float KQ_max_diff = KQ_max[col] - KQ_max_new[col];
-            KQ_max_scale[col] = expf(KQ_max_diff);
-            KQ_max[col] = KQ_max_new[col];
+            // FIX: If KQ_max is still at initialization value, no valid attention scores
+            // were computed (all masked). Skip rescaling to avoid 0×∞=NaN.
+            // Threshold -FLT_MAX/4 catches init value -FLT_MAX/2 with margin for floating-point.
+            if (KQ_max[col] <= -FLT_MAX/4.0f) {
+                KQ_max_scale[col] = 0.0f;
+                KQ_max[col] = KQ_max_new[col];
+            } else {
+                const float KQ_max_diff = KQ_max[col] - KQ_max_new[col];
+                KQ_max_scale[col] = expf(KQ_max_diff);
+                KQ_max[col] = KQ_max_new[col];
 
-            *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
+                *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
+            }
 
             // Scale previous KQ_rowsum to account for a potential increase in KQ_max:
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
@@ -3098,6 +3106,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // With col_iters=2: first iteration handles cols 0-31, second handles cols 32-63.
     for (int col_iter = 0; col_iter < col_iters; ++col_iter) {
         const int col_offset = col_iter * effective_nwarps * cols_per_warp;
+
+        // CRITICAL FIX: Reset accumulators for each col_iter iteration.
+        // Without this, col_iter=1 inherits stale values from col_iter=0,
+        // causing attention heads to bleed into each other (garbage output).
+        if (col_iter > 0) {
+#pragma unroll
+            for (int i = 0; i < (cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)); ++i) {
+                VKQ_C[i] = T_C_VKQ{};
+            }
+#pragma unroll
+            for (int col = 0; col < cols_per_thread; ++col) {
+                KQ_rowsum[col] = 0.0f;
+                KQ_max[col] = -FLT_MAX/2.0f;
+            }
+        }
 
     if (Q_in_reg) {
         const int j0 = col_offset + (warp_id / np) * cols_per_warp;
