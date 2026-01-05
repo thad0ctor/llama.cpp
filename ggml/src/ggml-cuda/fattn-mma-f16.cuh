@@ -1982,8 +1982,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
                     const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
 
-                    // Note: OOB K rows are zeroed during loading when oob_check=true,
-                    // so MMA produces zeros naturally. No need for runtime skip.
+                    // Skip MMA if this warp's K row is out of bounds (prevents garbage attention)
+                    // With np > 1, warps process different K rows. For short sequences, warps 1+ may be OOB.
+                    if (i_KQ_0 >= k_VKQ_sup) continue;
 
 #pragma unroll
                     for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
@@ -2038,8 +2039,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
                         const int i_KQ_0 = i_KQ_00 + (warp_id % np)*T_A_KQ::I;
 
-                        // Note: OOB K rows are zeroed during loading when oob_check=true,
-                        // so MMA produces zeros naturally. No need for runtime skip.
+                        // Skip MMA if this warp's K row is out of bounds
+                        if (i_KQ_0 >= k_VKQ_sup) continue;
 
                         T_A_KQ K_A;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
@@ -2195,11 +2196,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
-                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
-                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::I;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + T_C_KQ::get_i(l) < k_VKQ_sup) {
@@ -2220,10 +2216,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::I) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
-                // Skip OOB warp iterations to exclude zeros from softmax calculation
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::I;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + (warp_id % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
@@ -2266,11 +2258,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
-                // Skip if this warp's K rows are OOB. With oob_check=true, OOB K rows are
-                // zero-loaded, so KQ_C is 0 for OOB. We must exclude zeros from max calculation.
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::J;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     if (!oob_check || k0 + T_C_KQ::get_j(l) < k_VKQ_sup) {
@@ -2300,10 +2287,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
-                // Skip OOB warp iterations to exclude zeros from softmax calculation
-                const int warp_k_row = k0 + (warp_id % np) * T_C_KQ::J;
-                if (warp_k_row >= k_VKQ_sup) continue;
-
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     // Turing + Volta:
