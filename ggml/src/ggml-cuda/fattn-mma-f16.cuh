@@ -4237,7 +4237,21 @@ __global__ void flash_attn_ext_f16_blackwell(
          // With 32 Q heads and 4 KV heads, heads 0-7 map to KV head 0, 8-15 to KV head 1, etc.
          const int gqa_ratio = ne02 / ne12;
          const int kv_head_idx = head0 / gqa_ratio;  // KV head index (0 to ne12-1)
-         
+
+         // DEBUG: Verify GQA head mapping for all blocks
+         if (threadIdx.x == 0 && threadIdx.y == 0) {
+             printf("[GQA DEBUG] Block %d: zt=%d, head0=%d, gqa_ratio=%d, kv_head_idx=%d\n",
+                    blockIdx.x, zt, head0, gqa_ratio, kv_head_idx);
+             printf("[GQA DEBUG] Block %d: ne02=%d, ne12=%d, kv_head_idx range check: %s\n",
+                    blockIdx.x, ne02, ne12, kv_head_idx < ne12 ? "OK" : "OUT OF BOUNDS!");
+             // Calculate and print K offset
+             int64_t k_offset = nb13*sequence + nb12*kv_head_idx;
+             int64_t k_max_valid = nb13*ne13;  // Max valid offset
+             printf("[GQA DEBUG] Block %d: K offset=%ld bytes, max_valid=%ld, %s\n",
+                    blockIdx.x, (long)k_offset, (long)k_max_valid,
+                    k_offset < k_max_valid ? "OK" : "OUT OF BOUNDS!");
+         }
+
          const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02* head0);
          const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*kv_head_idx);  // FIX: Use kv_head_idx
          const half   * mask_h = ncols2 == 1 && !mask ? nullptr : (const half *) (mask + nb33*(sequence % ne33));
