@@ -3,6 +3,10 @@
 # Stop on error
 set -e
 
+# Activate conda base environment
+source /home/rgilbreth/anaconda3/etc/profile.d/conda.sh
+conda activate base
+
 # Setup logging
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs/server"
@@ -13,15 +17,6 @@ echo "Logging to: $LOG_FILE"
 
 # Start logging (output to both terminal and log file)
 exec > >(tee -a "$LOG_FILE") 2>&1
-
-# Activate the specified virtual environment
-VENV_PATH="/home/rgilbreth/Desktop/AI-Software/Venvs/unsloth-xformers/venv/bin/activate"
-if [ -f "$VENV_PATH" ]; then
-    source "$VENV_PATH"
-    echo "Virtual environment activated."
-else
-    echo "Warning: Virtual environment not found at $VENV_PATH"
-fi
 
 # Set Environment Variables
 export CUDA_VISIBLE_DEVICES=0,2
