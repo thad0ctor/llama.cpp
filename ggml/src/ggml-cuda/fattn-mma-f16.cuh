@@ -2891,6 +2891,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int kb0_stop,
         const char * __restrict__ tensor_maps) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(BLACKWELL_MMA_AVAILABLE)
+    // DEBUG: Track entry to process_tile for ALL blocks
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("[PROCESS_TILE ENTRY] Block %d: K_h2=%p, V_h2=%p, kb0=[%d,%d), is_fixup=%d\n",
+               blockIdx.x, (const void*)K_h2, (const void*)V_h2, kb0_start, kb0_stop, is_fixup);
+        printf("[PROCESS_TILE ENTRY] Block %d: stride_K=%d, stride_V=%d, ne11=%d\n",
+               blockIdx.x, stride_K, stride_V, ne11);
+    }
     // DEBUG: Track which template instance is being called for intermediate blocks
     if (is_fixup && threadIdx.x == 0 && threadIdx.y == 0) {
         printf("[FA PROCESS_TILE] block=%d is_fixup=%d needs_fixup=%d kb0=[%d,%d)\n",
