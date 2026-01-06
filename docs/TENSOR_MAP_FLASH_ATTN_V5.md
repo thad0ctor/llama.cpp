@@ -16,7 +16,8 @@ This document traces tensors through the complete Blackwell Flash Attention v5 p
 
 ## Step 1: KV Cache Retrieval
 
-**File:** `src/llama-kv-cache.cpp:get_k()`
+**Function:** `llama_kv_cache::get_k()`, `llama_kv_cache::get_v()`
+**File:** `src/llama-kv-cache.cpp:1008`
 
 **Input:**
 - K cache buffer: raw allocated tensor
@@ -38,7 +39,8 @@ Shape: [D, n_heads_kv, n_kv, batch]
 
 ## Step 2: build_attn_mha - Permute & Contiguous
 
-**File:** `src/llama-graph.cpp:1446-1452`
+**Function:** `llm_graph_context::build_attn_mha()`
+**File:** `src/llama-graph.cpp:1400`
 
 **Input (before permute):**
 ```
@@ -69,7 +71,8 @@ V: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1]
 
 ## Step 3: ggml_flash_attn_ext
 
-**File:** `ggml/src/ggml.c:5246-5287`
+**Function:** `ggml_flash_attn_ext()`
+**File:** `ggml/src/ggml.c:5246`
 
 **Input:**
 ```
@@ -100,18 +103,20 @@ O: [D, n_heads, seq_q, batch] = [128, 32, 1, 1]
 
 ## Step 4: CUDA Dispatch
 
-**File:** `ggml/src/ggml-cuda/fattn.cu:399-419`
+**Function:** `ggml_cuda_flash_attn_ext()`
+**File:** `ggml/src/ggml-cuda/fattn.cu:398`
 
 **Transformation:**
 - Checks compute capability (Blackwell = cc >= 1200)
 - Validates head_dim == 128, types match
-- Dispatches to `ggml_cuda_flash_attn_ext_attention_v5()`
+- Dispatches to `ggml_cuda_flash_attn_ext_attention_v5()` for Blackwell GPUs
 
 ---
 
 ## Step 5: attention_v5.cu Wrapper
 
-**File:** `ggml/src/ggml-cuda/attention_v5.cu:611-835`
+**Function:** `ggml_cuda_flash_attn_ext_attention_v5()`
+**File:** `ggml/src/ggml-cuda/attention_v5.cu:1717`
 
 **Input tensors (from dst->src[]):**
 ```
@@ -150,7 +155,8 @@ num_blocks = n_heads * n_batch * ceil(seq_q / BLOCK_Q) = 32
 
 ## Step 6: Kernel - Thread Block Assignment
 
-**File:** `ggml/src/ggml-cuda/attention_v5.cu:274-291`
+**Function:** `attention_v5_kernel<>()` (template)
+**File:** `ggml/src/ggml-cuda/attention_v5.cu:255`
 
 **Block ID Decomposition:**
 ```cpp
@@ -176,7 +182,8 @@ O += batch_id * stride_O_batch + head_id * stride_O_head + q_block_id * BLOCK_Q 
 
 ## Step 7: Kernel - KV Loop
 
-**File:** `ggml/src/ggml-cuda/attention_v5.cu:377-562`
+**Function:** `attention_v5_kernel<>()` (KV iteration loop)
+**File:** `ggml/src/ggml-cuda/attention_v5.cu:475`
 
 **Iteration:**
 ```
@@ -195,7 +202,8 @@ num_kv_iter = ceil(len_kv / BLOCK_KV) = ceil(768 / 64) = 12
 
 ## Step 8: Kernel - Output Write
 
-**File:** `ggml/src/ggml-cuda/attention_v5.cu:564-599`
+**Function:** `attention_v5_kernel<>()` (output write) or `attention_v5_splitk_reduce<>()` (for Split-K)
+**File:** `ggml/src/ggml-cuda/attention_v5.cu:650` (direct) / `1292` (Split-K reduce)
 
 **Transformation:**
 1. Normalize by softmax denominator
