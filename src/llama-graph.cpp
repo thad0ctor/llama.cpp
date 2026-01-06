@@ -1414,9 +1414,42 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
+    /*
+     * TENSOR LAYOUT CHECKPOINT: build_attn_mha permute+cont
+     * =====================================================
+     *
+     * BEFORE permute (from KV cache via get_k()/get_v()):
+     *   Q, K, V: ne[] = [D, heads, seq, batch]
+     *   - ne[0] = head_dim (D)
+     *   - ne[1] = number of heads
+     *   - ne[2] = sequence length
+     *   - ne[3] = batch size
+     *
+     * ggml_permute(ctx0, x, 0, 2, 1, 3) swaps dimensions 1 and 2:
+     *   new_axis[0] = old_axis[0]  (D stays at 0)
+     *   new_axis[1] = old_axis[2]  (seq moves to 1)
+     *   new_axis[2] = old_axis[1]  (heads moves to 2)
+     *   new_axis[3] = old_axis[3]  (batch stays at 3)
+     *
+     * AFTER permute (non-contiguous view):
+     *   Q, K, V: ne[] = [D, seq, heads, batch]
+     *   Strides: nb[1] is LARGE (old heads stride), nb[2] is SMALL (old seq stride)
+     *
+     * ggml_cont() copies to new contiguous buffer:
+     *   Q, K, V: ne[] = [D, seq, heads, batch]
+     *   Strides: nb[0]=sizeof(T), nb[1]=D*sizeof(T), nb[2]=D*seq*sizeof(T)
+     *   NOTE: nb[1] < nb[2] now (contiguous in new dimension order)
+     *
+     * DESTINATION: ggml_flash_attn_ext() and CUDA kernels (fattn.cu, attention_v5.cu)
+     * These kernels expect ne[1]=seq, ne[2]=heads after permute.
+     */
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    // Make permuted Q/K/V contiguous so head/seq strides are correct for fast attention
+    q = ggml_cont(ctx0, q);
+    k = ggml_cont(ctx0, k);
+    v = ggml_cont(ctx0, v);
 
     ggml_tensor * cur;
 

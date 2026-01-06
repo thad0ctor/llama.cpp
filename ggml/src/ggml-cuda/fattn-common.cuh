@@ -790,8 +790,9 @@ void launch_fattn(
 
     ggml_tensor * KQV = dst;
 
-    GGML_ASSERT(Q->type == GGML_TYPE_F32);
-    GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+    // Q/K/V can be F16/BF16/F32 (or quant for K/V); ensure supported numeric types
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16 || Q->type == GGML_TYPE_BF16);
+    GGML_ASSERT(KQV->type == GGML_TYPE_F32 || KQV->type == GGML_TYPE_F16 || KQV->type == GGML_TYPE_BF16);
 
     GGML_ASSERT(      Q->nb[0] == ggml_element_size(Q));
     GGML_ASSERT(      K->nb[0] == ggml_element_size(K));

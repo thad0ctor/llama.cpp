@@ -188,38 +188,75 @@ __device__ __forceinline__ float get_alibi_slope(
   return powf(base, float(exp));
 }
 
+/*
+ * TENSOR LAYOUT DOCUMENTATION
+ * ===========================
+ *
+ * TENSOR FLOW:
+ *   1. KV cache returns K,V as [D, heads, seq, batch] via get_k()/get_v()
+ *   2. llama-graph.cpp applies permute(0,2,1,3) which swaps dims 1<->2
+ *   3. ggml_cont() makes contiguous in the NEW order
+ *   4. Result: INPUT tensors are [D, seq, heads, batch]
+ *
+ * INPUT TENSORS (from llama-graph.cpp after permute + ggml_cont):
+ *   Q, K, V: shape = [D, seq, n_heads, batch] - CONTIGUOUS
+ *   - ne[0] = D (head dimension, 128)
+ *   - ne[1] = seq_len (seq_q for Q, seq_kv for K/V)
+ *   - ne[2] = n_heads (Q) or n_heads_kv (K, V for GQA)
+ *   - ne[3] = batch
+ *   - nb[1] = D * sizeof(T)        (stride to next seq position)
+ *   - nb[2] = D * seq * sizeof(T)  (stride to next head)
+ *
+ * OUTPUT TENSOR (created by ggml_flash_attn_ext with ne = {v.ne[0], q.ne[2], q.ne[1], q.ne[3]}):
+ *   O: shape = [D, n_heads, seq_q, batch] - **DIFFERENT FROM INPUT!**
+ *   - ne[0] = D
+ *   - ne[1] = n_heads   <-- NOTE: swapped from input!
+ *   - ne[2] = seq_q     <-- NOTE: swapped from input!
+ *   - ne[3] = batch
+ *   - nb[1] = D * sizeof(To)           (stride to next HEAD)
+ *   - nb[2] = D * n_heads * sizeof(To) (stride to next seq position)
+ *
+ * STRIDE PARAMETER SEMANTICS (kernel always uses seq/head semantics):
+ *   stride_X_row   = elements to advance by 1 in SEQUENCE dimension
+ *   stride_X_head  = elements to advance by 1 in HEADS dimension
+ *   stride_X_batch = elements to advance by 1 in BATCH dimension
+ *
+ * For INPUT [D, seq, heads, batch]:  stride_row = nb[1], stride_head = nb[2]
+ * For OUTPUT [D, heads, seq, batch]: stride_row = nb[2], stride_head = nb[1] (SWAPPED!)
+ */
 template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, typename T, typename To>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
 void attention_v5_kernel(
-  const T *Q,           // [D, seq_q, heads, batch] - F16 or BF16
-  const T *K,           // [D, seq_kv, heads_kv, batch] - F16 or BF16
-  const T *V,           // [D, seq_kv, heads_kv, batch] - F16 or BF16
-  const half *mask,     // [seq_kv, seq_q, batch] - F16, nullptr if no mask
-  To *O,                // [D, seq_q, heads, batch] - F32, F16, or BF16
-  int n_heads,          // Q->ne[1]
-  int n_heads_kv,       // K->ne[1] (for GQA)
-  int n_batch,          // Q->ne[3]
-  int len_q,            // Q->ne[2]
-  int len_kv,           // K->ne[2]
+  const T *Q,           // [D, seq_q, n_heads, batch] - contiguous after permute+cont
+  const T *K,           // [D, seq_kv, n_heads_kv, batch]
+  const T *V,           // [D, seq_kv, n_heads_kv, batch]
+  const half *mask,     // [seq_kv, seq_q, 1, batch] - F16, nullptr if no mask
+  To *O,                // [D, seq_q, n_heads, batch] - same layout as inputs
+  int n_heads,          // Q->ne[2] - number of query heads
+  int n_heads_kv,       // K->ne[2] - number of KV heads (for GQA)
+  int n_batch,          // Q->ne[3] - batch size
+  int len_q,            // Q->ne[1] - query sequence length
+  int len_kv,           // K->ne[1] - KV sequence length
   float softmax_scale,  // from op_params[0]
   float max_bias,       // ALiBi max_bias from op_params[1]
   float m0,             // ALiBi base for h < n_head_log2
   float m1,             // ALiBi base for h >= n_head_log2
-  uint32_t n_head_log2, // for ALiBi
+  uint32_t n_head_log2, // for ALiBi slope calculation
   float logit_softcap,  // from op_params[2], 0 if disabled
-  // Strides in ELEMENTS (not bytes) - supports non-contiguous tensors after ggml_permute
-  int stride_Q_row,     // Q->nb[2] / sizeof(T) - stride between sequence positions
-  int stride_Q_head,    // Q->nb[1] / sizeof(T) - stride between heads
-  int stride_Q_batch,   // Q->nb[3] / sizeof(T) - stride between batches
-  int stride_K_row,     // K->nb[2] / sizeof(T)
-  int stride_K_head,    // K->nb[1] / sizeof(T)
+  // Input strides (in elements) - for [D, seq, heads, batch] layout
+  int stride_Q_row,     // Q->nb[1] / sizeof(T) - stride to next seq position
+  int stride_Q_head,    // Q->nb[2] / sizeof(T) - stride to next head
+  int stride_Q_batch,   // Q->nb[3] / sizeof(T)
+  int stride_K_row,     // K->nb[1] / sizeof(T)
+  int stride_K_head,    // K->nb[2] / sizeof(T)
   int stride_K_batch,   // K->nb[3] / sizeof(T)
-  int stride_V_row,     // V->nb[2] / sizeof(T)
-  int stride_V_head,    // V->nb[1] / sizeof(T)
+  int stride_V_row,     // V->nb[1] / sizeof(T)
+  int stride_V_head,    // V->nb[2] / sizeof(T)
   int stride_V_batch,   // V->nb[3] / sizeof(T)
-  int stride_O_row,     // dst->nb[2] / sizeof(To)
-  int stride_O_head,    // dst->nb[1] / sizeof(To)
+  // Output strides (in elements) - same [D, seq, heads, batch] layout
+  int stride_O_row,     // dst->nb[1] / sizeof(To) - stride to next seq position
+  int stride_O_head,    // dst->nb[2] / sizeof(To) - stride to next head
   int stride_O_batch,   // dst->nb[3] / sizeof(To)
   // Mask strides (in elements, F16)
   int stride_mask_row,  // mask->nb[1] / sizeof(half) - stride between q positions
@@ -577,14 +614,41 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];  // Causal mask, can be nullptr
 
-    // Tensor dimensions - Q, K, V are permuted to [D, n_heads, seq, batch]
+    /*
+     * TENSOR LAYOUT CHECKPOINT: attention_v5 wrapper
+     * ===============================================
+     *
+     * TENSOR FLOW from llama-graph.cpp:
+     *   1. KV cache returns K,V as [D, heads, seq_kv, batch] via get_k()/get_v()
+     *   2. Q starts as [D, heads, seq_q, batch] from model layers
+     *   3. permute(0, 2, 1, 3) swaps dims 1<->2: [D, heads, seq, batch] -> [D, seq, heads, batch]
+     *   4. ggml_cont() makes contiguous in the NEW dimension order
+     *
+     * AFTER permute + ggml_cont (what we receive here):
+     *   Q: shape=[D, seq_q, n_heads_q, batch] - CONTIGUOUS
+     *      - ne[0] = D (head dimension, e.g., 128)
+     *      - ne[1] = seq_q (query sequence length) <-- WAS heads before permute
+     *      - ne[2] = n_heads_q (number of heads)   <-- WAS seq before permute
+     *      - ne[3] = batch
+     *
+     *   K: shape=[D, seq_kv, n_heads_kv, batch] - CONTIGUOUS
+     *   V: shape=[D, seq_kv, n_heads_kv, batch] - CONTIGUOUS
+     *
+     * Strides after ggml_cont (contiguous):
+     *   nb[0] = sizeof(T)
+     *   nb[1] = D * sizeof(T)          (stride to next seq position)
+     *   nb[2] = D * seq * sizeof(T)    (stride to next head)
+     *   nb[3] = D * seq * heads * sizeof(T)
+     */
+
+    // Extract dimensions - after permute(0,2,1,3), layout is [D, seq, heads, batch]
     const int64_t ne00 = Q->ne[0];  // head_dim (D)
-    const int64_t ne01 = Q->ne[1];  // n_heads_q
-    const int64_t ne02 = Q->ne[2];  // n_queries (seq_q)
+    const int64_t ne01 = Q->ne[2];  // n_heads_q - in dimension 2 after permute
+    const int64_t ne02 = Q->ne[1];  // seq_q - in dimension 1 after permute
     const int64_t ne03 = Q->ne[3];  // batch
 
-    const int64_t ne11 = K->ne[1];  // n_heads_kv (for GQA)
-    const int64_t ne12 = K->ne[2];  // n_kv (seq_kv)
+    const int64_t ne11 = K->ne[2];  // n_heads_kv - in dimension 2 after permute
+    const int64_t ne12 = K->ne[1];  // seq_kv - in dimension 1 after permute
 
     GGML_ASSERT(ne00 == 128 && "attention_v5 only supports head_dim=128");
     GGML_ASSERT(ne01 % ne11 == 0 && "n_heads_q must be divisible by n_heads_kv for GQA");
@@ -648,15 +712,30 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
         const T * K_data = (const T *)K->data;
         const T * V_data = (const T *)V->data;
 
-        // Input strides
-        const int stride_Q_row   = Q->nb[2] / sizeof(T);
-        const int stride_Q_head  = Q->nb[1] / sizeof(T);
+        /*
+         * STRIDE MAPPING for [D, seq, heads, batch] layout (after permute):
+         * =================================================================
+         * Tensor dimensions: ne[0]=D, ne[1]=seq, ne[2]=heads, ne[3]=batch
+         * Contiguous strides: nb[0]=sizeof(T), nb[1]=D*sizeof(T), nb[2]=D*seq*sizeof(T)
+         *
+         * Kernel stride semantics:
+         *   stride_X_row   = stride between SEQUENCE positions (to advance by 1 in seq dim)
+         *   stride_X_head  = stride between HEAD groups (to advance by 1 in heads dim)
+         *   stride_X_batch = stride between BATCHES
+         *
+         * Mapping (contiguous tensor in [D, seq, heads, batch] order):
+         *   stride_row  = nb[1] / sizeof(T) = D            (seq is dim 1)
+         *   stride_head = nb[2] / sizeof(T) = D * seq      (heads is dim 2)
+         *   stride_batch = nb[3] / sizeof(T)
+         */
+        const int stride_Q_row   = (int)(Q->nb[1] / sizeof(T));  // stride between seq positions (dim 1)
+        const int stride_Q_head  = (int)(Q->nb[2] / sizeof(T));  // stride between heads (dim 2)
         const int stride_Q_batch = Q->nb[3] / sizeof(T);
-        const int stride_K_row   = K->nb[2] / sizeof(T);
-        const int stride_K_head  = K->nb[1] / sizeof(T);
+        const int stride_K_row   = (int)(K->nb[1] / sizeof(T));
+        const int stride_K_head  = (int)(K->nb[2] / sizeof(T));
         const int stride_K_batch = K->nb[3] / sizeof(T);
-        const int stride_V_row   = V->nb[2] / sizeof(T);
-        const int stride_V_head  = V->nb[1] / sizeof(T);
+        const int stride_V_row   = (int)(V->nb[1] / sizeof(T));  // stride between seq positions (dim 1)
+        const int stride_V_head  = (int)(V->nb[2] / sizeof(T));  // stride between heads (dim 2)
         const int stride_V_batch = V->nb[3] / sizeof(T);
 
         const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(T);
@@ -664,8 +743,17 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
         if (dst->type == GGML_TYPE_F32) {
             using To = float;
             To * dst_data = (To *)dst->data;
-            const int stride_O_row   = dst->nb[2] / sizeof(To);
-            const int stride_O_head  = dst->nb[1] / sizeof(To);
+            /*
+             * OUTPUT LAYOUT: [D, heads, seq, batch] (from ggml_flash_attn_ext)
+             * This is DIFFERENT from input layout [D, seq, heads, batch]!
+             *   - ne[1] = heads, ne[2] = seq (swapped from input)
+             *   - nb[1] = D * sizeof(To)         (stride to next head)
+             *   - nb[2] = D * heads * sizeof(To) (stride to next seq position)
+             *
+             * Kernel expects: stride_O_row = seq stride, stride_O_head = head stride
+             */
+            const int stride_O_row   = dst->nb[2] / sizeof(To);  // seq is dim 2 in output
+            const int stride_O_head  = dst->nb[1] / sizeof(To);  // heads is dim 1 in output
             const int stride_O_batch = dst->nb[3] / sizeof(To);
 
             auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
@@ -685,8 +773,9 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
         } else if (dst->type == GGML_TYPE_BF16) {
             using To = nv_bfloat16;
             To * dst_data = (To *)dst->data;
-            const int stride_O_row   = dst->nb[2] / sizeof(To);
-            const int stride_O_head  = dst->nb[1] / sizeof(To);
+            // OUTPUT LAYOUT: [D, heads, seq, batch] - swapped from input [D, seq, heads, batch]
+            const int stride_O_row   = dst->nb[2] / sizeof(To);  // seq is dim 2 in output
+            const int stride_O_head  = dst->nb[1] / sizeof(To);  // heads is dim 1 in output
             const int stride_O_batch = dst->nb[3] / sizeof(To);
 
             auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
@@ -706,8 +795,9 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
         } else if (dst->type == GGML_TYPE_F16) {
             using To = half;
             To * dst_data = (To *)dst->data;
-            const int stride_O_row   = dst->nb[2] / sizeof(To);
-            const int stride_O_head  = dst->nb[1] / sizeof(To);
+            // OUTPUT LAYOUT: [D, heads, seq, batch] - swapped from input [D, seq, heads, batch]
+            const int stride_O_row   = dst->nb[2] / sizeof(To);  // seq is dim 2 in output
+            const int stride_O_head  = dst->nb[1] / sizeof(To);  // heads is dim 1 in output
             const int stride_O_batch = dst->nb[3] / sizeof(To);
 
             auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
@@ -762,7 +852,6 @@ bool ggml_cuda_flash_attn_ext_attention_v5_supported(const ggml_tensor * dst) {
     }
 
     // Supports both BF16 (native Blackwell) and F16 (for quantized models like Q8_0)
-    // Full stride support enables non-contiguous tensors from ggml_permute()
     if (Q->type != GGML_TYPE_BF16 && Q->type != GGML_TYPE_F16) {
         return false;
     }
@@ -780,8 +869,8 @@ bool ggml_cuda_flash_attn_ext_attention_v5_supported(const ggml_tensor * dst) {
     }
 
     // GQA support: n_heads_q must be divisible by n_heads_kv
-    // Q, K, V are permuted to [D, n_heads, seq, batch], so ne[1] is n_heads
-    if (Q->ne[1] % K->ne[1] != 0) {
+    // After permute(0,2,1,3), heads is in dimension 2
+    if (Q->ne[2] % K->ne[2] != 0) {
         return false;
     }
 

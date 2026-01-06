@@ -58,8 +58,26 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    /*
+     * TENSOR LAYOUT NOTE:
+     * Tensors from llama-graph.cpp are in [D, seq, heads, batch] order after permute(0,2,1,3)+cont.
+     * The permute swaps dimensions 1 and 2, so what was [D, heads, seq, batch] from KV cache
+     * becomes [D, seq, heads, batch]. Dimension semantics are: ne[1]=seq, ne[2]=heads.
+     *
+     * The GQA check below uses ne[2] for heads (after permute). The fallback to ne[1] handles
+     * potential non-standard tensor sources that haven't been permuted.
+     */
+    int heads_q = Q->ne[1];
+    int heads_kv = K->ne[1];
+    if (heads_q % heads_kv != 0 && Q->ne[2] % K->ne[2] == 0) {
+        // Fallback for non-standard layouts (rare - llama-graph.cpp always uses ne[1]=heads)
+        heads_q = Q->ne[2];
+        heads_kv = K->ne[2];
+    }
+    if (heads_q % heads_kv != 0) {
+        return;
+    }
+    const int gqa_ratio = heads_q / heads_kv;
 
     if (use_gqa_opt && gqa_ratio % 8 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
@@ -120,8 +138,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             const bool use_gqa_opt = mask && max_bias == 0.0f;
             GGML_ASSERT(use_gqa_opt);
 
-            GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-            const int gqa_ratio = Q->ne[2] / K->ne[2];
+            int heads_q = Q->ne[1];
+            int heads_kv = K->ne[1];
+            if (heads_q % heads_kv != 0 && Q->ne[2] % K->ne[2] == 0) {
+                heads_q = Q->ne[2];
+                heads_kv = K->ne[2];
+            }
+            if (heads_q % heads_kv != 0) {
+                return;
+            }
+            const int gqa_ratio = heads_q / heads_kv;
             GGML_ASSERT(gqa_ratio % 16 == 0);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
         } break;
@@ -224,8 +250,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
 
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    int heads_q = Q->ne[1];
+    int heads_kv = K->ne[1];
+    if (heads_q % heads_kv != 0 && Q->ne[2] % K->ne[2] == 0) {
+        heads_q = Q->ne[2];
+        heads_kv = K->ne[2];
+    }
+    if (heads_q % heads_kv != 0) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    const int gqa_ratio = heads_q / heads_kv;
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
