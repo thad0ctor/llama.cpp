@@ -9,7 +9,7 @@
 // 2. attention_v5_warp_specialized_kernel: Producer-Consumer warp specialization
 //    - Warps 0-1 (Producer): Load K, compute Q@K^T, softmax, write P to shared
 //    - Warps 2-3 (Consumer): Read P, load V, compute P@V, accumulate O
-//    - Uses named barriers for low-latency warp-group synchronization
+//    - Uses __syncthreads() for correct block-wide synchronization
 //    - Achieves compute overlap in addition to memory prefetch overlap
 
 #include "common.cuh"
@@ -24,58 +24,20 @@
 #include <type_traits>
 
 // =============================================================================
-// WARP SPECIALIZATION: Named Barrier Primitives
+// WARP SPECIALIZATION: Synchronization Notes
 // =============================================================================
-// Uses PTX bar.sync/bar.arrive for low-latency producer-consumer synchronization
-// Barrier IDs 1-4 are reserved for warp specialization; ID 0 is __syncthreads()
-
-namespace warp_spec {
-
-// Barrier IDs for producer-consumer handoff (double-buffered P)
-constexpr int BAR_P_READY_EVEN = 1;  // P[0,2,4,...] ready in shared memory
-constexpr int BAR_P_READY_ODD  = 2;  // P[1,3,5,...] ready in shared memory
-constexpr int BAR_P_DONE_EVEN  = 3;  // Consumer done with P[0,2,4,...]
-constexpr int BAR_P_DONE_ODD   = 4;  // Consumer done with P[1,3,5,...]
-
-// Thread counts for barrier participation
-constexpr int ALL_THREADS = 128;  // Full block (4 warps)
-
-// Get barrier ID based on iteration parity (for double-buffering)
-__device__ __forceinline__ int get_P_ready_bar(int iter) {
-    return (iter % 2 == 0) ? BAR_P_READY_EVEN : BAR_P_READY_ODD;
-}
-
-__device__ __forceinline__ int get_P_done_bar(int iter) {
-    return (iter % 2 == 0) ? BAR_P_DONE_EVEN : BAR_P_DONE_ODD;
-}
-
-// Producer signals: P[iter] is written to shared memory
-// All 128 threads participate (producers arrive, consumers wait)
-__device__ __forceinline__ void producer_signal_P_ready(int iter) {
-    __threadfence_block();  // Ensure P writes are visible
-    int bar_id = get_P_ready_bar(iter);
-    asm volatile("bar.arrive %0, %1;" : : "r"(bar_id), "r"(ALL_THREADS));
-}
-
-// Consumer waits for P[iter] to be ready
-__device__ __forceinline__ void consumer_wait_P_ready(int iter) {
-    int bar_id = get_P_ready_bar(iter);
-    asm volatile("bar.sync %0, %1;" : : "r"(bar_id), "r"(ALL_THREADS));
-}
-
-// Consumer signals: done reading P[iter], buffer can be reused
-__device__ __forceinline__ void consumer_signal_P_done(int iter) {
-    int bar_id = get_P_done_bar(iter);
-    asm volatile("bar.arrive %0, %1;" : : "r"(bar_id), "r"(ALL_THREADS));
-}
-
-// Producer waits for consumer to finish with P[iter]
-__device__ __forceinline__ void producer_wait_P_done(int iter) {
-    int bar_id = get_P_done_bar(iter);
-    asm volatile("bar.sync %0, %1;" : : "r"(bar_id), "r"(ALL_THREADS));
-}
-
-} // namespace warp_spec
+// The warp-specialized kernel uses __syncthreads() for producer-consumer
+// synchronization. This ensures all 128 threads participate in each barrier,
+// which is required for correct CUDA barrier semantics.
+//
+// Previous implementation used named barriers (bar.sync/bar.arrive) with
+// ALL_THREADS=128, but only 64 threads (producers OR consumers) would arrive
+// at each barrier call, causing undefined behavior due to warp divergence.
+//
+// The current implementation uses __syncthreads() which is safe because:
+// 1. All threads in the block participate in every barrier
+// 2. Double-buffering via (kv_id % 2) prevents data races on P buffer
+// 3. __threadfence_block() ensures memory visibility before barriers
 
 // Use WARP_SIZE from common.cuh
 // Use CUDA_CHECK from common.cuh
@@ -807,12 +769,14 @@ void attention_v5_kernel(
         const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
         const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
 
-        // divide by softmax denominator
+        // divide by softmax denominator (use reciprocal multiply for performance)
         float *regs = O_rmem[mma_id_q][mma_id_d];
-        regs[0] /= rowsumexp[mma_id_q][0];
-        regs[1] /= rowsumexp[mma_id_q][0];
-        regs[2] /= rowsumexp[mma_id_q][1];
-        regs[3] /= rowsumexp[mma_id_q][1];
+        const float inv_rowsumexp0 = 1.0f / rowsumexp[mma_id_q][0];
+        const float inv_rowsumexp1 = 1.0f / rowsumexp[mma_id_q][1];
+        regs[0] *= inv_rowsumexp0;
+        regs[1] *= inv_rowsumexp0;
+        regs[2] *= inv_rowsumexp1;
+        regs[3] *= inv_rowsumexp1;
 
         // Write output with type-aware conversion (To can be float, half, or nv_bfloat16)
         // Boundary check: ensure we don't write past len_q
@@ -951,14 +915,17 @@ __global__ void attention_v5_splitk_reduce(
         const float * partial_O_k = partial_O +
             (tile_id * split_k + k) * BLOCK_Q * DIM + q_row_local * DIM + d_base;
 
-        O_accum[0] += scale * partial_O_k[0];
-        O_accum[1] += scale * partial_O_k[1];
-        O_accum[2] += scale * partial_O_k[2];
-        O_accum[3] += scale * partial_O_k[3];
-        O_accum[4] += scale * partial_O_k[4];
-        O_accum[5] += scale * partial_O_k[5];
-        O_accum[6] += scale * partial_O_k[6];
-        O_accum[7] += scale * partial_O_k[7];
+        // Use float4 vector loads for better memory throughput (4x fewer transactions)
+        const float4 partial_0 = *reinterpret_cast<const float4*>(&partial_O_k[0]);
+        const float4 partial_1 = *reinterpret_cast<const float4*>(&partial_O_k[4]);
+        O_accum[0] += scale * partial_0.x;
+        O_accum[1] += scale * partial_0.y;
+        O_accum[2] += scale * partial_0.z;
+        O_accum[3] += scale * partial_0.w;
+        O_accum[4] += scale * partial_1.x;
+        O_accum[5] += scale * partial_1.y;
+        O_accum[6] += scale * partial_1.z;
+        O_accum[7] += scale * partial_1.w;
     }
 
     // Normalize and write final output
@@ -1087,12 +1054,14 @@ void attention_v5_warp_specialized_kernel(
 
   const int num_kv_iter = cdiv(len_kv, BLOCK_KV);
 
-  // Main loop
+  // Main loop - uses __syncthreads() for correct producer-consumer synchronization
+  // All 128 threads participate in every barrier to satisfy CUDA barrier semantics
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
-    if (is_producer) {
-      // Wait for P buffer availability
-      if (kv_id >= 2) warp_spec::producer_wait_P_done(kv_id - 2);
+    // Phase 1: Buffer protection - wait for consumers to finish with P[kv_id-2]
+    // This ensures producers don't overwrite P buffer that consumers are still reading
+    if (kv_id >= 2) __syncthreads();
 
+    if (is_producer) {
       // Load K
       const uint32_t K_dst = K_smem + (kv_id % 2) * K_BUF_SIZE;
       constexpr int num_elems = 16 / sizeof(T);
@@ -1201,10 +1170,13 @@ void attention_v5_warp_specialized_kernel(
           *reinterpret_cast<packed_t<T> *>(&P_buf[(q_row + 8) * BLOCK_KV + kv_col]) = float2_to_vec2<T>(regs[2], regs[3]);
         }
 
-      warp_spec::producer_signal_P_ready(kv_id);
-    } else { // Consumer
-      warp_spec::consumer_wait_P_ready(kv_id);
+      __threadfence_block();  // Ensure P writes are visible before barrier
+    }
 
+    // Phase 2: All 128 threads synchronize - P is now ready for consumers
+    __syncthreads();
+
+    if (!is_producer) {
       // Load P
       uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
       for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
@@ -1229,8 +1201,6 @@ void attention_v5_warp_specialized_kernel(
           rowsumexp[mma_id_q][0] = rowsumexp_smem[q_row0]; rowsumexp[mma_id_q][1] = rowsumexp_smem[q_row0 + 8];
         }
       }
-
-      warp_spec::consumer_signal_P_done(kv_id);
 
       // Load V
       constexpr int num_elems = 16 / sizeof(T);
@@ -1265,6 +1235,10 @@ void attention_v5_warp_specialized_kernel(
           for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
             mma_m16n8k16<T>(P_rmem[mma_id_q][mma_id_kv], V_rmem[mma_id_kv][mma_id_d], O_rmem[mma_id_q][mma_id_d]);
     }
+
+    // Phase 3: All 128 threads synchronize - safe for next iteration
+    // This ensures consumers are done reading P[kv_id] before producers overwrite it
+    __syncthreads();
   }
 
   // Epilogue: Consumer writes output
@@ -1275,8 +1249,11 @@ void attention_v5_warp_specialized_kernel(
         const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
         const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
         float *regs = O_rmem[mma_id_q][mma_id_d];
-        regs[0] /= rowsumexp[mma_id_q][0]; regs[1] /= rowsumexp[mma_id_q][0];
-        regs[2] /= rowsumexp[mma_id_q][1]; regs[3] /= rowsumexp[mma_id_q][1];
+        // Use reciprocal multiply for performance (division ~25 cycles, multiply ~4 cycles)
+        const float inv_rowsumexp0 = 1.0f / rowsumexp[mma_id_q][0];
+        const float inv_rowsumexp1 = 1.0f / rowsumexp[mma_id_q][1];
+        regs[0] *= inv_rowsumexp0; regs[1] *= inv_rowsumexp0;
+        regs[2] *= inv_rowsumexp1; regs[3] *= inv_rowsumexp1;
 
         if ((q_block_id * BLOCK_Q + row) < len_q) {
           if constexpr (std::is_same_v<To, float>) reinterpret_cast<float2 *>(O + row * stride_O_row + col)[0] = make_float2(regs[0], regs[1]);
