@@ -846,6 +846,544 @@ void attention_v5_kernel(
 }
 
 // =============================================================================
+// TWO-PHASE KERNEL SPLIT: Phase 1 - Q@K^T + Softmax
+// =============================================================================
+// This kernel computes the attention scores (Q @ K^T), applies mask and softmax,
+// and outputs the P matrix (attention weights) along with numerical stability metadata.
+//
+// REGISTER BUDGET (~212 registers, fits within 255 limit):
+//   - Q_rmem: (WARP_Q/16) * (DIM/16) * 4 = 1 * 8 * 4 = 32 registers
+//   - K_rmem: (BLOCK_KV/8) * (DIM/16) * 2 = 8 * 8 * 2 = 128 registers
+//   - S_rmem: (WARP_Q/16) * (BLOCK_KV/8) * 4 = 1 * 8 * 4 = 32 registers
+//   - misc (rowmax, rowsumexp, addresses, etc.): ~20 registers
+//   Total: ~212 registers
+//
+// NO V_rmem or O_rmem in this kernel - those are in Phase 2
+// =============================================================================
+template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, typename T>
+__launch_bounds__(NUM_WARPS * WARP_SIZE, 2)
+__global__
+void attention_v5_phase1_qk_softmax(
+    const T * __restrict__ Q,           // [D, seq_q, n_heads, batch]
+    const T * __restrict__ K,           // [D, seq_kv, n_heads_kv, batch]
+    const half * __restrict__ mask,     // [seq_kv, seq_q, 1, batch]
+    float * __restrict__ P_out,         // Output: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, BLOCK_KV]
+    float * __restrict__ meta_out,      // Output: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, 2] (rowmax, rowsumexp)
+    int n_heads,
+    int n_heads_kv,
+    int n_batch,
+    int len_q,
+    int len_kv,
+    float softmax_scale,
+    float max_bias,
+    float m0,
+    float m1,
+    uint32_t n_head_log2,
+    float logit_softcap,
+    int stride_Q_row,
+    int stride_Q_head,
+    int stride_Q_batch,
+    int stride_K_row,
+    int stride_K_head,
+    int stride_K_batch,
+    int stride_mask_row,
+    int stride_mask_batch
+) {
+    constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
+    constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
+    constexpr int MMA_M = 16, MMA_N = 8, MMA_K = 16;
+
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+
+    // Block decomposition: [batch, head, q_block, kv_iter]
+    const int num_q_blocks = cdiv(len_q, BLOCK_Q);
+    const int num_kv_iters = cdiv(len_kv, BLOCK_KV);
+    const int blocks_per_q_block = num_kv_iters;
+    const int blocks_per_head = num_q_blocks * blocks_per_q_block;
+    const int blocks_per_batch = n_heads * blocks_per_head;
+
+    const int batch_id = bid / blocks_per_batch;
+    const int bid_in_batch = bid % blocks_per_batch;
+    const int head_id = bid_in_batch / blocks_per_head;
+    const int bid_in_head = bid_in_batch % blocks_per_head;
+    const int q_block_id = bid_in_head / blocks_per_q_block;
+    const int kv_iter_id = bid_in_head % blocks_per_q_block;
+
+    // GQA: map query head to KV head
+    const int gqa_ratio = n_heads / n_heads_kv;
+    const int kv_head_id = head_id / gqa_ratio;
+
+    // Base pointers
+    Q += batch_id * stride_Q_batch + head_id * stride_Q_head + q_block_id * BLOCK_Q * stride_Q_row;
+    K += batch_id * stride_K_batch + kv_head_id * stride_K_head + kv_iter_id * BLOCK_KV * stride_K_row;
+
+    const half *mask_block = mask ? (mask + batch_id * stride_mask_batch + q_block_id * BLOCK_Q * stride_mask_row) : nullptr;
+    const float alibi_slope = get_alibi_slope(max_bias, head_id, n_head_log2, m0, m1);
+    const int q_start = q_block_id * BLOCK_Q;
+    const int kv_start = kv_iter_id * BLOCK_KV;
+
+    // Shared memory layout:
+    // - Q buffer: BLOCK_Q * DIM * sizeof(T) = 64 * 128 * 2 = 16KB
+    // - K buffer: BLOCK_KV * DIM * sizeof(T) = 64 * 128 * 2 = 16KB
+    // - Mask F32: BLOCK_Q * BLOCK_KV * sizeof(float) = 64 * 64 * 4 = 16KB
+    // Total: 48KB
+    extern __shared__ char smem_raw[];
+    T * smem = reinterpret_cast<T *>(smem_raw);
+    const uint32_t Q_smem = __cvta_generic_to_shared(smem);
+    const uint32_t K_smem = Q_smem + BLOCK_Q * DIM * sizeof(T);
+    const uint32_t mask_f32_smem = K_smem + BLOCK_KV * DIM * sizeof(T);
+
+    // Register allocation - ONLY Q, K, S (no V or O)
+    uint32_t Q_rmem[WARP_Q / MMA_M][DIM / MMA_K][4];
+    uint32_t K_rmem[BLOCK_KV / MMA_N][DIM / MMA_K][2];
+
+    // Pre-compute swizzled addresses
+    uint32_t Q_smem_thread, K_smem_thread;
+    {
+        const int row_off = warp_id * WARP_Q + (lane_id % 16);
+        const int col_off = lane_id / 16 * 8;
+        Q_smem_thread = swizzle<DIM * sizeof(T)>(Q_smem + (row_off * DIM + col_off) * sizeof(T));
+    }
+    {
+        const int row_off = lane_id % 8;
+        const int col_off = lane_id / 8 * 8;
+        K_smem_thread = swizzle<DIM * sizeof(T)>(K_smem + (row_off * DIM + col_off) * sizeof(T));
+    }
+
+    // Load Q to shared memory
+    global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE, T>(Q_smem, Q, stride_Q_row, tid, len_q - q_block_id * BLOCK_Q);
+    asm volatile("cp.async.commit_group;");
+
+    // Load K to shared memory
+    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE, T>(K_smem, K, stride_K_row, tid, len_kv - kv_iter_id * BLOCK_KV);
+    asm volatile("cp.async.commit_group;");
+
+    // Wait for Q
+    asm volatile("cp.async.wait_group 1;");
+    __syncthreads();
+
+    // Q shared -> registers
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++) {
+            uint32_t addr = Q_smem_thread;
+            addr += mma_id_q * MMA_M * DIM * sizeof(T);
+            addr ^= mma_id_d * MMA_K * sizeof(T);
+            ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
+        }
+
+    // Wait for K
+    asm volatile("cp.async.wait_all;");
+    __syncthreads();
+
+    // K shared -> registers
+    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+        for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d += 2) {
+            uint32_t addr = K_smem_thread;
+            addr += mma_id_kv * MMA_N * DIM * sizeof(T);
+            addr ^= mma_id_d * MMA_K * sizeof(T);
+            ldmatrix_x4(K_rmem[mma_id_kv][mma_id_d], addr);
+        }
+
+    // Pre-convert mask from F16 to F32 in shared memory
+    float * mask_f32 = reinterpret_cast<float *>(__cvta_shared_to_generic(mask_f32_smem));
+    if (mask_block) {
+        constexpr int num_pairs = (BLOCK_Q * BLOCK_KV) / 2;
+        for (int pair_idx = tid; pair_idx < num_pairs; pair_idx += TB_SIZE) {
+            const int i = pair_idx * 2;
+            const int q_idx = i / BLOCK_KV;
+            const int kv_idx = i % BLOCK_KV;
+            const int q_pos = q_start + q_idx;
+            const int kv_pos0 = kv_start + kv_idx;
+            const int kv_pos1 = kv_start + kv_idx + 1;
+
+            if (q_pos < len_q && kv_pos1 < len_kv) {
+                const half * src = &mask_block[q_idx * stride_mask_row + kv_pos0];
+                const half2 mask_pair = *reinterpret_cast<const half2 *>(src);
+                const float2 vals = __half22float2(mask_pair);
+                mask_f32[i] = vals.x;
+                mask_f32[i + 1] = vals.y;
+            } else if (q_pos < len_q && kv_pos0 < len_kv) {
+                mask_f32[i] = __half2float(mask_block[q_idx * stride_mask_row + kv_pos0]);
+                mask_f32[i + 1] = -FLT_MAX;
+            } else {
+                mask_f32[i] = -FLT_MAX;
+                mask_f32[i + 1] = -FLT_MAX;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Compute S = Q @ K^T
+    float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+            for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++)
+                mma_m16n8k16<T>(Q_rmem[mma_id_q][mma_id_d], K_rmem[mma_id_kv][mma_id_d], S_rmem[mma_id_q][mma_id_kv]);
+
+    // Apply softmax scale, mask, and compute P
+    float rowmax[WARP_Q / MMA_M][2];
+    float rowsumexp[WARP_Q / MMA_M][2] = {};
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+        rowmax[mma_id_q][0] = -FLT_MAX;
+        rowmax[mma_id_q][1] = -FLT_MAX;
+
+        // Apply scale and mask
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            float *regs = S_rmem[mma_id_q][mma_id_kv];
+            const int q_row_base = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int kv_col_base = kv_start + mma_id_kv * MMA_N + (lane_id % 4) * 2;
+
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int q_row = q_row_base + (r >= 2 ? 8 : 0);
+                const int kv_col = kv_col_base + (r % 2);
+
+                float score = regs[r] * softmax_scale;
+                if (logit_softcap != 0.0f) {
+                    score = logit_softcap * tanhf(score);
+                }
+
+                if (kv_col >= len_kv) {
+                    score = -FLT_MAX;
+                } else if (mask_block && (q_start + q_row) < len_q) {
+                    const int kv_local = kv_col - kv_start;
+                    const float mask_val = mask_f32[q_row * BLOCK_KV + kv_local];
+                    score += alibi_slope * mask_val;
+                }
+                regs[r] = score;
+            }
+        }
+
+        // Compute rowmax
+        float this_rowmax[2];
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            float *regs = S_rmem[mma_id_q][mma_id_kv];
+            if (mma_id_kv == 0) {
+                this_rowmax[0] = max(regs[0], regs[1]);
+                this_rowmax[1] = max(regs[2], regs[3]);
+            } else {
+                this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
+                this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
+            }
+        }
+
+        // Butterfly reduction
+        this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 1));
+        this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
+        this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
+        this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
+
+        rowmax[mma_id_q][0] = this_rowmax[0];
+        rowmax[mma_id_q][1] = this_rowmax[1];
+
+        // Compute exp(score - rowmax) and rowsumexp
+        float this_rowsumexp[2] = {0.0f, 0.0f};
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            float *regs = S_rmem[mma_id_q][mma_id_kv];
+            regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);
+            regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);
+            regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);
+            regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);
+
+            this_rowsumexp[0] += regs[0] + regs[1];
+            this_rowsumexp[1] += regs[2] + regs[3];
+        }
+
+        // Butterfly reduction for rowsumexp
+        this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
+        this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
+        this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
+        this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
+
+        rowsumexp[mma_id_q][0] = this_rowsumexp[0];
+        rowsumexp[mma_id_q][1] = this_rowsumexp[1];
+    }
+
+    // Output P matrix and metadata
+    // P_out layout: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, BLOCK_KV]
+    const int p_tile_offset = ((batch_id * n_heads + head_id) * num_q_blocks + q_block_id) * num_kv_iters + kv_iter_id;
+    float * P_tile = P_out + p_tile_offset * BLOCK_Q * BLOCK_KV;
+    float * meta_tile = meta_out + p_tile_offset * BLOCK_Q * 2;
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            float *regs = S_rmem[mma_id_q][mma_id_kv];
+            const int row0 = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int row8 = row0 + 8;
+            const int col = mma_id_kv * MMA_N + (lane_id % 4) * 2;
+
+            if ((q_start + row0) < len_q) {
+                P_tile[row0 * BLOCK_KV + col] = regs[0];
+                P_tile[row0 * BLOCK_KV + col + 1] = regs[1];
+            }
+            if ((q_start + row8) < len_q) {
+                P_tile[row8 * BLOCK_KV + col] = regs[2];
+                P_tile[row8 * BLOCK_KV + col + 1] = regs[3];
+            }
+        }
+
+        // Write metadata (rowmax, rowsumexp) - one per row, only lane 0 writes
+        if ((lane_id % 4) == 0) {
+            const int row0 = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int row8 = row0 + 8;
+            if ((q_start + row0) < len_q) {
+                meta_tile[row0 * 2] = rowmax[mma_id_q][0];
+                meta_tile[row0 * 2 + 1] = rowsumexp[mma_id_q][0];
+            }
+            if ((q_start + row8) < len_q) {
+                meta_tile[row8 * 2] = rowmax[mma_id_q][1];
+                meta_tile[row8 * 2 + 1] = rowsumexp[mma_id_q][1];
+            }
+        }
+    }
+}
+
+// =============================================================================
+// TWO-PHASE KERNEL SPLIT: Phase 2 - P@V Accumulation
+// =============================================================================
+// This kernel reads P matrix and metadata from Phase 1, computes P @ V,
+// and accumulates across all KV iterations with proper numerical rescaling.
+//
+// REGISTER BUDGET (~228 registers, fits within 255 limit):
+//   - P_rmem: (WARP_Q/16) * (BLOCK_KV/16) * 4 = 1 * 4 * 4 = 16 registers (as uint32)
+//   - V_rmem: (BLOCK_KV/16) * (DIM/8) * 2 = 4 * 16 * 2 = 128 registers
+//   - O_rmem: (WARP_Q/16) * (DIM/8) * 4 = 1 * 16 * 4 = 64 registers
+//   - misc (rowmax, rowsumexp, addresses, rescale): ~20 registers
+//   Total: ~228 registers
+//
+// NO Q_rmem or K_rmem in this kernel - those were in Phase 1
+// =============================================================================
+template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, typename T, typename To>
+__launch_bounds__(NUM_WARPS * WARP_SIZE, 2)
+__global__
+void attention_v5_phase2_pv_accum(
+    const float * __restrict__ P_in,    // Input: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, BLOCK_KV]
+    const float * __restrict__ meta_in, // Input: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, 2]
+    const T * __restrict__ V,           // [D, seq_kv, n_heads_kv, batch]
+    To * __restrict__ O,                // Output: [D, n_heads, seq_q, batch]
+    int n_heads,
+    int n_heads_kv,
+    int n_batch,
+    int len_q,
+    int len_kv,
+    int num_kv_iters,
+    int stride_V_row,
+    int stride_V_head,
+    int stride_V_batch,
+    int stride_O_row,
+    int stride_O_head,
+    int stride_O_batch
+) {
+    constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
+    constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
+    constexpr int MMA_M = 16, MMA_N = 8, MMA_K = 16;
+
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+
+    // Block decomposition: [batch, head, q_block]
+    const int num_q_blocks = cdiv(len_q, BLOCK_Q);
+    const int blocks_per_batch = n_heads * num_q_blocks;
+
+    const int batch_id = bid / blocks_per_batch;
+    const int bid_in_batch = bid % blocks_per_batch;
+    const int head_id = bid_in_batch / num_q_blocks;
+    const int q_block_id = bid_in_batch % num_q_blocks;
+
+    // GQA
+    const int gqa_ratio = n_heads / n_heads_kv;
+    const int kv_head_id = head_id / gqa_ratio;
+
+    const int q_start = q_block_id * BLOCK_Q;
+
+    // Shared memory layout:
+    // - V buffer: BLOCK_KV * DIM * sizeof(T) = 64 * 128 * 2 = 16KB
+    // - P buffer (F32): BLOCK_Q * BLOCK_KV * sizeof(float) = 64 * 64 * 4 = 16KB
+    // Total: 32KB
+    extern __shared__ char smem_raw[];
+    T * smem = reinterpret_cast<T *>(smem_raw);
+    const uint32_t V_smem = __cvta_generic_to_shared(smem);
+    float * P_smem = reinterpret_cast<float *>(smem_raw + BLOCK_KV * DIM * sizeof(T));
+
+    // Register allocation - ONLY P, V, O (no Q or K)
+    uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
+    uint32_t V_rmem[BLOCK_KV / MMA_K][DIM / MMA_N][2];
+    float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4] = {};
+
+    float rowmax[WARP_Q / MMA_M][2];
+    float rowsumexp[WARP_Q / MMA_M][2] = {};
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+        rowmax[mma_id_q][0] = -FLT_MAX;
+        rowmax[mma_id_q][1] = -FLT_MAX;
+    }
+
+    // Pre-compute swizzled V address
+    uint32_t V_smem_thread;
+    {
+        const int row_off = lane_id % 16;
+        const int col_off = lane_id / 16 * 8;
+        V_smem_thread = swizzle<DIM * sizeof(T)>(V_smem + (row_off * DIM + col_off) * sizeof(T));
+    }
+
+    // Base tile offset for this (batch, head, q_block)
+    const int base_tile_offset = ((batch_id * n_heads + head_id) * num_q_blocks + q_block_id) * num_kv_iters;
+
+    // Iterate over all KV blocks
+    for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
+        const int kv_start = kv_iter * BLOCK_KV;
+
+        // Load V to shared memory
+        const T * V_ptr = V + batch_id * stride_V_batch + kv_head_id * stride_V_head + kv_start * stride_V_row;
+        global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE, T>(V_smem, V_ptr, stride_V_row, tid, len_kv - kv_start);
+        asm volatile("cp.async.commit_group;");
+
+        // Load P tile to shared memory (cooperative load)
+        const float * P_tile = P_in + (base_tile_offset + kv_iter) * BLOCK_Q * BLOCK_KV;
+        for (int i = tid; i < BLOCK_Q * BLOCK_KV; i += TB_SIZE) {
+            P_smem[i] = P_tile[i];
+        }
+
+        // Wait for both loads
+        asm volatile("cp.async.wait_all;");
+        __syncthreads();
+
+        // Load metadata for this KV iteration
+        const float * meta_tile = meta_in + (base_tile_offset + kv_iter) * BLOCK_Q * 2;
+
+        // V shared -> registers
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+            for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d += 2) {
+                uint32_t addr = V_smem_thread;
+                addr += mma_id_kv * MMA_K * DIM * sizeof(T);
+                addr ^= mma_id_d * MMA_N * sizeof(T);
+                ldmatrix_x4_trans(V_rmem[mma_id_kv][mma_id_d], addr);
+            }
+
+        // Process each Q row in this warp's chunk
+        for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+            const int row0 = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int row8 = row0 + 8;
+
+            // Read rowmax/rowsumexp for this iteration from metadata
+            // Use shuffle to broadcast from lane 0 in each group
+            float iter_rowmax0 = -FLT_MAX, iter_rowmax1 = -FLT_MAX;
+            float iter_rowsumexp0 = 0.0f, iter_rowsumexp1 = 0.0f;
+
+            if ((q_start + row0) < len_q) {
+                iter_rowmax0 = meta_tile[row0 * 2];
+                iter_rowsumexp0 = meta_tile[row0 * 2 + 1];
+            }
+            if ((q_start + row8) < len_q) {
+                iter_rowmax1 = meta_tile[row8 * 2];
+                iter_rowsumexp1 = meta_tile[row8 * 2 + 1];
+            }
+
+            // Broadcast from lane 0 within each group of 4
+            iter_rowmax0 = __shfl_sync(0xFFFFFFFF, iter_rowmax0, (lane_id / 4) * 4);
+            iter_rowsumexp0 = __shfl_sync(0xFFFFFFFF, iter_rowsumexp0, (lane_id / 4) * 4);
+            iter_rowmax1 = __shfl_sync(0xFFFFFFFF, iter_rowmax1, (lane_id / 4) * 4);
+            iter_rowsumexp1 = __shfl_sync(0xFFFFFFFF, iter_rowsumexp1, (lane_id / 4) * 4);
+
+            // Compute new global rowmax
+            float new_rowmax0 = max(rowmax[mma_id_q][0], iter_rowmax0);
+            float new_rowmax1 = max(rowmax[mma_id_q][1], iter_rowmax1);
+
+            // Rescale existing O accumulator
+            float rescale0 = __expf(rowmax[mma_id_q][0] - new_rowmax0);
+            float rescale1 = __expf(rowmax[mma_id_q][1] - new_rowmax1);
+            for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
+                O_rmem[mma_id_q][mma_id_d][0] *= rescale0;
+                O_rmem[mma_id_q][mma_id_d][1] *= rescale0;
+                O_rmem[mma_id_q][mma_id_d][2] *= rescale1;
+                O_rmem[mma_id_q][mma_id_d][3] *= rescale1;
+            }
+
+            // Load P from shared memory and scale by exp(iter_rowmax - new_rowmax)
+            float iter_scale0 = __expf(iter_rowmax0 - new_rowmax0);
+            float iter_scale1 = __expf(iter_rowmax1 - new_rowmax1);
+
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++) {
+                const int kv_col = mma_id_kv * MMA_K + (lane_id % 4) * 2;
+                const int kv_col_8 = kv_col + 8;
+
+                // Load P values for this row
+                float p0_0 = P_smem[row0 * BLOCK_KV + kv_col] * iter_scale0;
+                float p0_1 = P_smem[row0 * BLOCK_KV + kv_col + 1] * iter_scale0;
+                float p8_0 = P_smem[row8 * BLOCK_KV + kv_col] * iter_scale1;
+                float p8_1 = P_smem[row8 * BLOCK_KV + kv_col + 1] * iter_scale1;
+
+                float p0_8 = P_smem[row0 * BLOCK_KV + kv_col_8] * iter_scale0;
+                float p0_9 = P_smem[row0 * BLOCK_KV + kv_col_8 + 1] * iter_scale0;
+                float p8_8 = P_smem[row8 * BLOCK_KV + kv_col_8] * iter_scale1;
+                float p8_9 = P_smem[row8 * BLOCK_KV + kv_col_8 + 1] * iter_scale1;
+
+                // Pack into P_rmem format for MMA
+                packed_t<T> *this_P_rmem = reinterpret_cast<packed_t<T> *>(P_rmem[mma_id_q][mma_id_kv]);
+                this_P_rmem[0] = float2_to_vec2<T>(p0_0, p0_1);
+                this_P_rmem[1] = float2_to_vec2<T>(p8_0, p8_1);
+                this_P_rmem[2] = float2_to_vec2<T>(p0_8, p0_9);
+                this_P_rmem[3] = float2_to_vec2<T>(p8_8, p8_9);
+            }
+
+            // Update rowmax and rowsumexp
+            rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale0 + iter_rowsumexp0 * iter_scale0;
+            rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale1 + iter_rowsumexp1 * iter_scale1;
+            rowmax[mma_id_q][0] = new_rowmax0;
+            rowmax[mma_id_q][1] = new_rowmax1;
+
+            // MMA O += P @ V
+            for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
+                for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+                    mma_m16n8k16<T>(P_rmem[mma_id_q][mma_id_kv], V_rmem[mma_id_kv][mma_id_d], O_rmem[mma_id_q][mma_id_d]);
+        }
+
+        __syncthreads();
+    }
+
+    // Write final output (normalized)
+    O += batch_id * stride_O_batch + head_id * stride_O_head + q_start * stride_O_row;
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
+            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+
+            float *regs = O_rmem[mma_id_q][mma_id_d];
+            regs[0] /= rowsumexp[mma_id_q][0];
+            regs[1] /= rowsumexp[mma_id_q][0];
+            regs[2] /= rowsumexp[mma_id_q][1];
+            regs[3] /= rowsumexp[mma_id_q][1];
+
+            if ((q_start + row) < len_q) {
+                if constexpr (std::is_same_v<To, float>) {
+                    reinterpret_cast<float2 *>(O + row * stride_O_row + col)[0] = make_float2(regs[0], regs[1]);
+                } else if constexpr (std::is_same_v<To, half>) {
+                    reinterpret_cast<half2 *>(O + row * stride_O_row + col)[0] = __float22half2_rn(make_float2(regs[0], regs[1]));
+                } else if constexpr (std::is_same_v<To, nv_bfloat16>) {
+                    reinterpret_cast<nv_bfloat162 *>(O + row * stride_O_row + col)[0] = __float22bfloat162_rn(make_float2(regs[0], regs[1]));
+                }
+            }
+            if ((q_start + row + 8) < len_q) {
+                if constexpr (std::is_same_v<To, float>) {
+                    reinterpret_cast<float2 *>(O + (row + 8) * stride_O_row + col)[0] = make_float2(regs[2], regs[3]);
+                } else if constexpr (std::is_same_v<To, half>) {
+                    reinterpret_cast<half2 *>(O + (row + 8) * stride_O_row + col)[0] = __float22half2_rn(make_float2(regs[2], regs[3]));
+                } else if constexpr (std::is_same_v<To, nv_bfloat16>) {
+                    reinterpret_cast<nv_bfloat162 *>(O + (row + 8) * stride_O_row + col)[0] = __float22bfloat162_rn(make_float2(regs[2], regs[3]));
+                }
+            }
+        }
+}
+
+// =============================================================================
 // Split-K Reduction Kernel
 // =============================================================================
 // Combines partial results from multiple splits using numerically stable
@@ -1363,6 +1901,14 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     // Expected 15-25% speedup for long sequences (>4K tokens) when split_k == 1
     constexpr bool USE_WARP_SPECIALIZED = true;
 
+    // Two-phase kernel split feature flag - addresses register pressure on SM_120
+    // When enabled, splits the attention computation into two kernels:
+    // - Phase 1: Q@K^T + Softmax (~212 registers) - fits within 255 limit
+    // - Phase 2: P@V accumulation (~228 registers) - fits within 255 limit
+    // This avoids the ~428 register requirement of the fused kernel and eliminates
+    // the need for --maxrregcount=224 which causes 200+ registers to spill to local memory
+    constexpr bool USE_TWO_PHASE_KERNEL = true;
+
     const int num_q_blocks = (len_q + BLOCK_Q - 1) / BLOCK_Q;
     const int total_kv_iters = (len_kv + BLOCK_KV - 1) / BLOCK_KV;
 
@@ -1423,6 +1969,30 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
         partial_meta = partial_meta_alloc.ptr;
     }
 
+    // ===========================================================================
+    // Two-Phase Kernel Workspace Allocation
+    // ===========================================================================
+    // P buffer: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, BLOCK_KV] floats
+    // Meta buffer: [batch, heads, num_q_blocks, num_kv_iters, BLOCK_Q, 2] floats (rowmax, rowsumexp)
+    float * phase_P_buffer = nullptr;
+    float * phase_meta_buffer = nullptr;
+
+    ggml_cuda_pool_alloc<float> phase_P_alloc(pool);
+    ggml_cuda_pool_alloc<float> phase_meta_alloc(pool);
+
+    // Determine if we should use two-phase kernel
+    const bool use_two_phase = USE_TWO_PHASE_KERNEL && (split_k == 1);
+
+    if (use_two_phase) {
+        const size_t phase_P_size = (size_t)total_tiles * total_kv_iters * BLOCK_Q * BLOCK_KV;
+        const size_t phase_meta_size = (size_t)total_tiles * total_kv_iters * BLOCK_Q * 2;
+
+        phase_P_alloc.alloc(phase_P_size);
+        phase_meta_alloc.alloc(phase_meta_size);
+        phase_P_buffer = phase_P_alloc.ptr;
+        phase_meta_buffer = phase_meta_alloc.ptr;
+    }
+
     // Lambda to launch kernel with specific output type
     auto launch_kernel_with_output_type = [&](auto input_type_tag) {
         using T = typename decltype(input_type_tag)::type;
@@ -1476,7 +2046,13 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
                                       + 2 * BLOCK_Q * sizeof(float);                  // Softmax state
 
         // Determine which kernel to use
-        const bool use_warp_spec = USE_WARP_SPECIALIZED && (split_k == 1);
+        const bool use_warp_spec = USE_WARP_SPECIALIZED && (split_k == 1) && !use_two_phase;
+
+        // Shared memory sizes for two-phase kernels
+        // Phase 1: Q buffer (16KB) + K buffer (16KB) + Mask F32 (16KB) = 48KB
+        const int smem_size_phase1 = BLOCK_Q * DIM * sizeof(T) + BLOCK_KV * DIM * sizeof(T) + BLOCK_Q * BLOCK_KV * sizeof(float);
+        // Phase 2: V buffer (16KB) + P buffer F32 (16KB) = 32KB
+        const int smem_size_phase2 = BLOCK_KV * DIM * sizeof(T) + BLOCK_Q * BLOCK_KV * sizeof(float);
 
         if (dst->type == GGML_TYPE_F32) {
             using To = float;
@@ -1494,7 +2070,41 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
             const int stride_O_head  = dst->nb[1] / sizeof(To);  // heads is dim 1 in output
             const int stride_O_batch = dst->nb[3] / sizeof(To);
 
-            if (use_warp_spec) {
+            if (use_two_phase) {
+                // ===========================================================================
+                // TWO-PHASE KERNEL: Eliminates register spilling on SM_120
+                // ===========================================================================
+                // Phase 1: Q@K^T + Softmax - ~212 registers, no spilling
+                // Phase 2: P@V accumulation - ~228 registers, no spilling
+                const int phase1_blocks = n_batch * n_heads * num_q_blocks * total_kv_iters;
+                const int phase2_blocks = base_blocks;  // n_batch * n_heads * num_q_blocks
+
+                // Phase 1: Compute attention scores and softmax
+                auto kernel_phase1 = attention_v5_phase1_qk_softmax<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T>;
+                if (smem_size_phase1 > 48000) {
+                    CUDA_CHECK(cudaFuncSetAttribute(kernel_phase1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_phase1));
+                }
+                kernel_phase1<<<phase1_blocks, TB_SIZE, smem_size_phase1, main_stream>>>(
+                    Q_data, K_data, mask_data,
+                    phase_P_buffer, phase_meta_buffer,
+                    n_heads, n_heads_kv, n_batch, len_q, len_kv,
+                    scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                    stride_Q_row, stride_Q_head, stride_Q_batch,
+                    stride_K_row, stride_K_head, stride_K_batch,
+                    stride_mask_row, stride_mask_batch);
+
+                // Phase 2: P@V accumulation and output
+                auto kernel_phase2 = attention_v5_phase2_pv_accum<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
+                if (smem_size_phase2 > 48000) {
+                    CUDA_CHECK(cudaFuncSetAttribute(kernel_phase2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_phase2));
+                }
+                kernel_phase2<<<phase2_blocks, TB_SIZE, smem_size_phase2, main_stream>>>(
+                    phase_P_buffer, phase_meta_buffer, V_data, dst_data,
+                    n_heads, n_heads_kv, n_batch, len_q, len_kv, total_kv_iters,
+                    stride_V_row, stride_V_head, stride_V_batch,
+                    stride_O_row, stride_O_head, stride_O_batch);
+
+            } else if (use_warp_spec) {
                 // Warp-specialized kernel: producer-consumer pipeline, no split-k support
                 auto kernel_ws = attention_v5_warp_specialized_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
                 if (smem_size_warp_spec > 48000) {
@@ -1546,7 +2156,35 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
             const int stride_O_head  = dst->nb[1] / sizeof(To);  // heads is dim 1 in output
             const int stride_O_batch = dst->nb[3] / sizeof(To);
 
-            if (use_warp_spec) {
+            if (use_two_phase) {
+                // Two-phase kernel for BF16 output
+                const int phase1_blocks = n_batch * n_heads * num_q_blocks * total_kv_iters;
+                const int phase2_blocks = base_blocks;
+
+                auto kernel_phase1 = attention_v5_phase1_qk_softmax<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T>;
+                if (smem_size_phase1 > 48000) {
+                    CUDA_CHECK(cudaFuncSetAttribute(kernel_phase1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_phase1));
+                }
+                kernel_phase1<<<phase1_blocks, TB_SIZE, smem_size_phase1, main_stream>>>(
+                    Q_data, K_data, mask_data,
+                    phase_P_buffer, phase_meta_buffer,
+                    n_heads, n_heads_kv, n_batch, len_q, len_kv,
+                    scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                    stride_Q_row, stride_Q_head, stride_Q_batch,
+                    stride_K_row, stride_K_head, stride_K_batch,
+                    stride_mask_row, stride_mask_batch);
+
+                auto kernel_phase2 = attention_v5_phase2_pv_accum<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
+                if (smem_size_phase2 > 48000) {
+                    CUDA_CHECK(cudaFuncSetAttribute(kernel_phase2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_phase2));
+                }
+                kernel_phase2<<<phase2_blocks, TB_SIZE, smem_size_phase2, main_stream>>>(
+                    phase_P_buffer, phase_meta_buffer, V_data, dst_data,
+                    n_heads, n_heads_kv, n_batch, len_q, len_kv, total_kv_iters,
+                    stride_V_row, stride_V_head, stride_V_batch,
+                    stride_O_row, stride_O_head, stride_O_batch);
+
+            } else if (use_warp_spec) {
                 // Warp-specialized kernel: producer-consumer pipeline, no split-k support
                 auto kernel_ws = attention_v5_warp_specialized_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
                 if (smem_size_warp_spec > 48000) {
@@ -1598,7 +2236,35 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
             const int stride_O_head  = dst->nb[1] / sizeof(To);  // heads is dim 1 in output
             const int stride_O_batch = dst->nb[3] / sizeof(To);
 
-            if (use_warp_spec) {
+            if (use_two_phase) {
+                // Two-phase kernel for F16 output
+                const int phase1_blocks = n_batch * n_heads * num_q_blocks * total_kv_iters;
+                const int phase2_blocks = base_blocks;
+
+                auto kernel_phase1 = attention_v5_phase1_qk_softmax<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T>;
+                if (smem_size_phase1 > 48000) {
+                    CUDA_CHECK(cudaFuncSetAttribute(kernel_phase1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_phase1));
+                }
+                kernel_phase1<<<phase1_blocks, TB_SIZE, smem_size_phase1, main_stream>>>(
+                    Q_data, K_data, mask_data,
+                    phase_P_buffer, phase_meta_buffer,
+                    n_heads, n_heads_kv, n_batch, len_q, len_kv,
+                    scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                    stride_Q_row, stride_Q_head, stride_Q_batch,
+                    stride_K_row, stride_K_head, stride_K_batch,
+                    stride_mask_row, stride_mask_batch);
+
+                auto kernel_phase2 = attention_v5_phase2_pv_accum<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
+                if (smem_size_phase2 > 48000) {
+                    CUDA_CHECK(cudaFuncSetAttribute(kernel_phase2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_phase2));
+                }
+                kernel_phase2<<<phase2_blocks, TB_SIZE, smem_size_phase2, main_stream>>>(
+                    phase_P_buffer, phase_meta_buffer, V_data, dst_data,
+                    n_heads, n_heads_kv, n_batch, len_q, len_kv, total_kv_iters,
+                    stride_V_row, stride_V_head, stride_V_batch,
+                    stride_O_row, stride_O_head, stride_O_batch);
+
+            } else if (use_warp_spec) {
                 // Warp-specialized kernel: producer-consumer pipeline, no split-k support
                 auto kernel_ws = attention_v5_warp_specialized_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
                 if (smem_size_warp_spec > 48000) {
