@@ -22,6 +22,7 @@ LLAMA_VANILLA="/home/rgilbreth/Desktop/AI-Software/llama.cpp/build/bin/llama-ser
 MODEL="/media/rgilbreth/AI-M2-2TB/Models/Qwen3/Coder/30B-A3B/Q8_0/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf"
 
 # Set Environment Variables
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0,2
 export GGML_CUDA_FORCE_MMQ="1"
 export GGML_CUDA_F16="1"

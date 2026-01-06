@@ -1427,13 +1427,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
+        // Flash attention kernels require F16/BF16 tensors for Q, K, V.
+        // Quantized models (Q8_0, Q4_0, etc.) produce F32 activations after dequantization.
+        // We cast to BF16 (if possible) to preserve range and avoid overflow (NaNs),
+        // or F16 if we must match existing F16 tensors (e.g. from cache).
+        ggml_type target_type = GGML_TYPE_BF16;
+        if (k->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F16) {
+            target_type = GGML_TYPE_F16;
+        }
+
+        if (q->type == GGML_TYPE_F32) {
+            q = ggml_cast(ctx0, q, target_type);
+        }
+
         if (k->type == GGML_TYPE_F32) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            k = ggml_cast(ctx0, k, target_type);
         }
 
         if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            v = ggml_cast(ctx0, v, target_type);
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,

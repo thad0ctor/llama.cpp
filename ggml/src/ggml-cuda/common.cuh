@@ -1252,6 +1252,8 @@ struct ggml_backend_cuda_context {
     void * mmq_get_src1_q8_1(size_t required_size) {
         if (mmq_buffers.src1_q8_1 == nullptr || mmq_buffers.src1_q8_1_size < required_size) {
             if (mmq_buffers.src1_q8_1) {
+                // Synchronize to ensure no pending kernels are using the buffer
+                CUDA_CHECK(cudaStreamSynchronize(stream()));
                 CUDA_CHECK(cudaFree(mmq_buffers.src1_q8_1));
                 mmq_invalidate_cuda_graph();  // Pointer changed, graph must be recaptured
             }
@@ -1265,6 +1267,7 @@ struct ggml_backend_cuda_context {
     void * mmq_get_ids_src1(size_t required_size) {
         if (mmq_buffers.ids_src1 == nullptr || mmq_buffers.ids_src1_size < required_size) {
             if (mmq_buffers.ids_src1) {
+                CUDA_CHECK(cudaStreamSynchronize(stream()));
                 CUDA_CHECK(cudaFree(mmq_buffers.ids_src1));
                 mmq_invalidate_cuda_graph();
             }
@@ -1278,6 +1281,7 @@ struct ggml_backend_cuda_context {
     void * mmq_get_ids_dst(size_t required_size) {
         if (mmq_buffers.ids_dst == nullptr || mmq_buffers.ids_dst_size < required_size) {
             if (mmq_buffers.ids_dst) {
+                CUDA_CHECK(cudaStreamSynchronize(stream()));
                 CUDA_CHECK(cudaFree(mmq_buffers.ids_dst));
                 mmq_invalidate_cuda_graph();
             }
@@ -1291,6 +1295,7 @@ struct ggml_backend_cuda_context {
     void * mmq_get_expert_bounds(size_t required_size) {
         if (mmq_buffers.expert_bounds == nullptr || mmq_buffers.expert_bounds_size < required_size) {
             if (mmq_buffers.expert_bounds) {
+                CUDA_CHECK(cudaStreamSynchronize(stream()));
                 CUDA_CHECK(cudaFree(mmq_buffers.expert_bounds));
                 mmq_invalidate_cuda_graph();
             }
