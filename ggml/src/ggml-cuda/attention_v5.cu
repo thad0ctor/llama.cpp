@@ -411,6 +411,13 @@ void attention_v5_kernel(
     // K shared -> registers
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
+
+    // PREFETCH: Start loading next K block early to hide memory latency
+    // This overlaps next K load with current iteration's compute
+    if (kv_id + 1 < num_kv_iter) {
+      load_K(kv_id + 1);
+    }
+
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d += 2) {
         uint32_t addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(T));
@@ -421,18 +428,38 @@ void attention_v5_kernel(
 
     // Pre-convert mask from F16 to F32 in shared memory (once per KV iteration)
     // This eliminates ~12,288 redundant __half2float conversions per iteration
+    // Uses __half22float2 to process pairs of F16 values for 2x conversion throughput
     float * mask_f32 = reinterpret_cast<float *>(__cvta_shared_to_generic(mask_f32_smem));
     if (mask_block) {
       const int kv_base = kv_id * BLOCK_KV;
-      for (int i = tid; i < BLOCK_Q * BLOCK_KV; i += TB_SIZE) {
+      // Process pairs of mask values using __half22float2 for better throughput
+      // Each thread processes 2 consecutive KV positions at once
+      constexpr int num_pairs = (BLOCK_Q * BLOCK_KV) / 2;  // 2048 pairs for 64x64
+      for (int pair_idx = tid; pair_idx < num_pairs; pair_idx += TB_SIZE) {
+        const int i = pair_idx * 2;  // Base index for this pair
         const int q_idx = i / BLOCK_KV;
         const int kv_idx = i % BLOCK_KV;
         const int q_pos = q_start + q_idx;
-        const int kv_pos = kv_base + kv_idx;
-        if (q_pos < len_q && kv_pos < len_kv) {
-          mask_f32[i] = __half2float(mask_block[q_idx * stride_mask_row + kv_pos]);
+        const int kv_pos0 = kv_base + kv_idx;
+        const int kv_pos1 = kv_base + kv_idx + 1;
+
+        // Both elements in a pair are from the same q_idx row (consecutive in KV dim)
+        // since kv_idx is always even (i = pair_idx * 2, and BLOCK_KV is 64)
+        if (q_pos < len_q && kv_pos1 < len_kv) {
+          // Both positions valid - use paired conversion
+          const half * src = &mask_block[q_idx * stride_mask_row + kv_pos0];
+          const half2 mask_pair = *reinterpret_cast<const half2 *>(src);
+          const float2 vals = __half22float2(mask_pair);
+          mask_f32[i] = vals.x;
+          mask_f32[i + 1] = vals.y;
+        } else if (q_pos < len_q && kv_pos0 < len_kv) {
+          // Only first position valid
+          mask_f32[i] = __half2float(mask_block[q_idx * stride_mask_row + kv_pos0]);
+          mask_f32[i + 1] = -FLT_MAX;
         } else {
-          mask_f32[i] = -FLT_MAX;  // Invalid positions get -inf
+          // Both positions invalid
+          mask_f32[i] = -FLT_MAX;
+          mask_f32[i + 1] = -FLT_MAX;
         }
       }
       __syncthreads();
@@ -446,8 +473,8 @@ void attention_v5_kernel(
                           K_rmem[mma_id_kv][mma_id_d],
                           S_rmem[mma_id_q][mma_id_kv]);
 
-    // prefetch K
-    load_K(kv_id + 1);
+    // NOTE: K prefetch for (kv_id + 1) now happens earlier (after K->registers load)
+    // to better overlap memory latency with compute
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
       // Apply softmax scale, logit softcap, and mask to attention scores
