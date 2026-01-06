@@ -67,10 +67,18 @@ void global_to_shared_swizzle(uint32_t dst, const T *src, int src_stride, int ti
     const int row = idx / WIDTH;
     const int col = idx % WIDTH;
 
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(T)>(dst + (row * WIDTH + col) * sizeof(T));
     if (row < max_rows) {
-        const uint32_t dst_addr = swizzle<WIDTH * sizeof(T)>(dst + (row * WIDTH + col) * sizeof(T));
         const T *src_addr = src + (row * src_stride + col);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+    } else {
+        // Zero-initialize rows beyond max_rows to prevent garbage in MMA computations
+        // Write 16 bytes of zeros (8 x 16-bit elements)
+        T * smem_ptr = reinterpret_cast<T*>(__cvta_shared_to_generic(dst_addr));
+        #pragma unroll
+        for (int i = 0; i < num_elems; i++) {
+            smem_ptr[i] = T(0);
+        }
     }
   }
 }
@@ -180,7 +188,7 @@ __device__ __forceinline__ float get_alibi_slope(
   return powf(base, float(exp));
 }
 
-template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, typename T>
+template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, typename T, typename To>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
 void attention_v5_kernel(
@@ -188,12 +196,12 @@ void attention_v5_kernel(
   const T *K,           // [D, seq_kv, heads_kv, batch] - F16 or BF16
   const T *V,           // [D, seq_kv, heads_kv, batch] - F16 or BF16
   const half *mask,     // [seq_kv, seq_q, batch] - F16, nullptr if no mask
-  float *O,             // [D, seq_q, heads, batch] - always F32 (flash attention output)
-  int n_heads,          // Q->ne[2]
-  int n_heads_kv,       // K->ne[2] (for GQA support)
+  To *O,                // [D, seq_q, heads, batch] - F32, F16, or BF16
+  int n_heads,          // Q->ne[1]
+  int n_heads_kv,       // K->ne[1] (for GQA)
   int n_batch,          // Q->ne[3]
-  int len_q,            // Q->ne[1]
-  int len_kv,           // K->ne[1]
+  int len_q,            // Q->ne[2]
+  int len_kv,           // K->ne[2]
   float softmax_scale,  // from op_params[0]
   float max_bias,       // ALiBi max_bias from op_params[1]
   float m0,             // ALiBi base for h < n_head_log2
@@ -201,21 +209,21 @@ void attention_v5_kernel(
   uint32_t n_head_log2, // for ALiBi
   float logit_softcap,  // from op_params[2], 0 if disabled
   // Strides in ELEMENTS (not bytes) - supports non-contiguous tensors after ggml_permute
-  int stride_Q_row,     // Q->nb[1] / sizeof(T) - stride between sequence positions
-  int stride_Q_head,    // Q->nb[2] / sizeof(T) - stride between heads
+  int stride_Q_row,     // Q->nb[2] / sizeof(T) - stride between sequence positions
+  int stride_Q_head,    // Q->nb[1] / sizeof(T) - stride between heads
   int stride_Q_batch,   // Q->nb[3] / sizeof(T) - stride between batches
-  int stride_K_row,     // K->nb[1] / sizeof(T)
-  int stride_K_head,    // K->nb[2] / sizeof(T)
+  int stride_K_row,     // K->nb[2] / sizeof(T)
+  int stride_K_head,    // K->nb[1] / sizeof(T)
   int stride_K_batch,   // K->nb[3] / sizeof(T)
-  int stride_V_row,     // V->nb[1] / sizeof(T)
-  int stride_V_head,    // V->nb[2] / sizeof(T)
+  int stride_V_row,     // V->nb[2] / sizeof(T)
+  int stride_V_head,    // V->nb[1] / sizeof(T)
   int stride_V_batch,   // V->nb[3] / sizeof(T)
-  int stride_O_row,     // dst->nb[1] / sizeof(float)
-  int stride_O_head,    // dst->nb[2] / sizeof(float)
-  int stride_O_batch,   // dst->nb[3] / sizeof(float)
+  int stride_O_row,     // dst->nb[2] / sizeof(To)
+  int stride_O_head,    // dst->nb[1] / sizeof(To)
+  int stride_O_batch,   // dst->nb[3] / sizeof(To)
   // Mask strides (in elements, F16)
   int stride_mask_row,  // mask->nb[1] / sizeof(half) - stride between q positions
-  int stride_mask_batch)// mask->nb[2] / sizeof(half) - stride between batches
+  int stride_mask_batch)// mask->nb[3] / sizeof(half) - stride between batches
 {
   constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
@@ -530,13 +538,25 @@ void attention_v5_kernel(
       regs[2] /= rowsumexp[mma_id_q][1];
       regs[3] /= rowsumexp[mma_id_q][1];
 
-      // Write F32 output using stride_O_row (flash attention output is always F32)
+      // Write output with type-aware conversion (To can be float, half, or nv_bfloat16)
       // Boundary check: ensure we don't write past len_q
       if ((q_block_id * BLOCK_Q + row) < len_q) {
-          reinterpret_cast<float2 *>(O + (row + 0) * stride_O_row + col)[0] = make_float2(regs[0], regs[1]);
+          if constexpr (std::is_same_v<To, float>) {
+              reinterpret_cast<float2 *>(O + (row + 0) * stride_O_row + col)[0] = make_float2(regs[0], regs[1]);
+          } else if constexpr (std::is_same_v<To, half>) {
+              reinterpret_cast<half2 *>(O + (row + 0) * stride_O_row + col)[0] = __float22half2_rn(make_float2(regs[0], regs[1]));
+          } else if constexpr (std::is_same_v<To, nv_bfloat16>) {
+              reinterpret_cast<nv_bfloat162 *>(O + (row + 0) * stride_O_row + col)[0] = __float22bfloat162_rn(make_float2(regs[0], regs[1]));
+          }
       }
       if ((q_block_id * BLOCK_Q + row + 8) < len_q) {
-          reinterpret_cast<float2 *>(O + (row + 8) * stride_O_row + col)[0] = make_float2(regs[2], regs[3]);
+          if constexpr (std::is_same_v<To, float>) {
+              reinterpret_cast<float2 *>(O + (row + 8) * stride_O_row + col)[0] = make_float2(regs[2], regs[3]);
+          } else if constexpr (std::is_same_v<To, half>) {
+              reinterpret_cast<half2 *>(O + (row + 8) * stride_O_row + col)[0] = __float22half2_rn(make_float2(regs[2], regs[3]));
+          } else if constexpr (std::is_same_v<To, nv_bfloat16>) {
+              reinterpret_cast<nv_bfloat162 *>(O + (row + 8) * stride_O_row + col)[0] = __float22bfloat162_rn(make_float2(regs[2], regs[3]));
+          }
       }
     }
 }
@@ -557,17 +577,17 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];  // Causal mask, can be nullptr
 
-    // Tensor dimensions
+    // Tensor dimensions - Q, K, V are permuted to [D, n_heads, seq, batch]
     const int64_t ne00 = Q->ne[0];  // head_dim (D)
-    const int64_t ne01 = Q->ne[1];  // n_queries (seq_q)
-    const int64_t ne02 = Q->ne[2];  // n_heads_q
+    const int64_t ne01 = Q->ne[1];  // n_heads_q
+    const int64_t ne02 = Q->ne[2];  // n_queries (seq_q)
     const int64_t ne03 = Q->ne[3];  // batch
 
-    const int64_t ne11 = K->ne[1];  // n_kv (seq_kv)
-    const int64_t ne12 = K->ne[2];  // n_heads_kv (for GQA)
+    const int64_t ne11 = K->ne[1];  // n_heads_kv (for GQA)
+    const int64_t ne12 = K->ne[2];  // n_kv (seq_kv)
 
     GGML_ASSERT(ne00 == 128 && "attention_v5 only supports head_dim=128");
-    GGML_ASSERT(ne02 % ne12 == 0 && "n_heads_q must be divisible by n_heads_kv for GQA");
+    GGML_ASSERT(ne01 % ne11 == 0 && "n_heads_q must be divisible by n_heads_kv for GQA");
 
     // Verify innermost dimension is contiguous (required for vectorized loads)
     GGML_ASSERT(Q->nb[0] == ggml_type_size(Q->type) && "Q innermost dimension must be contiguous");
@@ -578,11 +598,11 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
     // Calculate dimensions for kernel
-    const int n_heads = ne02;
-    const int n_heads_kv = ne12;
+    const int n_heads = ne01;
+    const int n_heads_kv = ne11;
     const int n_batch = ne03;
-    const int len_q = ne01;
-    const int len_kv = ne11;
+    const int len_q = ne02;
+    const int len_kv = ne12;
 
     // Extract parameters from op_params (same as fattn-common.cuh)
     float scale         = 1.0f;
@@ -608,9 +628,6 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const int stride_mask_row   = mask ? (int)(mask->nb[1] / sizeof(half)) : 0;
     const int stride_mask_batch = mask ? (int)(mask->nb[3] / sizeof(half)) : 0;
 
-    // Output is always F32 for flash attention
-    float * dst_data = (float *)dst->data;
-
     // Kernel configuration (Blackwell optimized)
     constexpr int BLOCK_Q = 64;
     constexpr int BLOCK_KV = 64;
@@ -621,89 +638,107 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const int num_blocks = bs * ((len_q + BLOCK_Q - 1) / BLOCK_Q);
     const int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
-    // Dispatch based on input type (Q, K, V are F16 or BF16, output is F32)
+    // Get the CUDA stream from context (critical for multi-GPU correctness)
+    cudaStream_t main_stream = ctx.stream();
+
+    // Lambda to launch kernel with specific output type
+    auto launch_kernel_with_output_type = [&](auto input_type_tag) {
+        using T = typename decltype(input_type_tag)::type;
+        const T * Q_data = (const T *)Q->data;
+        const T * K_data = (const T *)K->data;
+        const T * V_data = (const T *)V->data;
+
+        // Input strides
+        const int stride_Q_row   = Q->nb[2] / sizeof(T);
+        const int stride_Q_head  = Q->nb[1] / sizeof(T);
+        const int stride_Q_batch = Q->nb[3] / sizeof(T);
+        const int stride_K_row   = K->nb[2] / sizeof(T);
+        const int stride_K_head  = K->nb[1] / sizeof(T);
+        const int stride_K_batch = K->nb[3] / sizeof(T);
+        const int stride_V_row   = V->nb[2] / sizeof(T);
+        const int stride_V_head  = V->nb[1] / sizeof(T);
+        const int stride_V_batch = V->nb[3] / sizeof(T);
+
+        const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(T);
+
+        if (dst->type == GGML_TYPE_F32) {
+            using To = float;
+            To * dst_data = (To *)dst->data;
+            const int stride_O_row   = dst->nb[2] / sizeof(To);
+            const int stride_O_head  = dst->nb[1] / sizeof(To);
+            const int stride_O_batch = dst->nb[3] / sizeof(To);
+
+            auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
+            if (smem_size > 48000) {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+            kernel<<<num_blocks, TB_SIZE, smem_size, main_stream>>>(
+                Q_data, K_data, V_data, mask_data, dst_data,
+                n_heads, n_heads_kv, n_batch, len_q, len_kv,
+                scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                stride_Q_row, stride_Q_head, stride_Q_batch,
+                stride_K_row, stride_K_head, stride_K_batch,
+                stride_V_row, stride_V_head, stride_V_batch,
+                stride_O_row, stride_O_head, stride_O_batch,
+                stride_mask_row, stride_mask_batch);
+
+        } else if (dst->type == GGML_TYPE_BF16) {
+            using To = nv_bfloat16;
+            To * dst_data = (To *)dst->data;
+            const int stride_O_row   = dst->nb[2] / sizeof(To);
+            const int stride_O_head  = dst->nb[1] / sizeof(To);
+            const int stride_O_batch = dst->nb[3] / sizeof(To);
+
+            auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
+            if (smem_size > 48000) {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+            kernel<<<num_blocks, TB_SIZE, smem_size, main_stream>>>(
+                Q_data, K_data, V_data, mask_data, dst_data,
+                n_heads, n_heads_kv, n_batch, len_q, len_kv,
+                scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                stride_Q_row, stride_Q_head, stride_Q_batch,
+                stride_K_row, stride_K_head, stride_K_batch,
+                stride_V_row, stride_V_head, stride_V_batch,
+                stride_O_row, stride_O_head, stride_O_batch,
+                stride_mask_row, stride_mask_batch);
+
+        } else if (dst->type == GGML_TYPE_F16) {
+            using To = half;
+            To * dst_data = (To *)dst->data;
+            const int stride_O_row   = dst->nb[2] / sizeof(To);
+            const int stride_O_head  = dst->nb[1] / sizeof(To);
+            const int stride_O_batch = dst->nb[3] / sizeof(To);
+
+            auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, T, To>;
+            if (smem_size > 48000) {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+            kernel<<<num_blocks, TB_SIZE, smem_size, main_stream>>>(
+                Q_data, K_data, V_data, mask_data, dst_data,
+                n_heads, n_heads_kv, n_batch, len_q, len_kv,
+                scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                stride_Q_row, stride_Q_head, stride_Q_batch,
+                stride_K_row, stride_K_head, stride_K_batch,
+                stride_V_row, stride_V_head, stride_V_batch,
+                stride_O_row, stride_O_head, stride_O_batch,
+                stride_mask_row, stride_mask_batch);
+        } else {
+            GGML_ABORT("attention_v5: unsupported output type");
+        }
+    };
+
+    struct type_tag_bf16 { using type = nv_bfloat16; };
+    struct type_tag_f16 { using type = half; };
+
+    // Dispatch based on input type
     if (Q->type == GGML_TYPE_BF16) {
         GGML_ASSERT(K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16);
-
-        const nv_bfloat16 * Q_data = (const nv_bfloat16 *)Q->data;
-        const nv_bfloat16 * K_data = (const nv_bfloat16 *)K->data;
-        const nv_bfloat16 * V_data = (const nv_bfloat16 *)V->data;
-
-        // Extract strides in elements (not bytes) for BF16
-        // Q/K/V have shape [D, seq, heads, batch] - nb[1] is stride between seq positions
-        const int stride_Q_row   = Q->nb[1] / sizeof(nv_bfloat16);
-        const int stride_Q_head  = Q->nb[2] / sizeof(nv_bfloat16);
-        const int stride_Q_batch = Q->nb[3] / sizeof(nv_bfloat16);
-        const int stride_K_row   = K->nb[1] / sizeof(nv_bfloat16);
-        const int stride_K_head  = K->nb[2] / sizeof(nv_bfloat16);
-        const int stride_K_batch = K->nb[3] / sizeof(nv_bfloat16);
-        const int stride_V_row   = V->nb[1] / sizeof(nv_bfloat16);
-        const int stride_V_head  = V->nb[2] / sizeof(nv_bfloat16);
-        const int stride_V_batch = V->nb[3] / sizeof(nv_bfloat16);
-        // Output has shape [D, heads, seq, batch] - dimensions 1,2 are SWAPPED vs Q!
-        // nb[1] is stride between heads, nb[2] is stride between seq positions
-        const int stride_O_row   = dst->nb[2] / sizeof(float);  // seq stride (dim 2)
-        const int stride_O_head  = dst->nb[1] / sizeof(float);  // head stride (dim 1)
-        const int stride_O_batch = dst->nb[3] / sizeof(float);
-
-        const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(nv_bfloat16);
-        auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, nv_bfloat16>;
-
-        if (smem_size > 48000) {
-            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        }
-
-        kernel<<<num_blocks, TB_SIZE, smem_size>>>(
-            Q_data, K_data, V_data, mask_data, dst_data,
-            n_heads, n_heads_kv, n_batch, len_q, len_kv,
-            scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-            stride_Q_row, stride_Q_head, stride_Q_batch,
-            stride_K_row, stride_K_head, stride_K_batch,
-            stride_V_row, stride_V_head, stride_V_batch,
-            stride_O_row, stride_O_head, stride_O_batch,
-            stride_mask_row, stride_mask_batch);
-
+        launch_kernel_with_output_type(type_tag_bf16{});
     } else {
-        // F16 path (used by Q8_0 and other quantized models)
+        // F16 path
         GGML_ASSERT(Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
-
-        const half * Q_data = (const half *)Q->data;
-        const half * K_data = (const half *)K->data;
-        const half * V_data = (const half *)V->data;
-
-        // Extract strides in elements (not bytes) for F16
-        // Q/K/V have shape [D, seq, heads, batch] - nb[1] is stride between seq positions
-        const int stride_Q_row   = Q->nb[1] / sizeof(half);
-        const int stride_Q_head  = Q->nb[2] / sizeof(half);
-        const int stride_Q_batch = Q->nb[3] / sizeof(half);
-        const int stride_K_row   = K->nb[1] / sizeof(half);
-        const int stride_K_head  = K->nb[2] / sizeof(half);
-        const int stride_K_batch = K->nb[3] / sizeof(half);
-        const int stride_V_row   = V->nb[1] / sizeof(half);
-        const int stride_V_head  = V->nb[2] / sizeof(half);
-        const int stride_V_batch = V->nb[3] / sizeof(half);
-        // Output has shape [D, heads, seq, batch] - dimensions 1,2 are SWAPPED vs Q!
-        // nb[1] is stride between heads, nb[2] is stride between seq positions
-        const int stride_O_row   = dst->nb[2] / sizeof(float);  // seq stride (dim 2)
-        const int stride_O_head  = dst->nb[1] / sizeof(float);  // head stride (dim 1)
-        const int stride_O_batch = dst->nb[3] / sizeof(float);
-
-        const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(half);
-        auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, half>;
-
-        if (smem_size > 48000) {
-            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        }
-
-        kernel<<<num_blocks, TB_SIZE, smem_size>>>(
-            Q_data, K_data, V_data, mask_data, dst_data,
-            n_heads, n_heads_kv, n_batch, len_q, len_kv,
-            scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-            stride_Q_row, stride_Q_head, stride_Q_batch,
-            stride_K_row, stride_K_head, stride_K_batch,
-            stride_V_row, stride_V_head, stride_V_batch,
-            stride_O_row, stride_O_head, stride_O_batch,
-            stride_mask_row, stride_mask_batch);
+        launch_kernel_with_output_type(type_tag_f16{});
     }
 
     CUDA_CHECK(cudaGetLastError());
@@ -732,6 +767,11 @@ bool ggml_cuda_flash_attn_ext_attention_v5_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // Output must be supported
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_BF16) {
+        return false;
+    }
+
     // Innermost dimension must be contiguous for vectorized loads (cp.async.cg 16-byte)
     if (Q->nb[0] != ggml_type_size(Q->type) ||
         K->nb[0] != ggml_type_size(K->type) ||
@@ -740,7 +780,8 @@ bool ggml_cuda_flash_attn_ext_attention_v5_supported(const ggml_tensor * dst) {
     }
 
     // GQA support: n_heads_q must be divisible by n_heads_kv
-    if (Q->ne[2] % K->ne[2] != 0) {
+    // Q, K, V are permuted to [D, n_heads, seq, batch], so ne[1] is n_heads
+    if (Q->ne[1] % K->ne[1] != 0) {
         return false;
     }
 
