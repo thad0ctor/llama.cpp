@@ -120,5 +120,6 @@ fi
         --parallel 1 \
         --port 5001 \
         --no-warmup \
-        --jinja
+        --jinja \
+        --n-predict 500
 } 2>&1 | stdbuf -oL tee -a "$LOG_FILE"
