@@ -770,3 +770,120 @@ namespace ggml_cuda_mma {
         NO_DEVICE_CODE;
     }
 }
+
+namespace ggml_cuda_wgmma {
+
+#ifdef BLACKWELL_WGMMA_AVAILABLE
+
+// Create shared memory descriptor for WGMMA operand B
+// smem_ptr must be 16-byte aligned, swizzle_bits from 0-3
+__device__ __forceinline__ uint64_t make_smem_desc(
+    const void* smem_ptr, 
+    uint32_t leading_dim_bytes,
+    uint32_t stride_dim_bytes,
+    uint32_t swizzle_bits = 3)  // 128-byte swizzle default
+{
+    uint32_t addr = __cvta_generic_to_shared(smem_ptr);
+    // Descriptor format per PTX ISA 8.5
+    uint64_t desc = addr;
+    desc |= (uint64_t(leading_dim_bytes >> 4) << 16);
+    desc |= (uint64_t(stride_dim_bytes >> 4) << 32);
+    desc |= (uint64_t(swizzle_bits) << 62);
+    return desc;
+}
+
+// WGMMA m64n64k16 FP16 -> FP32 accumulator
+// Requires 4 consecutive warps (warpgroup)
+__device__ __forceinline__ void wgmma_m64n64k16_f16_f32(
+    float* accum,           // 64 floats in registers per thread
+    const half* A_smem,     // 64x16 in shared memory
+    uint64_t B_desc,        // Descriptor for 16x64 B matrix
+    bool scale_D = true)
+{
+    uint32_t scale = scale_D ? 1 : 0;
+
+    asm volatile(
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
+        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
+        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+        " %16, %17, %18, %19, %20, %21, %22, %23, "
+        " %24, %25, %26, %27, %28, %29, %30, %31}, "
+        "[%32], %33, %34;"
+        : "+f"(accum[0]),  "+f"(accum[1]),  "+f"(accum[2]),  "+f"(accum[3]),
+          "+f"(accum[4]),  "+f"(accum[5]),  "+f"(accum[6]),  "+f"(accum[7]),
+          "+f"(accum[8]),  "+f"(accum[9]),  "+f"(accum[10]), "+f"(accum[11]),
+          "+f"(accum[12]), "+f"(accum[13]), "+f"(accum[14]), "+f"(accum[15]),
+          "+f"(accum[16]), "+f"(accum[17]), "+f"(accum[18]), "+f"(accum[19]),
+          "+f"(accum[20]), "+f"(accum[21]), "+f"(accum[22]), "+f"(accum[23]),
+          "+f"(accum[24]), "+f"(accum[25]), "+f"(accum[26]), "+f"(accum[27]),
+          "+f"(accum[28]), "+f"(accum[29]), "+f"(accum[30]), "+f"(accum[31])
+        : "l"(A_smem), "l"(B_desc), "r"(scale)
+        : "memory"
+    );
+}
+
+// Commit all pending WGMMA operations
+__device__ __forceinline__ void wgmma_commit_group() {
+    asm volatile("wgmma.commit_group.sync.aligned;");
+}
+
+// Wait for N groups to complete (0 = wait for all)
+__device__ __forceinline__ void wgmma_wait_group(int n = 0) {
+    if (n == 0) {
+        asm volatile("wgmma.wait_group.sync.aligned 0;");
+    } else if (n == 1) {
+        asm volatile("wgmma.wait_group.sync.aligned 1;");
+    }
+    // Add more cases as needed
+}
+
+// Fence before reading accumulator results
+__device__ __forceinline__ void wgmma_fence() {
+    asm volatile("wgmma.fence.sync.aligned;");
+}
+
+#else
+
+__device__ __forceinline__ uint64_t make_smem_desc(
+    const void* smem_ptr, 
+    uint32_t leading_dim_bytes,
+    uint32_t stride_dim_bytes,
+    uint32_t swizzle_bits = 3)
+{
+    GGML_UNUSED(smem_ptr);
+    GGML_UNUSED(leading_dim_bytes);
+    GGML_UNUSED(stride_dim_bytes);
+    GGML_UNUSED(swizzle_bits);
+    NO_DEVICE_CODE;
+    return 0;
+}
+
+__device__ __forceinline__ void wgmma_m64n64k16_f16_f32(
+    float* accum,
+    const half* A_smem,
+    uint64_t B_desc,
+    bool scale_D = true)
+{
+    GGML_UNUSED(accum);
+    GGML_UNUSED(A_smem);
+    GGML_UNUSED(B_desc);
+    GGML_UNUSED(scale_D);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void wgmma_commit_group() {
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void wgmma_wait_group(int n = 0) {
+    GGML_UNUSED(n);
+    NO_DEVICE_CODE;
+}
+
+__device__ __forceinline__ void wgmma_fence() {
+    NO_DEVICE_CODE;
+}
+
+#endif // BLACKWELL_WGMMA_AVAILABLE
+
+} // namespace ggml_cuda_wgmma

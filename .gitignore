@@ -45,6 +45,7 @@
 /tags
 /.build/
 /build*
+!/build.sh
 /release
 /debug
 /libllama.so
@@ -137,3 +138,7 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Custom build scripts
+/build_rtx5090_optimized.sh
+results.csv
