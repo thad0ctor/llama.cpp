@@ -147,13 +147,29 @@ if (CUDAToolkit_FOUND)
         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
     endif()
 
-    # sm_120 (RTX 5090): Maximize register usage to reduce spills
-    # 255 regs * 256 threads = 65,280 < 65,536 regs/SM
-    string(FIND "${CMAKE_CUDA_ARCHITECTURES}" "120" _sm120_found)
-    if (NOT _sm120_found EQUAL -1)
-        # Lower max registers to keep occupancy non-zero on Blackwell (sm_120)
-        list(APPEND CUDA_FLAGS --maxrregcount=224)
-        message(STATUS "sm_120: Adding --maxrregcount=224 for Blackwell occupancy")
+    # sm_120 (Blackwell) register limit for occupancy
+    # 224 regs * 256 threads = 57,344 < 65,536 regs/SM ensures non-zero occupancy
+    # IMPORTANT: Only apply when sm_120 is the sole architecture to avoid
+    # penalizing other architectures (e.g., sm_86) in multi-arch builds.
+    set(GGML_CUDA_SM120_MAXRREGCOUNT 224 CACHE STRING "Max register count for sm_120 Blackwell GPUs")
+
+    # Detect if we have sm_120 and count total architectures
+    set(_has_sm120 FALSE)
+    set(_arch_count 0)
+    foreach(ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        math(EXPR _arch_count "${_arch_count} + 1")
+        if (ARCH MATCHES "^120")
+            set(_has_sm120 TRUE)
+        endif()
+    endforeach()
+
+    # Only apply register limit if sm_120 is the ONLY architecture
+    if (_has_sm120 AND _arch_count EQUAL 1)
+        list(APPEND CUDA_FLAGS --maxrregcount=${GGML_CUDA_SM120_MAXRREGCOUNT})
+        message(STATUS "sm_120 only: Adding --maxrregcount=${GGML_CUDA_SM120_MAXRREGCOUNT} for Blackwell occupancy")
+    elseif (_has_sm120 AND _arch_count GREATER 1)
+        message(STATUS "Multi-arch build includes sm_120: register limit NOT applied (would affect other architectures)")
+        message(STATUS "  For optimal sm_120 performance, build separately with -DCMAKE_CUDA_ARCHITECTURES=120a-real")
     endif()
 
     if (GGML_FATAL_WARNINGS)

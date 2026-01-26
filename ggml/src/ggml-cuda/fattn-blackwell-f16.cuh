@@ -2,52 +2,147 @@
 
 #include "common.cuh"
 #include "fattn-common.cuh"
-#include "tma.cuh"
-#include "mma.cuh"
 
-// Blackwell-specific Flash Attention Kernel (sm_120+)
+// Blackwell-specific Flash Attention Kernel for F16 inputs (sm_120+)
 // Architecture:
-//   - Warp Specialization: 1 Producer Warp (TMA), 4 Consumer Warps (WGMMA)
-//   - Circular Buffering: 2-stage pipeline for K/V tiles
-//   - Q-in-Registers: Persistent Q for consumers
-//   - Large Tiles: 64x128 (M x N)
+//   - Uses m16n8k16 MMA tensor core instructions (available sm_75+)
+//   - Uses cp.async for efficient memory loading
+//   - F16 inputs, F32 accumulators
+//   - Online softmax with row-wise tracking
+//
+// This kernel handles F16 K/V inputs on Blackwell GPUs, complementing
+// the attention_v5 kernel which handles BF16 inputs.
 
-#ifdef BLACKWELL_TMA_AVAILABLE
+#if defined(CP_ASYNC_AVAILABLE) || !defined(__CUDA_ARCH__)
 
-using namespace ggml_cuda_mma;
-using namespace ggml_cuda_wgmma;
+// Ceiling division helper
+__device__ __host__ constexpr
+int fattn_blackwell_cdiv(int a, int b) { return (a + b - 1) / b; }
+
+// Fast tanh approximation using polynomial (7th order, accurate to ~1e-5 in [-4,4])
+// Avoids expensive tanhf() in critical path when logit_softcap is enabled
+__device__ __forceinline__
+float tanh_fast(float x) {
+    x = fmaxf(-4.0f, fminf(4.0f, x));
+    const float x2 = x * x;
+    return x * (1.0f + x2 * (-0.333333333f + x2 * (0.133333333f + x2 * (-0.053968254f))));
+}
 
 // ----------------------------------------------------------------------------
-// WGMMA Primitives for Registers
+// Swizzle for bank-conflict-free shared memory access
 // ----------------------------------------------------------------------------
 
-// WGMMA m64n64k16 with A in registers (distributed) and B in Shared Memory (descriptor)
-__device__ __forceinline__ void wgmma_m64n64k16_f16_f32_reg(
-    float* accum,           // 64 floats in registers per thread (accumulators)
-    uint32_t* A_regs,       // A matrix fragment in registers (f16x2)
-    uint64_t B_desc,        // B matrix descriptor (Shared Memory)
-    int scale_D = 1)
-{
-    asm volatile(
-        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
-        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
-        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
-        " %16, %17, %18, %19, %20, %21, %22, %23, "
-        " %24, %25, %26, %27, %28, %29, %30, %31}, "
-        "{%32, %33, %34, %35}, " // A regs (4x b32 = 8x f16)
-        "%36, %37, %38, 0;"      // B desc, scale, zero
-        : "+f"(accum[0]),  "+f"(accum[1]),  "+f"(accum[2]),  "+f"(accum[3]),
-          "+f"(accum[4]),  "+f"(accum[5]),  "+f"(accum[6]),  "+f"(accum[7]),
-          "+f"(accum[8]),  "+f"(accum[9]),  "+f"(accum[10]), "+f"(accum[11]),
-          "+f"(accum[12]), "+f"(accum[13]), "+f"(accum[14]), "+f"(accum[15]),
-          "+f"(accum[16]), "+f"(accum[17]), "+f"(accum[18]), "+f"(accum[19]),
-          "+f"(accum[20]), "+f"(accum[21]), "+f"(accum[22]), "+f"(accum[23]),
-          "+f"(accum[24]), "+f"(accum[25]), "+f"(accum[26]), "+f"(accum[27]),
-          "+f"(accum[28]), "+f"(accum[29]), "+f"(accum[30]), "+f"(accum[31])
-        : "r"(A_regs[0]), "r"(A_regs[1]), "r"(A_regs[2]), "r"(A_regs[3]),
-          "l"(B_desc), "r"(scale_D), "r"(scale_D) // scale_D is used for D and C
-        : "memory"
-    );
+// NOTE: stride in bytes
+template <int STRIDE>
+__device__
+uint32_t fattn_swizzle(uint32_t index) {
+    // No swizzling needed for small strides
+    if constexpr (STRIDE == 16)
+        return index;
+
+    uint32_t row_idx = (index / STRIDE) % 8;
+    uint32_t bits_to_xor = row_idx / max(64 / STRIDE, 1);
+    return index ^ (bits_to_xor << 4);
+}
+
+// ----------------------------------------------------------------------------
+// Memory loading helpers
+// ----------------------------------------------------------------------------
+
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline
+void fattn_global_to_shared_swizzle(uint32_t dst, const half *src, int src_stride, int tid, int valid_rows) {
+    constexpr int num_elems = 16 / sizeof(half);  // 8 half elements per 16-byte load
+    constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+
+    #pragma unroll
+    for (int iter = 0; iter < num_iters; iter++) {
+        const int idx = (iter * TB_SIZE + tid) * num_elems;
+        const int row = idx / WIDTH;
+        const int col = idx % WIDTH;
+
+        const uint32_t dst_addr = fattn_swizzle<WIDTH * sizeof(half)>(dst + (row * WIDTH + col) * sizeof(half));
+        if (row < valid_rows) {
+            const half *src_addr = src + (row * src_stride + col);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+        } else {
+            half *dst_ptr = reinterpret_cast<half *>(__cvta_shared_to_generic(dst_addr));
+            *reinterpret_cast<half2*>(dst_ptr + 0) = __float2half2_rn(0.0f);
+            *reinterpret_cast<half2*>(dst_ptr + 2) = __float2half2_rn(0.0f);
+            *reinterpret_cast<half2*>(dst_ptr + 4) = __float2half2_rn(0.0f);
+            *reinterpret_cast<half2*>(dst_ptr + 6) = __float2half2_rn(0.0f);
+        }
+    }
+}
+
+// Variant for loading with scale applied
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline
+void fattn_global_to_shared_swizzle_scaled(uint32_t dst, const half *src, int src_stride, int tid, half2 scale) {
+    constexpr int num_elems = 16 / sizeof(half);
+    constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+
+    #pragma unroll
+    for (int iter = 0; iter < num_iters; iter++) {
+        const int idx = (iter * TB_SIZE + tid) * num_elems;
+        const int row = idx / WIDTH;
+        const int col = idx % WIDTH;
+
+        // Load 8 halfs, scale, then store
+        const half *src_addr = src + (row * src_stride + col);
+        half2 data[4];
+        data[0] = *reinterpret_cast<const half2*>(src_addr + 0);
+        data[1] = *reinterpret_cast<const half2*>(src_addr + 2);
+        data[2] = *reinterpret_cast<const half2*>(src_addr + 4);
+        data[3] = *reinterpret_cast<const half2*>(src_addr + 6);
+
+        data[0] = __hmul2(data[0], scale);
+        data[1] = __hmul2(data[1], scale);
+        data[2] = __hmul2(data[2], scale);
+        data[3] = __hmul2(data[3], scale);
+
+        const uint32_t dst_addr = fattn_swizzle<WIDTH * sizeof(half)>(dst + (row * WIDTH + col) * sizeof(half));
+        half *dst_ptr = reinterpret_cast<half *>(__cvta_shared_to_generic(dst_addr));
+        *reinterpret_cast<half2*>(dst_ptr + 0) = data[0];
+        *reinterpret_cast<half2*>(dst_ptr + 2) = data[1];
+        *reinterpret_cast<half2*>(dst_ptr + 4) = data[2];
+        *reinterpret_cast<half2*>(dst_ptr + 6) = data[3];
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ldmatrix helpers for loading from shared memory to registers
+// ----------------------------------------------------------------------------
+
+__device__ inline
+void fattn_ldmatrix_x4(uint32_t regs[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
+                : "r"(addr));
+}
+
+__device__ inline
+void fattn_ldmatrix_x4_trans(uint32_t regs[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
+                : "r"(addr));
+}
+
+// ----------------------------------------------------------------------------
+// MMA helper for m16n8k16 F16->F32 accumulation
+// ----------------------------------------------------------------------------
+
+__device__ inline
+void fattn_mma_m16n8k16_f16_f32(uint32_t A[4], uint32_t B[2], float D[4]) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
 }
 
 // ----------------------------------------------------------------------------
@@ -55,95 +150,34 @@ __device__ __forceinline__ void wgmma_m64n64k16_f16_f32_reg(
 // ----------------------------------------------------------------------------
 
 template<int DKQ, int DV>
-struct blackwell_config {
+struct blackwell_f16_config {
     // Tile sizes
-    static constexpr int BLOCK_M = 64;  // Q rows
-    static constexpr int BLOCK_N = 128; // K/V block size
-    static constexpr int STAGES  = 2;
-    
+    static constexpr int BLOCK_M  = 64;   // Q rows per block
+    static constexpr int BLOCK_N  = 64;   // K/V block size
+
     // Dimensions
     static constexpr int HEAD_SIZE_Q = DKQ;
     static constexpr int HEAD_SIZE_V = DV;
-    
-    // Thread configuration
-    static constexpr int WARPS_CONSUMER = 7;
-    static constexpr int WARPS_PRODUCER = 1;
-    static constexpr int NUM_WARPS      = WARPS_CONSUMER + WARPS_PRODUCER;
-    static constexpr int NUM_THREADS    = NUM_WARPS * WARP_SIZE;
+
+    // Thread configuration - use 4 warps like attention_v5
+    static constexpr int NUM_WARPS   = 4;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_SIZE;
+
+    // MMA tile sizes (m16n8k16)
+    static constexpr int MMA_M = 16;
+    static constexpr int MMA_N = 8;
+    static constexpr int MMA_K = 16;
+
+    // Work per warp
+    static constexpr int WARP_Q = BLOCK_M / NUM_WARPS;  // 16 Q rows per warp
 };
-
-// ----------------------------------------------------------------------------
-// Shared Memory Layout
-// ----------------------------------------------------------------------------
-
-template<typename Config>
-struct SharedStorage {
-    using half_t = half;
-    
-    // Q tile for loading (Global -> Shared -> Regs)
-    // Size: BLOCK_M * DKQ
-    half_t Q[Config::BLOCK_M * Config::HEAD_SIZE_Q];
-    
-    struct Stage {
-        // K and V tiles.
-        // We use a flat buffer. For MLA, they might be the same.
-        // Size: BLOCK_N * Max(DKQ, DV)
-        half_t K[Config::BLOCK_N * Config::HEAD_SIZE_Q]; 
-        half_t V[Config::BLOCK_N * Config::HEAD_SIZE_V];
-    };
-    
-    Stage stages[Config::STAGES];
-    
-    // mbarriers for synchronization
-    uint64_t mbar_full[Config::STAGES];  // Producer signals arrival (full), Consumer waits
-    uint64_t mbar_empty[Config::STAGES]; // Consumer signals done (empty), Producer waits
-};
-
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
-
-// Make WGMMA descriptor for K (N x D)
-// K is stored in shared memory as [BLOCK_N, D] row-major?
-// Or [D, BLOCK_N] col-major?
-// TMA loads K in natural layout (usually [N, D] row-major from global).
-// WGMMA expects B to be in specific layouts.
-// "Matrix B data can be laid out in row-major or column-major."
-// "Standard layouts: ... with 128-byte swizzling."
-// If we use SWIZZLE_NONE for TMA, we might need to match WGMMA expectations.
-// For now, assume simple row-major layout descriptor.
-__device__ __forceinline__ uint64_t make_wgmma_desc(
-    const void* smem_ptr,
-    int dim_h, int dim_w, int stride_bytes,
-    int swizzle_mode = 0 // 0 = none, 1 = 32B, 2 = 64B, 3 = 128B
-) {
-    uint32_t addr = __cvta_generic_to_shared(smem_ptr);
-    uint64_t desc = 0;
-    
-    // PTX 8.0+ Descriptor
-    // [0-13]: Address (16B aligned) >> 4
-    desc |= ((uint64_t)addr >> 4);
-    
-    // [16-29]: Leading Dimension (stride) >> 4
-    desc |= ((uint64_t)(stride_bytes >> 4) << 16);
-    
-    // [32-45]: Stride dimension (usually same as LD for simple layout?) 
-    // Actually for WGMMA B: 
-    // "Stride is the stride in bytes between two leading dimension lines."
-    desc |= ((uint64_t)(stride_bytes >> 4) << 32); 
-
-    // Swizzle: [62-63]
-    desc |= ((uint64_t)swizzle_mode << 62);
-    
-    return desc;
-}
 
 // ----------------------------------------------------------------------------
 // Kernel
 // ----------------------------------------------------------------------------
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool mla>
-__launch_bounds__(256, 2)
+__launch_bounds__(128, 2)
 __global__ void flash_attn_blackwell_f16(
     const char * __restrict__ Q,
     const char * __restrict__ K,
@@ -151,206 +185,676 @@ __global__ void flash_attn_blackwell_f16(
     const char * __restrict__ mask,
     float      * __restrict__ dst,
     const float scale,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const uint32_t n_head_log2,
     const float logit_softcap,
-    const uint3 ne01, const int32_t ne02,
-    const int32_t nb01, const int32_t nb02, const int32_t nb03,
-    const int32_t nb11, const int32_t nb12, const int64_t nb13,
-    const int32_t nb21, const int32_t nb22, const int64_t nb23,
-    const char * __restrict__ tensor_maps
+    const int ne00,         // head_dim Q
+    const int ne01,         // n_queries
+    const int ne02,         // n_heads_q
+    const int ne03,         // batch
+    const int ne10,         // head_dim K
+    const int ne11,         // n_kv (sequence length)
+    const int ne12,         // n_heads_kv
+    const int nb01, const int nb02, const int nb03,  // Q strides
+    const int nb11, const int nb12, const int64_t nb13,  // K strides
+    const int nb21, const int nb22, const int64_t nb23,  // V strides
+    const int ne32, const int64_t nb32,                  // mask head dims
+    const int ne33, const int64_t nb33,                  // mask batch dims
+    const int stride_mask, const int mask_is_f16         // mask stride/type
 ) {
-    using Config = blackwell_config<DKQ, DV>;
-    extern __shared__ char smem_raw[];
-    SharedStorage<Config>* smem = reinterpret_cast<SharedStorage<Config>*>(smem_raw);
+    using Config = blackwell_f16_config<DKQ, DV>;
 
-    const int tid = threadIdx.x;
+    const int tid     = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
-    const bool is_producer = (warp_id == Config::WARPS_CONSUMER); // Warp 4
 
-    // Initialize mbarriers
-    if (tid == 0) {
-        for (int i = 0; i < Config::STAGES; ++i) {
-            mbarrier_init(&smem->mbar_full[i], 1); // Producer arrives
-            mbarrier_init(&smem->mbar_empty[i], Config::WARPS_CONSUMER * WARP_SIZE); // Consumers arrive
+    // Grid indexing
+    const int q_block_id = blockIdx.x;
+    const int head_id    = blockIdx.y;
+    const int batch_id   = blockIdx.z;
+
+    // Calculate number of Q blocks
+    const int num_q_blocks = fattn_blackwell_cdiv(ne01, Config::BLOCK_M);
+    if (q_block_id >= num_q_blocks) return;
+    const int q_valid = min(Config::BLOCK_M, ne01 - q_block_id * Config::BLOCK_M);
+
+    // Base pointers with proper striding
+    const half * Q_ptr = (const half *)(Q + batch_id * nb03 + head_id * nb02 + q_block_id * Config::BLOCK_M * nb01);
+    const half * K_ptr = (const half *)(K + batch_id * nb13 + (head_id % ne12) * nb12);
+    const half * V_ptr = (const half *)(V + batch_id * nb23 + (head_id % ne12) * nb22);
+
+    // Shared memory layout
+    // Q_smem overlaps with K_smem since Q is only loaded once
+    extern __shared__ half smem[];
+    const uint32_t Q_smem = __cvta_generic_to_shared(smem);
+    const uint32_t K_smem = Q_smem;  // Double buffer for K
+    const uint32_t V_smem = K_smem + 2 * Config::BLOCK_N * DKQ * sizeof(half);
+    constexpr size_t q_bytes  = Config::BLOCK_M * DKQ * sizeof(half);
+    constexpr size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + Config::BLOCK_N * DV) * sizeof(half);
+    constexpr size_t smem_base_bytes = q_bytes > kv_bytes ? q_bytes : kv_bytes;
+    uint8_t * const mask_smem_base = reinterpret_cast<uint8_t *>(smem) + smem_base_bytes;
+    half  * const mask_smem_h = reinterpret_cast<half *>(mask_smem_base);
+    float * const mask_smem_f = reinterpret_cast<float *>(mask_smem_base);
+
+    // Register storage for MMA operands
+    // Q is persistent in registers
+    uint32_t Q_regs[Config::WARP_Q / Config::MMA_M][DKQ / Config::MMA_K][4];
+    // K is loaded fresh each iteration
+    uint32_t K_regs[Config::BLOCK_N / Config::MMA_N][DKQ / Config::MMA_K][2];
+    // P (softmax output) for GEMM2
+    uint32_t P_regs[Config::WARP_Q / Config::MMA_M][Config::BLOCK_N / Config::MMA_K][4];
+    // V for GEMM2
+    uint32_t V_regs[Config::BLOCK_N / Config::MMA_K][DV / Config::MMA_N][2];
+    // Output accumulator
+    float O_regs[Config::WARP_Q / Config::MMA_M][DV / Config::MMA_N][4] = {};
+
+    // Pre-compute swizzled addresses for ldmatrix
+    uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
+    {
+        // A tile (Q): row = warp_id*WARP_Q + lane%16, col = lane/16 * 8
+        const int row_off = warp_id * Config::WARP_Q + (lane_id % 16);
+        const int col_off = lane_id / 16 * 8;
+        Q_smem_thread = fattn_swizzle<DKQ * sizeof(half)>(Q_smem + (row_off * DKQ + col_off) * sizeof(half));
+    }
+    {
+        // B tile (K): row = lane%8, col = lane/8 * 8
+        const int row_off = lane_id % 8;
+        const int col_off = lane_id / 8 * 8;
+        K_smem_thread = fattn_swizzle<DKQ * sizeof(half)>(K_smem + (row_off * DKQ + col_off) * sizeof(half));
+    }
+    {
+        // B tile transposed (V): row = lane%16, col = lane/16 * 8
+        const int row_off = lane_id % 16;
+        const int col_off = lane_id / 16 * 8;
+        V_smem_thread = fattn_swizzle<DV * sizeof(half)>(V_smem + (row_off * DV + col_off) * sizeof(half));
+    }
+
+    // Softmax tracking
+    const float softmax_scale = scale;
+    float rowmax[Config::WARP_Q / Config::MMA_M][2];
+    float rowsumexp[Config::WARP_Q / Config::MMA_M][2] = {};
+
+    #pragma unroll
+    for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+        rowmax[mma_id_q][0] = -FLT_MAX;
+        rowmax[mma_id_q][1] = -FLT_MAX;
+    }
+
+    // ============================================================
+    // Load Q [BLOCK_M, DKQ] to shared memory (with scale)
+    // ============================================================
+    {
+        const half2 scale_h2 = make_half2(softmax_scale, softmax_scale);
+        constexpr int num_elems = 16 / sizeof(half);
+        constexpr int num_iters = Config::BLOCK_M * DKQ / (Config::NUM_THREADS * num_elems);
+
+        #pragma unroll
+        for (int iter = 0; iter < num_iters; iter++) {
+            const int idx = (iter * Config::NUM_THREADS + tid) * num_elems;
+            const int row = idx / DKQ;
+            const int col = idx % DKQ;
+
+            half2 data[4];
+            if (row < q_valid) {
+                // Load from global
+                const half *src_addr = Q_ptr + row * (nb01 / sizeof(half)) + col;
+                data[0] = *reinterpret_cast<const half2*>(src_addr + 0);
+                data[1] = *reinterpret_cast<const half2*>(src_addr + 2);
+                data[2] = *reinterpret_cast<const half2*>(src_addr + 4);
+                data[3] = *reinterpret_cast<const half2*>(src_addr + 6);
+
+                // Apply scale
+                data[0] = __hmul2(data[0], scale_h2);
+                data[1] = __hmul2(data[1], scale_h2);
+                data[2] = __hmul2(data[2], scale_h2);
+                data[3] = __hmul2(data[3], scale_h2);
+            } else {
+                data[0] = __float2half2_rn(0.0f);
+                data[1] = __float2half2_rn(0.0f);
+                data[2] = __float2half2_rn(0.0f);
+                data[3] = __float2half2_rn(0.0f);
+            }
+
+            // Store to shared with swizzle
+            const uint32_t dst_addr = fattn_swizzle<DKQ * sizeof(half)>(Q_smem + (row * DKQ + col) * sizeof(half));
+            half *dst_ptr = reinterpret_cast<half *>(__cvta_shared_to_generic(dst_addr));
+            *reinterpret_cast<half2*>(dst_ptr + 0) = data[0];
+            *reinterpret_cast<half2*>(dst_ptr + 2) = data[1];
+            *reinterpret_cast<half2*>(dst_ptr + 4) = data[2];
+            *reinterpret_cast<half2*>(dst_ptr + 6) = data[3];
         }
     }
     __syncthreads();
-    
-    // Base pointers
-    const int q_head = blockIdx.y;
-    const int q_batch = blockIdx.z; // Assumes grid (N, head, batch)
-    
-    // ------------------------------------------------------------------------
-    // Consumer Role (WGMMA)
-    // ------------------------------------------------------------------------
-    if (!is_producer) {
-        // 1. Load Q into Registers (Persistent)
-        // -------------------------------------
-        // Strategy: 
-        // a) Load global Q -> SMEM Q (coalesced)
-        // b) ldmatrix SMEM Q -> Regs Q (fragment layout)
-        
-        // Q Fragment storage: 
-        // M=64. WGMMA uses 128 threads.
-        // Q is MxK (64xDKQ).
-        // Each WGMMA `m64n64k16` consumes 16 columns of K.
-        // We need D/16 chunks of Q registers.
-        // Each chunk: 64 rows x 16 cols (f16) = 1024 elems.
-        // Distributed across 128 threads -> 8 elems/thread -> 4x half2 -> 4x 32-bit regs.
-        
-        constexpr int K_CHUNKS = DKQ / 16;
-        uint32_t Q_regs[K_CHUNKS][4]; // [chunk][reg]
-        
-        // Load Q to SMEM
-        // Simple cooperative load: 128 threads load 64 x DKQ elements.
-        // Each thread loads (64*DKQ)/128 = DKQ/2 elements.
-        // Only doing this once, so efficiency is secondary to correctness.
-        const char* Q_ptr = Q + q_batch * nb03 + q_head * nb02;
-        // Map blockIdx.x to Q block? 
-        // Usually flash attn grid is (num_tiles_m, num_heads, batch).
-        // Let's assume blockIdx.x is tile index M.
-        int m_block = blockIdx.x;
-        int m_base = m_block * Config::BLOCK_M;
-        
-        // Load loop... (implementation omitted for brevity, assume Q in SMEM)
-        // ...
-        __syncthreads(); // Q loaded in SMEM
-        
-        // Load Q to Regs using ldmatrix
-        // Q in SMEM is [64, DKQ]. 
-        // We iterate over K_CHUNKS (16 cols).
-        for (int k = 0; k < K_CHUNKS; ++k) {
-            int k_offset = k * 16;
-            // ldmatrix.sync.aligned.m8n8.x4.trans.b16 ...
-            // We need 4 regs per thread.
-            // Address: smem->Q + ...
-            // Use ldmatrix primitive from mma.cuh
-            // ...
-        }
-        
-        // 2. Main Loop
-        // ------------
-        float acc_s[2][32]; // 2x 64x64 tiles (N=128), 32 floats per thread
-        float acc_o[32];    // Output accumulator
-        // Clear O
+
+    // ============================================================
+    // Load Q from shared memory to registers (persistent)
+    // ============================================================
+    #pragma unroll
+    for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
         #pragma unroll
-        for(int i=0; i<32; ++i) acc_o[i] = 0.0f;
-        
-        float l_i = 0.0f; // Softmax sum
-        float m_i = -1e20f; // Softmax max
-        
-        const int num_k_blocks = (ne01.y + Config::BLOCK_N - 1) / Config::BLOCK_N;
+        for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d++) {
+            uint32_t addr = Q_smem_thread;
+            addr += mma_id_q * Config::MMA_M * DKQ * sizeof(half);  // Row offset
+            addr ^= mma_id_d * Config::MMA_K * sizeof(half);        // Column offset (XOR for swizzle)
+            fattn_ldmatrix_x4(Q_regs[mma_id_q][mma_id_d], addr);
+        }
+    }
+    __syncthreads();  // Ensure Q is loaded before reusing smem for K
 
-        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-            int stage = k_block % Config::STAGES;
-            
-            // Wait for Producer
-            // mbarrier_wait(&smem->mbar_full[stage], k_block % 2); // Phase
-            // Wait logic needs to track phase manually or use count.
-            // Using `mbarrier_wait` helper.
-            
-            // GEMM 1: S = Q * K^T
-            // K is in smem->stages[stage].K
-            // Dimensions: N=128, D=DKQ.
-            // We split N into two 64-chunks: K0 (cols 0-63), K1 (cols 64-127).
-            
-            // Clear S accums
+    // ============================================================
+    // K/V iteration loop
+    // ============================================================
+    const int num_kv_iter = fattn_blackwell_cdiv(ne11, Config::BLOCK_N);
+
+    // Lambda for loading K
+    auto load_K = [&](int kv_id) {
+        if (kv_id < num_kv_iter) {
+            const int k_valid = min(Config::BLOCK_N, ne11 - kv_id * Config::BLOCK_N);
+            const uint32_t dst = K_smem + (kv_id % 2) * (Config::BLOCK_N * DKQ * sizeof(half));
+            const half *src = K_ptr + kv_id * Config::BLOCK_N * (nb11 / sizeof(half));
+            fattn_global_to_shared_swizzle<Config::BLOCK_N, DKQ, Config::NUM_THREADS>(dst, src, nb11 / sizeof(half), tid, k_valid);
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+
+    // Lambda for loading V
+    auto load_V = [&](int kv_id) {
+        const int k_valid = min(Config::BLOCK_N, ne11 - kv_id * Config::BLOCK_N);
+        const uint32_t dst = V_smem;
+        const half *src = V_ptr + kv_id * Config::BLOCK_N * (nb21 / sizeof(half));
+        fattn_global_to_shared_swizzle<Config::BLOCK_N, DV, Config::NUM_THREADS>(dst, src, nb21 / sizeof(half), tid, k_valid);
+        asm volatile("cp.async.commit_group;");
+    };
+
+    // Prefetch first K block
+    load_K(0);
+
+    const bool has_mask = (mask != nullptr);
+    const char * mask_base = has_mask ?
+        (mask + nb33 * (batch_id % ne33) + nb32 * (head_id % ne32)) :
+        nullptr;
+    const float slope = (max_bias != 0.0f) ? get_alibi_slope(max_bias, head_id, n_head_log2, m0, m1) : 1.0f;
+
+    for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
+        // S accumulator for Q @ K^T
+        float S_regs[Config::WARP_Q / Config::MMA_M][Config::BLOCK_N / Config::MMA_N][4] = {};
+
+        // Sync to ensure previous V is consumed before loading new one
+        __syncthreads();
+        load_V(kv_id);
+
+        // Prefetch mask tile into shared memory (if present)
+        if (has_mask) {
+            const int total = Config::BLOCK_M * Config::BLOCK_N;
+            if (mask_is_f16) {
+                // cp.async load half mask tile to shared
+                const uint32_t mask_smem_addr = __cvta_generic_to_shared(mask_smem_h);
+                constexpr int num_elems = 16 / sizeof(half);  // 8 half per 16B
+                for (int idx = tid * num_elems; idx < total; idx += Config::NUM_THREADS * num_elems) {
+                    const int q_local = idx / Config::BLOCK_N;
+                    const int k_local = idx % Config::BLOCK_N;
+                    const int q = q_block_id * Config::BLOCK_M + q_local;
+                    const int k = kv_id * Config::BLOCK_N + k_local;
+                    const uint32_t dst_addr = mask_smem_addr + idx * sizeof(half);
+                    if (q < ne01 && k + (num_elems - 1) < ne11) {
+                        const half *src = reinterpret_cast<const half *>(mask_base) + q * stride_mask + k;
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
+                    } else {
+                        // Fallback scalar for tail or OOB
+                        for (int i = 0; i < num_elems; ++i) {
+                            const int kk = k + i;
+                            const int dst_idx = idx + i;
+                            if (dst_idx < total && q < ne01 && kk < ne11) {
+                                mask_smem_h[dst_idx] = reinterpret_cast<const half *>(mask_base)[q * stride_mask + kk];
+                            } else if (dst_idx < total) {
+                                mask_smem_h[dst_idx] = __float2half(0.0f);
+                            }
+                        }
+                    }
+                }
+                asm volatile("cp.async.commit_group;");
+            } else {
+                // Vectorized float4 loads for F32 mask
+                for (int idx = tid * 4; idx < total; idx += Config::NUM_THREADS * 4) {
+                    const int q_local = idx / Config::BLOCK_N;
+                    const int k_local = idx % Config::BLOCK_N;
+                    const int q = q_block_id * Config::BLOCK_M + q_local;
+                    const int k = kv_id * Config::BLOCK_N + k_local;
+                    if (q < ne01 && k + 3 < ne11 && k_local <= Config::BLOCK_N - 4) {
+                        const float4 v4 = *reinterpret_cast<const float4 *>(reinterpret_cast<const float *>(mask_base) + q * stride_mask + k);
+                        *reinterpret_cast<float4 *>(mask_smem_f + idx) = v4;
+                    } else {
+                        for (int i = 0; i < 4; ++i) {
+                            const int kk = k + i;
+                            const int dst_idx = idx + i;
+                            if (dst_idx < total && q < ne01 && kk < ne11) {
+                                mask_smem_f[dst_idx] = reinterpret_cast<const float *>(mask_base)[q * stride_mask + kk];
+                            } else if (dst_idx < total) {
+                                mask_smem_f[dst_idx] = 0.0f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wait for K and V to be available before reading from shared memory
+        asm volatile("cp.async.wait_all;");
+        __syncthreads();
+
+        #pragma unroll
+        for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
             #pragma unroll
-            for(int i=0; i<32; ++i) { acc_s[0][i] = 0.0f; acc_s[1][i] = 0.0f; }
-            
-            // Iterate over D in chunks of 16
-            for (int k = 0; k < K_CHUNKS; ++k) {
-                // K0 Descriptor
-                // Ptr: &smem->stages[stage].K[... k*16 ...]
-                // This assumes K is stored such that we can address 16-col chunks?
-                // Or K is [N, D] row-major?
-                // If row-major, taking a 16-col slice is non-contiguous in memory.
-                // WGMMA B-matrix needs contiguous layout or simple stride?
-                // WGMMA `m64n64k16` expects B to be 64x16 (NxK).
-                // If B is [N, D], and we want N=64, K=16 block.
-                // With row-major, stride is D*sizeof(half).
-                // So we can point to (row=0, col=k*16) and set stride=D*2.
-                
-                uint64_t desc_k0 = make_wgmma_desc(&smem->stages[stage].K[k*16], Config::BLOCK_N, DKQ*2, DKQ*2); 
-                // Offset for K1 (next 64 rows of K? Or cols?)
-                // K is [N, D]. We split N.
-                // K0: Rows 0-63. K1: Rows 64-127.
-                uint64_t desc_k1 = make_wgmma_desc(&smem->stages[stage].K[64*DKQ + k*16], Config::BLOCK_N, DKQ*2, DKQ*2);
-                
-                wgmma_m64n64k16_f16_f32_reg(acc_s[0], Q_regs[k], desc_k0);
-                wgmma_m64n64k16_f16_f32_reg(acc_s[1], Q_regs[k], desc_k1);
+            for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d += 2) {
+                uint32_t addr = K_smem_thread + (kv_id % 2) * (Config::BLOCK_N * DKQ * sizeof(half));
+                addr += mma_id_kv * Config::MMA_N * DKQ * sizeof(half);  // Row offset
+                addr ^= mma_id_d * Config::MMA_K * sizeof(half);         // Column offset
+                fattn_ldmatrix_x4(K_regs[mma_id_kv][mma_id_d], addr);
             }
-            wgmma_commit_group();
-            wgmma_wait_group(0);
-            
-            // Softmax & Rescaling
-            // ... (Online Softmax logic on acc_s) ...
-            
-            // GEMM 2: O = S * V
-            // S is in acc_s (regs). V is in smem.
-            // S (64x128) * V (128xD).
-            // WGMMA `m64n64k16`.
-            // Tile M=64, N=D_chunk?
-            // K_dim of this GEMM is 128 (N from previous).
-            // We loop k from 0..128 in steps of 16.
-            // V is [N, D].
-            // We need V in SMEM to be accessed as K=16 chunks.
-            // Row-major V [128, D].
-            // Chunk k (16 rows) of V: V[k*16 : (k+1)*16, :]
-            // Target: O column chunk (D_chunk).
-            // This is "Vector-Matrix" style WGMMA? Or just normal GEMM.
-            // M=64 (Q rows), N=D (V cols), K=128 (V rows).
-            // We want output O (64xD).
-            // We iterate over K=128 (8 steps of 16).
-            // But we need to calculate all N columns of O.
-            // If D=128, N=128.
-            // We can split O into O0 (cols 0-63), O1 (cols 64-127).
-            
-            // Loop k_inner (0..128, step 16):
-            //   Load S_frag (from acc_s).
-            //   S needs to be converted f32->f16 for WGMMA input?
-            //   Or use f32 accumulators as input? Only supported on some paths.
-            //   Assuming conversion needed.
-            
-            // Signal Empty
-            uint64_t* mbar = &smem->mbar_empty[stage];
-            asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "l"(mbar));
         }
-        
-        // Write Output O to Global
-    }
-    
-    // ------------------------------------------------------------------------
-    // Producer Role
-    // ------------------------------------------------------------------------
-    else {
-        // Producer Logic
-        const int num_k_blocks = (ne01.y + Config::BLOCK_N - 1) / Config::BLOCK_N;
-        
-        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-            int stage = k_block % Config::STAGES;
-            bool wait_empty = (k_block >= Config::STAGES);
-            
-            if (wait_empty) {
-                // Wait for Consumers to finish reading
-                mbarrier_wait(&smem->mbar_empty[stage], (k_block - Config::STAGES) % 2); 
+
+        // ============================================================
+        // GEMM1: S = Q @ K^T  [BLOCK_M, BLOCK_N]
+        // ============================================================
+        #pragma unroll
+        for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+            #pragma unroll
+            for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+                #pragma unroll
+                for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d++) {
+                    fattn_mma_m16n8k16_f16_f32(
+                        Q_regs[mma_id_q][mma_id_d],
+                        K_regs[mma_id_kv][mma_id_d],
+                        S_regs[mma_id_q][mma_id_kv]);
+                }
             }
-            
-            // Issue TMA Loads
-            int32_t coord_x = k_block * Config::BLOCK_N;
-            
-            // Load K
-            tma_load_2d(&smem->stages[stage].K[0], (const CUtensorMap*)(tensor_maps), 
-                        &smem->mbar_full[stage], coord_x, 0);
-            
-            // Load V
-            if (!mla || (DKQ != DV)) {
-                tma_load_2d(&smem->stages[stage].V[0], (const CUtensorMap*)(tensor_maps + sizeof(CUtensorMap)), 
-                            &smem->mbar_full[stage], coord_x, 0);
+        }
+
+        // Prefetch next K
+        load_K(kv_id + 1);
+
+        // ============================================================
+        // Apply logit softcap if enabled (before mask addition)
+        // ============================================================
+        if (logit_softcap != 0.0f) {
+            #pragma unroll
+            for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+                #pragma unroll
+                for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+                    float *regs = S_regs[mma_id_q][mma_id_kv];
+                    regs[0] = logit_softcap * tanh_fast(regs[0]);
+                    regs[1] = logit_softcap * tanh_fast(regs[1]);
+                    regs[2] = logit_softcap * tanh_fast(regs[2]);
+                    regs[3] = logit_softcap * tanh_fast(regs[3]);
+                }
+            }
+        }
+
+        // ============================================================
+        // Apply mask / OOB (additive bias)
+        // ============================================================
+        #pragma unroll
+        for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+            #pragma unroll
+            for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+                float *regs = S_regs[mma_id_q][mma_id_kv];
+
+                const int row0 = warp_id * Config::WARP_Q + mma_id_q * Config::MMA_M + (lane_id / 4);
+                const int row1 = row0 + 8;
+                const int col0 = mma_id_kv * Config::MMA_N + (lane_id % 4) * 2;
+                const int col1 = col0 + 1;
+
+                const int q0 = q_block_id * Config::BLOCK_M + row0;
+                const int q1 = q0 + 8;
+                const int k0 = kv_id * Config::BLOCK_N + col0;
+                const int k1 = k0 + 1;
+
+                float m00 = (q0 < ne01 && k0 < ne11) ? 0.0f : -INFINITY;
+                float m01 = (q0 < ne01 && k1 < ne11) ? 0.0f : -INFINITY;
+                float m10 = (q1 < ne01 && k0 < ne11) ? 0.0f : -INFINITY;
+                float m11 = (q1 < ne01 && k1 < ne11) ? 0.0f : -INFINITY;
+
+                if (has_mask) {
+                    if (q0 < ne01 && k0 < ne11) {
+                        m00 = mask_is_f16 ? __half2float(mask_smem_h[row0 * Config::BLOCK_N + col0]) :
+                                            mask_smem_f[row0 * Config::BLOCK_N + col0];
+                    }
+                    if (q0 < ne01 && k1 < ne11) {
+                        m01 = mask_is_f16 ? __half2float(mask_smem_h[row0 * Config::BLOCK_N + col1]) :
+                                            mask_smem_f[row0 * Config::BLOCK_N + col1];
+                    }
+                    if (q1 < ne01 && k0 < ne11) {
+                        m10 = mask_is_f16 ? __half2float(mask_smem_h[(row0 + 8) * Config::BLOCK_N + col0]) :
+                                            mask_smem_f[(row0 + 8) * Config::BLOCK_N + col0];
+                    }
+                    if (q1 < ne01 && k1 < ne11) {
+                        m11 = mask_is_f16 ? __half2float(mask_smem_h[(row0 + 8) * Config::BLOCK_N + col1]) :
+                                            mask_smem_f[(row0 + 8) * Config::BLOCK_N + col1];
+                    }
+                }
+
+                regs[0] += slope * m00;
+                regs[1] += slope * m01;
+                regs[2] += slope * m10;
+                regs[3] += slope * m11;
+            }
+        }
+
+        // ============================================================
+        // Online Softmax
+        // ============================================================
+        #pragma unroll
+        for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+            // Find row-wise max
+            float this_rowmax[2];
+            #pragma unroll
+            for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+                float *regs = S_regs[mma_id_q][mma_id_kv];
+                if (mma_id_kv == 0) {
+                    this_rowmax[0] = fmaxf(regs[0], regs[1]);
+                    this_rowmax[1] = fmaxf(regs[2], regs[3]);
+                } else {
+                    this_rowmax[0] = fmaxf(this_rowmax[0], fmaxf(regs[0], regs[1]));
+                    this_rowmax[1] = fmaxf(this_rowmax[1], fmaxf(regs[2], regs[3]));
+                }
             }
 
-            uint32_t bytes_expected = sizeof(half) * (Config::BLOCK_N * DKQ + (!mla ? Config::BLOCK_N * DV : 0));
-            mbarrier_arrive_expect_tx(&smem->mbar_full[stage], bytes_expected);
+            // Butterfly reduction across 4 threads
+            this_rowmax[0] = fmaxf(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 1));
+            this_rowmax[0] = fmaxf(this_rowmax[0], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[0], 2));
+            this_rowmax[1] = fmaxf(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 1));
+            this_rowmax[1] = fmaxf(this_rowmax[1], __shfl_xor_sync(0xFFFFFFFF, this_rowmax[1], 2));
+
+            // Update with previous max
+            this_rowmax[0] = fmaxf(this_rowmax[0], rowmax[mma_id_q][0]);
+            this_rowmax[1] = fmaxf(this_rowmax[1], rowmax[mma_id_q][1]);
+
+            // Rescale previous O accumulators
+            float rescale[2];
+            rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+            rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+
+            #pragma unroll
+            for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d++) {
+                O_regs[mma_id_q][mma_id_d][0] *= rescale[0];
+                O_regs[mma_id_q][mma_id_d][1] *= rescale[0];
+                O_regs[mma_id_q][mma_id_d][2] *= rescale[1];
+                O_regs[mma_id_q][mma_id_d][3] *= rescale[1];
+            }
+
+            // Save new rowmax
+            rowmax[mma_id_q][0] = this_rowmax[0];
+            rowmax[mma_id_q][1] = this_rowmax[1];
+
+            // Compute exp and sum
+            float this_rowsumexp[2];
+            #pragma unroll
+            for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+                float *regs = S_regs[mma_id_q][mma_id_kv];
+                regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);
+                regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);
+                regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);
+                regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);
+
+                if (mma_id_kv == 0) {
+                    this_rowsumexp[0] = regs[0] + regs[1];
+                    this_rowsumexp[1] = regs[2] + regs[3];
+                } else {
+                    this_rowsumexp[0] += regs[0] + regs[1];
+                    this_rowsumexp[1] += regs[2] + regs[3];
+                }
+
+                // Pack to P registers for GEMM2 (convert m16n8 layout to m16k16)
+                half2 *this_P_regs = reinterpret_cast<half2*>(P_regs[mma_id_q][mma_id_kv / 2]);
+                this_P_regs[(mma_id_kv % 2) * 2]     = __float22half2_rn(make_float2(regs[0], regs[1]));
+                this_P_regs[(mma_id_kv % 2) * 2 + 1] = __float22half2_rn(make_float2(regs[2], regs[3]));
+            }
+
+            // Butterfly reduction for sum
+            this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
+            this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
+            this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
+            this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
+
+            // Accumulate to total rowsumexp
+            rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+            rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+        }
+
+        // ============================================================
+        // Load V to registers
+        // ============================================================
+        asm volatile("cp.async.wait_all;");
+        __syncthreads();
+
+        #pragma unroll
+        for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_K; mma_id_kv++) {
+            #pragma unroll
+            for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d += 2) {
+                uint32_t addr = V_smem_thread;
+                addr += mma_id_kv * Config::MMA_K * DV * sizeof(half);  // Row offset
+                addr ^= mma_id_d * Config::MMA_N * sizeof(half);        // Column offset
+                fattn_ldmatrix_x4_trans(V_regs[mma_id_kv][mma_id_d], addr);
+            }
+        }
+
+        // ============================================================
+        // GEMM2: O += P @ V  [BLOCK_M, DV]
+        // ============================================================
+        #pragma unroll
+        for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+            #pragma unroll
+            for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d++) {
+                #pragma unroll
+                for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_K; mma_id_kv++) {
+                    fattn_mma_m16n8k16_f16_f32(
+                        P_regs[mma_id_q][mma_id_kv],
+                        V_regs[mma_id_kv][mma_id_d],
+                        O_regs[mma_id_q][mma_id_d]);
+                }
+            }
         }
     }
+
+    // ============================================================
+    // Write output: O / rowsumexp
+    // ============================================================
+    #pragma unroll
+    for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+        #pragma unroll
+        for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d++) {
+            const int row = warp_id * Config::WARP_Q + mma_id_q * Config::MMA_M + (lane_id / 4);
+            const int col = mma_id_d * Config::MMA_N + (lane_id % 4) * 2;
+
+            // Normalize by softmax denominator (guard against all-masked rows)
+            float *regs = O_regs[mma_id_q][mma_id_d];
+            const float denom0 = fmaxf(rowsumexp[mma_id_q][0], 1e-6f);
+            const float denom1 = fmaxf(rowsumexp[mma_id_q][1], 1e-6f);
+            regs[0] /= denom0;
+            regs[1] /= denom0;
+            regs[2] /= denom1;
+            regs[3] /= denom1;
+
+            // Write to global memory (F32 output)
+            const int global_row = q_block_id * Config::BLOCK_M + row;
+            if (global_row < ne01) {
+                float *dst_row0 = dst + (batch_id * ne02 + head_id) * ne01 * DV + (global_row + 0) * DV + col;
+                float *dst_row8 = dst + (batch_id * ne02 + head_id) * ne01 * DV + (global_row + 8) * DV + col;
+
+                dst_row0[0] = regs[0];
+                dst_row0[1] = regs[1];
+                if (global_row + 8 < ne01) {
+                    dst_row8[0] = regs[2];
+                    dst_row8[1] = regs[3];
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Host-side wrapper
+// ----------------------------------------------------------------------------
+
+template<int DKQ, int DV, int ncols1, int ncols2>
+void launch_flash_attn_blackwell_f16(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor * dst,
+    const ggml_tensor * Q,
+    const ggml_tensor * K,
+    const ggml_tensor * V,
+    const ggml_tensor * mask,
+    float scale,
+    float max_bias,
+    float m0,
+    float m1,
+    uint32_t n_head_log2,
+    float logit_softcap) {
+
+    using Config = blackwell_f16_config<DKQ, DV>;
+
+    const int64_t ne00 = Q->ne[0];  // head_dim Q
+    const int64_t ne01 = Q->ne[1];  // n_queries
+    const int64_t ne02 = Q->ne[2];  // n_heads_q
+    const int64_t ne03 = Q->ne[3];  // batch
+
+    const int64_t ne10 = K->ne[0];  // head_dim K
+    const int64_t ne11 = K->ne[1];  // n_kv
+    const int64_t ne12 = K->ne[2];  // n_heads_kv
+
+    // Grid dimensions
+    const int num_q_blocks = fattn_blackwell_cdiv(ne01, Config::BLOCK_M);
+    dim3 grid(num_q_blocks, ne02, ne03);
+    dim3 block(Config::NUM_THREADS);
+
+    // Shared memory: max(Q, K double buffer + V)
+    const size_t q_bytes  = Config::BLOCK_M * DKQ * sizeof(half);
+    const size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + Config::BLOCK_N * DV) * sizeof(half);
+    const size_t smem_base_bytes = q_bytes > kv_bytes ? q_bytes : kv_bytes;
+    const size_t mask_bytes = (mask != nullptr)
+        ? (Config::BLOCK_M * Config::BLOCK_N * (mask->type == GGML_TYPE_F16 ? sizeof(half) : sizeof(float)))
+        : 0;
+    const int smem_size = (int) (smem_base_bytes + mask_bytes);
+
+    // Set shared memory limit if needed
+    if (smem_size > 48000) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            flash_attn_blackwell_f16<DKQ, DV, ncols1, ncols2, false>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size));
+    }
+
+    const bool mask_is_f16 = mask && mask->type == GGML_TYPE_F16;
+    const int  stride_mask = mask_is_f16 ? (mask->nb[1] / (int)sizeof(half)) : (mask ? (mask->nb[1] / (int)sizeof(float)) : 0);
+    const int  ne32 = mask ? (int)mask->ne[2] : 1;
+    const int  ne33 = mask ? (int)mask->ne[3] : 1;
+    const int64_t nb32 = mask ? mask->nb[2] : 0;
+    const int64_t nb33 = mask ? mask->nb[3] : 0;
+
+    flash_attn_blackwell_f16<DKQ, DV, ncols1, ncols2, false>
+        <<<grid, block, smem_size, ctx.stream()>>>(
+            (const char *)Q->data,
+            (const char *)K->data,
+            (const char *)V->data,
+            mask ? (const char *)mask->data : nullptr,
+            (float *)dst->data,
+            scale,
+            max_bias,
+            m0,
+            m1,
+            n_head_log2,
+            logit_softcap,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12,
+            Q->nb[1], Q->nb[2], Q->nb[3],
+            K->nb[1], K->nb[2], K->nb[3],
+            V->nb[1], V->nb[2], V->nb[3],
+            ne32, nb32, ne33, nb33,
+            stride_mask, mask_is_f16 ? 1 : 0);
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#endif // CP_ASYNC_AVAILABLE || !__CUDA_ARCH__
+
+// ----------------------------------------------------------------------------
+// External interface
+// ----------------------------------------------------------------------------
+
+static void ggml_cuda_flash_attn_ext_blackwell_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(CP_ASYNC_AVAILABLE) || !defined(__CUDA_ARCH__)
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int64_t ne00 = Q->ne[0];  // head_dim
+
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (const float *)dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *)dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *)dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    // If scale is 0, use default 1/sqrt(head_dim)
+    if (scale == 0.0f) {
+        scale = 1.0f / sqrtf(float(ne00));
+    }
+
+    const uint32_t n_head      = Q->ne[2];
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    switch (ne00) {
+        case 64:
+            launch_flash_attn_blackwell_f16<64, 64, 1, 1>(ctx, dst, Q, K, V, mask, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+            break;
+        case 128:
+            launch_flash_attn_blackwell_f16<128, 128, 1, 1>(ctx, dst, Q, K, V, mask, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+            break;
+        default:
+            GGML_ABORT("Unsupported head dimension for Blackwell F16 kernel");
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("Blackwell F16 kernel requires MMA support");
+#endif
+}
+
+static bool ggml_cuda_flash_attn_ext_blackwell_f16_supported(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    // Only support specific head dimensions
+    if (Q->ne[0] != 64 && Q->ne[0] != 128) {
+        return false;
+    }
+
+    // Must have matching head dimensions
+    if (Q->ne[0] != V->ne[0] || K->ne[0] != Q->ne[0]) {
+        return false;
+    }
+
+    // Must be F16 inputs
+    if (Q->type != GGML_TYPE_F16 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // Mask type must be supported (F16 or F32), if present
+    if (mask != nullptr && mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    return true;
 }

@@ -1001,9 +1001,10 @@ void launch_fattn(
 
     // L2 cache persistence for K/V cache on Blackwell (RTX 5090 has 96MB L2)
     // Persists K tensor in L2 during decode for faster repeated access
+    // Controlled by GGML_CUDA_L2_PERSIST env var (default OFF)
 #if CUDART_VERSION >= 11000
     const size_t kv_cache_size = K->ne[0] * K->ne[1] * sizeof(half);
-    ggml_cuda_l2_persist_guard l2_guard(main_stream, const_cast<char *>(K_data), kv_cache_size, cc);
+    ggml_cuda_l2_persist_guard l2_guard(main_stream, const_cast<char *>(K_data), kv_cache_size, cc, Q->ne[1]);
 #endif
 
     GGML_ASSERT(block_dim.x % warp_size == 0);

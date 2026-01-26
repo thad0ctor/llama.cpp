@@ -4,8 +4,18 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-blackwell-f16.cuh"
 #include "fattn.cuh"
 #include "attention_v5.cuh"
+
+#include <cstdlib>
+#include <cstdio>
+
+// Environment variable controls for Blackwell Flash Attention dispatch
+// GGML_CUDA_NO_ATTENTION_V5: Disable attention_v5 (BF16) kernel, fall back to MMA/vec
+// GGML_CUDA_NO_BLACKWELL_F16: Disable Blackwell F16 kernel, fall back to MMA/vec
+static bool ggml_cuda_no_attention_v5 = (getenv("GGML_CUDA_NO_ATTENTION_V5") != nullptr);
+static bool ggml_cuda_no_blackwell_f16 = (getenv("GGML_CUDA_NO_BLACKWELL_F16") != nullptr);
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -210,11 +220,38 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_WMMA_F16     = 300,
     BEST_FATTN_KERNEL_MMA_F16      = 400,
     BEST_FATTN_KERNEL_ATTENTION_V5 = 500,  // SM_120 (Blackwell) BF16 optimized
+    BEST_FATTN_KERNEL_BLACKWELL_F16 = 510, // SM_120 (Blackwell) F16 optimized
 };
+
+static const char * ggml_cuda_last_fattn_skip_reason = nullptr;
+
+static void ggml_cuda_log_fattn_skip_once(const char * reason, const ggml_tensor * dst) {
+    ggml_cuda_last_fattn_skip_reason = reason;
+    static int logged = 0;
+    if (logged++ != 0) {
+        return;
+    }
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    fprintf(stderr,
+        "flash_attn_ext skipped: %s | cc=%d Q=(%s)[%d,%d,%d,%d] K=(%s)[%d,%d,%d,%d] V=(%s)[%d,%d,%d,%d] mask=%s[%d,%d,%d,%d]\n",
+        reason,
+        cc,
+        ggml_type_name(Q->type), (int) Q->ne[0], (int) Q->ne[1], (int) Q->ne[2], (int) Q->ne[3],
+        ggml_type_name(K->type), (int) K->ne[0], (int) K->ne[1], (int) K->ne[2], (int) K->ne[3],
+        ggml_type_name(V->type), (int) V->ne[0], (int) V->ne[1], (int) V->ne[2], (int) V->ne[3],
+        mask ? ggml_type_name(mask->type) : "null",
+        mask ? (int) mask->ne[0] : 0, mask ? (int) mask->ne[1] : 0, mask ? (int) mask->ne[2] : 0, mask ? (int) mask->ne[3] : 0);
+    fflush(stderr);
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
+    ggml_cuda_log_fattn_skip_once("FLASH_ATTN_AVAILABLE not set", dst);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
@@ -246,23 +283,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case 112:
         case 256:
             if (V->ne[0] != K->ne[0]) {
+                ggml_cuda_log_fattn_skip_once("V head dim != K head dim", dst);
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
         case 576:
             if (V->ne[0] != 512) {
+                ggml_cuda_log_fattn_skip_once("K head dim 576 requires V head dim 512", dst);
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (!gqa_opt_applies || gqa_ratio % 16 != 0) {
+                ggml_cuda_log_fattn_skip_once("K head dim 576 requires gqa_opt and gqa_ratio % 16 == 0", dst);
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
         default:
+            ggml_cuda_log_fattn_skip_once("unsupported head dim", dst);
             return BEST_FATTN_KERNEL_NONE;
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
+        ggml_cuda_log_fattn_skip_once("K/V type mismatch (FA_ALL_QUANTS off)", dst);
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -275,22 +317,36 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
 #ifndef GGML_CUDA_FA_ALL_QUANTS
+            ggml_cuda_log_fattn_skip_once("quant type requires FA_ALL_QUANTS", dst);
             return BEST_FATTN_KERNEL_NONE;
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             break;
         default:
+            ggml_cuda_log_fattn_skip_once("unsupported K type", dst);
             return BEST_FATTN_KERNEL_NONE;
     }
 
     if (mask && mask->ne[2] != 1) {
+        ggml_cuda_log_fattn_skip_once("mask ne[2] != 1", dst);
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // SM_120 (Blackwell): Use optimized attention_v5 kernel if supported
-    if (cc >= GGML_CUDA_CC_BLACKWELL && ggml_cuda_flash_attn_ext_attention_v5_supported(dst)) {
-        return BEST_FATTN_KERNEL_ATTENTION_V5;
+    // SM_120 (Blackwell): Dispatch to Blackwell-specific kernels
+    // Controlled by environment variables:
+    //   GGML_CUDA_NO_ATTENTION_V5: Disable attention_v5 (BF16), fall back to MMA/vec
+    //   GGML_CUDA_NO_BLACKWELL_F16: Disable Blackwell F16, fall back to MMA/vec
+    if (cc >= GGML_CUDA_CC_BLACKWELL) {
+        // Use attention_v5 (BF16) if supported and not disabled
+        if (!ggml_cuda_no_attention_v5 && ggml_cuda_flash_attn_ext_attention_v5_supported(dst)) {
+            return BEST_FATTN_KERNEL_ATTENTION_V5;
+        }
+        // Use Blackwell F16 kernel for F16 inputs if not disabled
+        if (!ggml_cuda_no_blackwell_f16 && ggml_cuda_flash_attn_ext_blackwell_f16_supported(dst)) {
+            return BEST_FATTN_KERNEL_BLACKWELL_F16;
+        }
+        // Fall through to MMA/vec kernels below when Blackwell kernels are disabled or not applicable
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -363,7 +419,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const char * kernel_name = "unknown";
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_TILE:          kernel_name = "tile"; break;
+        case BEST_FATTN_KERNEL_VEC:           kernel_name = "vec"; break;
+        case BEST_FATTN_KERNEL_WMMA_F16:      kernel_name = "wmma_f16"; break;
+        case BEST_FATTN_KERNEL_MMA_F16:       kernel_name = "mma_f16"; break;
+        case BEST_FATTN_KERNEL_ATTENTION_V5:  kernel_name = "attention_v5_bf16"; break;
+        case BEST_FATTN_KERNEL_BLACKWELL_F16: kernel_name = "blackwell_f16"; break;
+        default: break;
+    }
+    fprintf(stderr, "ggml_cuda_flash_attn_ext: kernel=%s\n", kernel_name);
+    fflush(stderr);
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -381,9 +450,33 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_ATTENTION_V5:
             ggml_cuda_flash_attn_ext_attention_v5(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_BLACKWELL_F16:
+            ggml_cuda_flash_attn_ext_blackwell_f16(ctx, dst);
+            break;
     }
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    if (kernel == BEST_FATTN_KERNEL_NONE) {
+        static int logged = 0;
+        if (logged++ == 0) {
+            const ggml_tensor * Q    = dst->src[0];
+            const ggml_tensor * K    = dst->src[1];
+            const ggml_tensor * V    = dst->src[2];
+            const ggml_tensor * mask = dst->src[3];
+            const char * reason = ggml_cuda_last_fattn_skip_reason ? ggml_cuda_last_fattn_skip_reason : "no suitable kernel";
+            fprintf(stderr,
+                "ggml_cuda_flash_attn_ext_supported: rejected: %s | head_dim=%d Q=%s K=%s V=%s mask=%s[%d,%d,%d,%d]\n",
+                reason,
+                (int) Q->ne[0],
+                ggml_type_name(Q->type),
+                ggml_type_name(K->type),
+                ggml_type_name(V->type),
+                mask ? ggml_type_name(mask->type) : "null",
+                mask ? (int) mask->ne[0] : 0, mask ? (int) mask->ne[1] : 0, mask ? (int) mask->ne[2] : 0, mask ? (int) mask->ne[3] : 0);
+            fflush(stderr);
+        }
+    }
+    return kernel != BEST_FATTN_KERNEL_NONE;
 }

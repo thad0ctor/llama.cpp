@@ -1407,6 +1407,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    const bool fa_requested = cparams.flash_attn;
+    bool fa_built = false;
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1420,14 +1422,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    if (cparams.flash_attn && kq_b == nullptr) {
+    if (fa_requested && kq_b == nullptr) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
+        // Cast Q/K/V to F16 for Flash Attention
+        // K/V: typically already F16 from KV cache, but may be F32 for embedding models
+        // Q: cast to F16 to enable optimized Blackwell kernels (which require all F16)
+        if (q->type == GGML_TYPE_F32) {
+            q = ggml_cast(ctx0, q, GGML_TYPE_F16);
+        }
+
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
@@ -1438,6 +1446,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        fa_built = true;
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -1462,6 +1471,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        if (fa_requested && kq_b != nullptr) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: Flash Attention skipped: KQ bias is present (kq_b != nullptr)\n", __func__);
+            }
+        }
+        if (fa_requested && !fa_built) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_WARN(
+                    "%s: Flash Attention not built: kq_b=%s[%d,%d,%d,%d] kq_mask=%s[%d,%d,%d,%d] fa_built=%d\n",
+                    __func__,
+                    kq_b ? ggml_type_name(kq_b->type) : "null",
+                    kq_b ? (int) kq_b->ne[0] : 0, kq_b ? (int) kq_b->ne[1] : 0, kq_b ? (int) kq_b->ne[2] : 0, kq_b ? (int) kq_b->ne[3] : 0,
+                    kq_mask ? ggml_type_name(kq_mask->type) : "null",
+                    kq_mask ? (int) kq_mask->ne[0] : 0, kq_mask ? (int) kq_mask->ne[1] : 0, kq_mask ? (int) kq_mask->ne[2] : 0, kq_mask ? (int) kq_mask->ne[3] : 0,
+                    fa_built ? 1 : 0);
+            }
+        }
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 

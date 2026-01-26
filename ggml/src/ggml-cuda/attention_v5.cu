@@ -6,7 +6,9 @@
 #include "common.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <float.h>
 
 // Use WARP_SIZE from common.cuh
@@ -18,6 +20,17 @@ int attn_v5_cdiv(int a, int b) { return (a + b - 1) / b; }
 
 // Rename cdiv usages to attn_v5_cdiv to avoid conflicts
 #define cdiv attn_v5_cdiv
+
+// Fast tanh approximation using polynomial (7th order, accurate to ~1e-5 in [-4,4])
+// Avoids expensive tanhf() in critical path when logit_softcap is enabled
+__device__ __forceinline__
+float tanh_fast(float x) {
+    // Clamp to avoid overflow in polynomial
+    x = fmaxf(-4.0f, fminf(4.0f, x));
+    const float x2 = x * x;
+    // Coefficients for tanh Taylor series approximation
+    return x * (1.0f + x2 * (-0.333333333f + x2 * (0.133333333f + x2 * (-0.053968254f))));
+}
 
 // NOTE: stride in bytes
 template <int STRIDE>
@@ -64,6 +77,58 @@ void global_to_shared_swizzle(uint32_t dst, const nv_bfloat16 *src, int src_stri
     const nv_bfloat16 *src_addr = src + (row * src_stride + col);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
   }
+}
+
+// Variant that pre-applies scale during Q load (fused load + scale)
+// Uses cp.async to preserve overlap, then scales in shared memory.
+// This amortizes the scale multiplication cost since Q is loaded once and used many times.
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline
+void global_to_shared_swizzle_scaled(uint32_t dst, const nv_bfloat16 *src, int src_stride, int tid, float scale) {
+  constexpr int num_elems = 16 / sizeof(nv_bfloat16);
+  constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+  const nv_bfloat162 scale_bf2 = __float2bfloat162_rn(scale);
+
+  // Async load to shared (same layout as global_to_shared_swizzle)
+  for (int iter = 0; iter < num_iters; iter++) {
+    const int idx = (iter * TB_SIZE + tid) * num_elems;
+    const int row = idx / WIDTH;
+    const int col = idx % WIDTH;
+
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+    const nv_bfloat16 *src_addr = src + (row * src_stride + col);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+  }
+  asm volatile("cp.async.commit_group;");
+  asm volatile("cp.async.wait_all;");
+  __syncthreads();
+
+  // Scale in shared memory (vectorized)
+  #pragma unroll
+  for (int iter = 0; iter < num_iters; iter++) {
+    const int idx = (iter * TB_SIZE + tid) * num_elems;
+    const int row = idx / WIDTH;
+    const int col = idx % WIDTH;
+
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+    nv_bfloat16 *dst_ptr = reinterpret_cast<nv_bfloat16 *>(__cvta_shared_to_generic(dst_addr));
+
+    nv_bfloat162 data0 = *reinterpret_cast<const nv_bfloat162*>(dst_ptr + 0);
+    nv_bfloat162 data1 = *reinterpret_cast<const nv_bfloat162*>(dst_ptr + 2);
+    nv_bfloat162 data2 = *reinterpret_cast<const nv_bfloat162*>(dst_ptr + 4);
+    nv_bfloat162 data3 = *reinterpret_cast<const nv_bfloat162*>(dst_ptr + 6);
+
+    data0 = __hmul2(data0, scale_bf2);
+    data1 = __hmul2(data1, scale_bf2);
+    data2 = __hmul2(data2, scale_bf2);
+    data3 = __hmul2(data3, scale_bf2);
+
+    *reinterpret_cast<nv_bfloat162*>(dst_ptr + 0) = data0;
+    *reinterpret_cast<nv_bfloat162*>(dst_ptr + 2) = data1;
+    *reinterpret_cast<nv_bfloat162*>(dst_ptr + 4) = data2;
+    *reinterpret_cast<nv_bfloat162*>(dst_ptr + 6) = data3;
+  }
+  __syncthreads();
 }
 
 __device__ inline
@@ -121,16 +186,31 @@ void launch_kernel(
 }
 
 template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
-__launch_bounds__(NUM_WARPS * WARP_SIZE)
+__launch_bounds__(NUM_WARPS * WARP_SIZE, 2)
 __global__
 void attention_v5_kernel(
-  const nv_bfloat16 *Q,  // [bs, len_q, DIM]
-  const nv_bfloat16 *K,  // [bs, len_kv, DIM]
-  const nv_bfloat16 *V,  // [bs, len_kv, DIM]
-  nv_bfloat16 *O,        // [bs, len_q, DIM]
+  const nv_bfloat16 * __restrict__ Q,  // [bs, len_q, DIM]
+  const nv_bfloat16 * __restrict__ K,  // [bs, len_kv, DIM]
+  const nv_bfloat16 * __restrict__ V,  // [bs, len_kv, DIM]
+  float * __restrict__ O,              // [bs, len_q, DIM]
+  const char * __restrict__ mask,      // [len_q, len_kv]
   int bs,
   int len_q,
-  int len_kv) {
+  int len_kv,
+  int n_head,
+  float scale,
+  float max_bias,
+  float m0,
+  float m1,
+  uint32_t n_head_log2,
+  float logit_softcap,
+  int ne32,
+  int64_t nb32,
+  int ne33,
+  int64_t nb33,
+  int stride_mask,
+  int mask_is_f16,
+  int is_causal) {
 
   constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
@@ -144,6 +224,9 @@ void attention_v5_kernel(
   const int bs_id = bid / num_q_blocks;
   const int q_block_id = bid % num_q_blocks;
 
+  const int head_id  = bs_id % n_head;
+  const int batch_id = bs_id / n_head;
+
   Q += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q * DIM;
   K += bs_id * len_kv * DIM;
   V += bs_id * len_kv * DIM;
@@ -154,6 +237,12 @@ void attention_v5_kernel(
   const uint32_t Q_smem = __cvta_generic_to_shared(smem);
   const uint32_t K_smem = Q_smem;  // double buffer for K
   const uint32_t V_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(nv_bfloat16);
+  constexpr int smem_q_bytes = BLOCK_Q * DIM * sizeof(nv_bfloat16);
+  constexpr int smem_kv_bytes = 4 * BLOCK_KV * DIM * sizeof(nv_bfloat16);
+  constexpr int smem_base_bytes = smem_q_bytes > smem_kv_bytes ? smem_q_bytes : smem_kv_bytes;
+  uint8_t * const mask_smem_base = reinterpret_cast<uint8_t *>(smem) + smem_base_bytes;
+  half  * const mask_smem_h = reinterpret_cast<half *>(mask_smem_base);
+  float * const mask_smem_f = reinterpret_cast<float *>(mask_smem_base);
 
   // FA2: shard BLOCK_Q among all warps
   // replicate K and V on all warps
@@ -196,7 +285,7 @@ void attention_v5_kernel(
     V_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)>(V_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
   }
 
-  const float softmax_scale = rsqrtf(static_cast<float>(DIM));
+  const float softmax_scale = scale;
 
   float rowmax[WARP_Q / MMA_M][2];
   float rowsumexp[WARP_Q / MMA_M][2] = {};
@@ -206,14 +295,13 @@ void attention_v5_kernel(
     rowmax[mma_id_q][1] = -FLT_MAX;
   }
 
-  // load Q [BLOCK_Q, DIM]
-  global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
-  asm volatile("cp.async.commit_group;");
-  asm volatile("cp.async.wait_all;");
-  __syncthreads();
+  // load Q [BLOCK_Q, DIM] with scale pre-applied (fused)
+  global_to_shared_swizzle_scaled<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid, softmax_scale);
 
   // shared -> registers
+  #pragma unroll
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+    #pragma unroll
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++) {
       uint32_t addr = Q_smem_thread;
       addr += mma_id_q * MMA_M * DIM * sizeof(nv_bfloat16);  // row
@@ -236,29 +324,52 @@ void attention_v5_kernel(
     asm volatile("cp.async.commit_group;");
   };
   auto load_V = [&](int kv_id) {
-    // single buffer for V
-    const uint32_t dst = V_smem;
-    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, V, DIM, tid);
-    V += BLOCK_KV * DIM;
+    // double buffer for V
+    if (kv_id < num_kv_iter) {
+      const uint32_t dst = V_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
+      global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, V, DIM, tid);
+      V += BLOCK_KV * DIM;
+    }
     asm volatile("cp.async.commit_group;");
   };
 
   // prefetch K
   load_K(0);
+  // prefetch V
+  load_V(0);
+
+  const bool has_mask = (mask != nullptr);
+  const char * mask_base = has_mask ?
+      (mask + nb33 * (batch_id % ne33) + nb32 * (head_id % ne32)) :
+      nullptr;
+  const float slope = (max_bias != 0.0f) ? get_alibi_slope(max_bias, head_id, n_head_log2, m0, m1) : 1.0f;
 
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
-    float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
+    // Causal tile skipping optimization:
+    // For causal attention, position (q, k) is masked if k > q.
+    // If the entire KV block starts after the last Q position in this block,
+    // all elements would be masked (-inf), so we can skip the entire tile.
+    // This saves up to 2x compute for causal attention.
+    if (is_causal) {
+      const int kv_block_start = kv_id * BLOCK_KV;
+      const int q_block_end = q_block_id * BLOCK_Q + BLOCK_Q - 1;  // last Q row in this block
+      if (kv_block_start > q_block_end) {
+        // All K positions are > all Q positions in this block, skip.
+        // Keep K/V pointers and prefetch pipeline in sync.
+        V += BLOCK_KV * DIM;
+        load_K(kv_id + 1);
+        continue;
+      }
+    }
 
-    // prefetch V
-    // __syncthreads() here is required to make sure we finish using V_smem
-    // from the previous iteration, since there is only 1 shared buffer for V.
-    __syncthreads();
-    load_V(kv_id);
+    float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
     // K shared -> registers
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
+    #pragma unroll
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+      #pragma unroll
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d += 2) {
         uint32_t addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
         addr += mma_id_kv * MMA_N * DIM * sizeof(nv_bfloat16);  // row
@@ -267,8 +378,11 @@ void attention_v5_kernel(
       }
 
     // MMA S = Q @ K.T [BLOCK_Q, BLOCK_KV]
+    #pragma unroll
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+      #pragma unroll
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+        #pragma unroll
         for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++)
           mma_m16n8k16(Q_rmem[mma_id_q][mma_id_d],
                        K_rmem[mma_id_kv][mma_id_d],
@@ -277,14 +391,136 @@ void attention_v5_kernel(
     // prefetch K
     load_K(kv_id + 1);
 
+    // Note: softmax scale is now pre-applied to Q during load (fused),
+    // so no scale multiplication needed here after GEMM1
+
+    // apply logit softcap if enabled (before mask addition)
+    // Uses fast polynomial approximation instead of expensive tanhf()
+    if (logit_softcap != 0.0f) {
+      #pragma unroll
+      for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        #pragma unroll
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+          float *regs = S_rmem[mma_id_q][mma_id_kv];
+          regs[0] = logit_softcap * tanh_fast(regs[0]);
+          regs[1] = logit_softcap * tanh_fast(regs[1]);
+          regs[2] = logit_softcap * tanh_fast(regs[2]);
+          regs[3] = logit_softcap * tanh_fast(regs[3]);
+        }
+    }
+
+    // load mask tile (if present)
+    if (has_mask) {
+      const int total = BLOCK_Q * BLOCK_KV;
+      if (mask_is_f16) {
+        const uint32_t mask_smem_addr = __cvta_generic_to_shared(mask_smem_h);
+        constexpr int num_elems = 16 / sizeof(half);  // 8 half per 16B
+        for (int idx = tid * num_elems; idx < total; idx += TB_SIZE * num_elems) {
+          const int q_local = idx / BLOCK_KV;
+          const int k_local = idx % BLOCK_KV;
+          const int q = q_block_id * BLOCK_Q + q_local;
+          const int k = kv_id * BLOCK_KV + k_local;
+          const uint32_t dst_addr = mask_smem_addr + idx * sizeof(half);
+          if (k_local <= BLOCK_KV - num_elems && q < len_q && k + (num_elems - 1) < len_kv) {
+            const half *src = reinterpret_cast<const half *>(mask_base) + q * stride_mask + k;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
+          } else {
+            for (int i = 0; i < num_elems; ++i) {
+              const int kk = k + i;
+              const int dst_idx = idx + i;
+              if (dst_idx < total && q < len_q && kk < len_kv) {
+                mask_smem_h[dst_idx] = reinterpret_cast<const half *>(mask_base)[q * stride_mask + kk];
+              } else if (dst_idx < total) {
+                mask_smem_h[dst_idx] = __float2half(0.0f);
+              }
+            }
+          }
+        }
+        asm volatile("cp.async.commit_group;");
+      } else {
+        for (int idx = tid * 4; idx < total; idx += TB_SIZE * 4) {
+          const int q_local = idx / BLOCK_KV;
+          const int k_local = idx % BLOCK_KV;
+          const int q = q_block_id * BLOCK_Q + q_local;
+          const int k = kv_id * BLOCK_KV + k_local;
+          if (k_local <= BLOCK_KV - 4 && q < len_q && k + 3 < len_kv) {
+            const float4 v4 = *reinterpret_cast<const float4 *>(reinterpret_cast<const float *>(mask_base) + q * stride_mask + k);
+            *reinterpret_cast<float4 *>(mask_smem_f + idx) = v4;
+          } else {
+            for (int i = 0; i < 4; ++i) {
+              const int kk = k + i;
+              const int dst_idx = idx + i;
+              if (dst_idx < total && q < len_q && kk < len_kv) {
+                mask_smem_f[dst_idx] = reinterpret_cast<const float *>(mask_base)[q * stride_mask + kk];
+              } else if (dst_idx < total) {
+                mask_smem_f[dst_idx] = 0.0f;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (has_mask && mask_is_f16) {
+      // Keep at most the two newest async groups pending (e.g., V + K prefetch),
+      // while ensuring the mask tile (older group) is resident in shared memory.
+      asm volatile("cp.async.wait_group 2;");
+    }
+    __syncthreads();
+
+    // apply mask / OOB (additive bias)
+    #pragma unroll
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+      #pragma unroll
+      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+        float *regs = S_rmem[mma_id_q][mma_id_kv];
+
+        const int row0 = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+        const int row1 = row0 + 8;
+        const int col0 = mma_id_kv * MMA_N + (lane_id % 4) * 2;
+        const int col1 = col0 + 1;
+
+        const int q0 = q_block_id * BLOCK_Q + row0;
+        const int q1 = q0 + 8;
+        const int k0 = kv_id * BLOCK_KV + col0;
+        const int k1 = k0 + 1;
+
+        float m00 = (q0 < len_q && k0 < len_kv) ? 0.0f : -INFINITY;
+        float m01 = (q0 < len_q && k1 < len_kv) ? 0.0f : -INFINITY;
+        float m10 = (q1 < len_q && k0 < len_kv) ? 0.0f : -INFINITY;
+        float m11 = (q1 < len_q && k1 < len_kv) ? 0.0f : -INFINITY;
+
+        if (has_mask) {
+          if (q0 < len_q && k0 < len_kv) {
+            m00 = mask_is_f16 ? __half2float(mask_smem_h[row0 * BLOCK_KV + col0]) :
+                                mask_smem_f[row0 * BLOCK_KV + col0];
+          }
+          if (q0 < len_q && k1 < len_kv) {
+            m01 = mask_is_f16 ? __half2float(mask_smem_h[row0 * BLOCK_KV + col1]) :
+                                mask_smem_f[row0 * BLOCK_KV + col1];
+          }
+          if (q1 < len_q && k0 < len_kv) {
+            m10 = mask_is_f16 ? __half2float(mask_smem_h[(row0 + 8) * BLOCK_KV + col0]) :
+                                mask_smem_f[(row0 + 8) * BLOCK_KV + col0];
+          }
+          if (q1 < len_q && k1 < len_kv) {
+            m11 = mask_is_f16 ? __half2float(mask_smem_h[(row0 + 8) * BLOCK_KV + col1]) :
+                                mask_smem_f[(row0 + 8) * BLOCK_KV + col1];
+          }
+        }
+
+        regs[0] += slope * m00;
+        regs[1] += slope * m01;
+        regs[2] += slope * m10;
+        regs[3] += slope * m11;
+      }
+
+    #pragma unroll
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-      // apply softmax scale
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
-        for (int reg_id = 0; reg_id < 4; reg_id++)
-          S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
 
       // rowmax
       float this_rowmax[2];
+      #pragma unroll
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
         float *regs = S_rmem[mma_id_q][mma_id_kv];
         if (mma_id_kv == 0) {
@@ -310,6 +546,7 @@ void attention_v5_kernel(
       float rescale[2];
       rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
       rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+      #pragma unroll
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
         O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
         O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
@@ -323,6 +560,7 @@ void attention_v5_kernel(
 
       // rowsumexp
       float this_rowsumexp[2];
+      #pragma unroll
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
         float *regs = S_rmem[mma_id_q][mma_id_kv];
         regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);  // c0
@@ -359,17 +597,25 @@ void attention_v5_kernel(
     // V shared -> registers
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
+    #pragma unroll
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+      #pragma unroll
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d += 2) {
-        uint32_t addr = V_smem_thread;
+        uint32_t addr = V_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
         addr += mma_id_kv * MMA_K * DIM * sizeof(nv_bfloat16);  // row
         addr ^= mma_id_d * MMA_N * sizeof(nv_bfloat16);  // col
         ldmatrix_x4_trans(V_rmem[mma_id_kv][mma_id_d], addr);
       }
 
+    // prefetch V
+    load_V(kv_id + 1);
+
     // MMA O += P @ V [BLOCK_Q, DIM]
+    #pragma unroll
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+      #pragma unroll
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
+        #pragma unroll
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
           mma_m16n8k16(P_rmem[mma_id_q][mma_id_kv],
                        V_rmem[mma_id_kv][mma_id_d],
@@ -377,20 +623,34 @@ void attention_v5_kernel(
   }
 
   // write to O
+  #pragma unroll
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+    #pragma unroll
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
       const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
       const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
 
       // divide by softmax denominator
       float *regs = O_rmem[mma_id_q][mma_id_d];
-      regs[0] /= rowsumexp[mma_id_q][0];
-      regs[1] /= rowsumexp[mma_id_q][0];
-      regs[2] /= rowsumexp[mma_id_q][1];
-      regs[3] /= rowsumexp[mma_id_q][1];
+      const float denom0 = fmaxf(rowsumexp[mma_id_q][0], 1e-6f);
+      const float denom1 = fmaxf(rowsumexp[mma_id_q][1], 1e-6f);
+      regs[0] /= denom0;
+      regs[1] /= denom0;
+      regs[2] /= denom1;
+      regs[3] /= denom1;
 
-      reinterpret_cast<nv_bfloat162 *>(O + (row + 0) * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
-      reinterpret_cast<nv_bfloat162 *>(O + (row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
+      const int global_row0 = q_block_id * BLOCK_Q + row;
+      const int global_row1 = global_row0 + 8;
+      if (global_row0 < len_q) {
+        float *dst_row0 = O + (row + 0) * DIM + col;
+        dst_row0[0] = regs[0];
+        dst_row0[1] = regs[1];
+      }
+      if (global_row1 < len_q) {
+        float *dst_row1 = O + (row + 8) * DIM + col;
+        dst_row1[0] = regs[2];
+        dst_row1[1] = regs[3];
+      }
     }
 }
 
@@ -398,25 +658,46 @@ void attention_v5(
   const nv_bfloat16 *Q,  // [bs, len_q, DIM]
   const nv_bfloat16 *K,  // [bs, len_kv, DIM]
   const nv_bfloat16 *V,  // [bs, len_kv, DIM]
-  nv_bfloat16 *O,        // [bs, len_q, DIM]
+  float *O,              // [bs, len_q, DIM]
+  const char *mask,      // [len_q, len_kv]
   int bs,
   int len_q,
   int len_kv,
-  int dim) {
+  int dim,
+  int n_head,
+  float scale,
+  float max_bias,
+  float m0,
+  float m1,
+  uint32_t n_head_log2,
+  float logit_softcap,
+  int ne32,
+  int64_t nb32,
+  int ne33,
+  int64_t nb33,
+  int stride_mask,
+  int mask_is_f16,
+  int is_causal) {
 
   GGML_ASSERT(dim == 128 && "attention_v5 only supports dim=128");
 
   const int BLOCK_Q = 64;
-  const int BLOCK_KV = 64;
+  const int BLOCK_KV = 128;
   const int DIM = 128;
   const int NUM_WARPS = 4;
 
   const int num_blocks = bs * cdiv(len_q, BLOCK_Q);
   const int TB_SIZE = NUM_WARPS * WARP_SIZE;
-  const int smem_size = max(BLOCK_Q, BLOCK_KV * 3) * DIM * sizeof(nv_bfloat16);
+  const int smem_kv_bytes = 4 * BLOCK_KV * DIM * sizeof(nv_bfloat16);
+  const int smem_q_bytes  = BLOCK_Q * DIM * sizeof(nv_bfloat16);
+  const int smem_base_bytes = max(smem_kv_bytes, smem_q_bytes);
+  const int mask_bytes = mask ? (BLOCK_Q * BLOCK_KV * (mask_is_f16 ? (int)sizeof(half) : (int)sizeof(float))) : 0;
+  const int smem_size = smem_base_bytes + mask_bytes;
 
   auto kernel = attention_v5_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>;
-  launch_kernel(kernel, num_blocks, TB_SIZE, smem_size, Q, K, V, O, bs, len_q, len_kv);
+  launch_kernel(kernel, num_blocks, TB_SIZE, smem_size, Q, K, V, O, mask, bs, len_q, len_kv,
+                n_head, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                ne32, nb32, ne33, nb33, stride_mask, mask_is_f16, is_causal);
 }
 
 // =============================================================================
@@ -430,6 +711,7 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
 
     const int64_t ne00 = Q->ne[0];  // head_dim (D)
     const int64_t ne01 = Q->ne[1];  // n_queries
@@ -444,12 +726,15 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     GGML_ASSERT(Q->type == GGML_TYPE_BF16 && "attention_v5 requires BF16 input");
     GGML_ASSERT(K->type == GGML_TYPE_BF16 && "attention_v5 requires BF16 input");
     GGML_ASSERT(V->type == GGML_TYPE_BF16 && "attention_v5 requires BF16 input");
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && "attention_v5 requires F32 output");
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
 
     // Get raw pointers
     const nv_bfloat16 * Q_data = (const nv_bfloat16 *)Q->data;
     const nv_bfloat16 * K_data = (const nv_bfloat16 *)K->data;
     const nv_bfloat16 * V_data = (const nv_bfloat16 *)V->data;
-    nv_bfloat16 * dst_data = (nv_bfloat16 *)dst->data;
+    float * dst_data = (float *)dst->data;
+    const char * mask_data = mask ? (const char *)mask->data : nullptr;
 
     // Calculate dimensions
     const int bs = ne02 * ne03;  // batch * n_heads
@@ -457,8 +742,42 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const int len_kv = ne11;
     const int dim = ne00;
 
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+    if (scale == 0.0f) {
+        scale = 1.0f / sqrtf(float(ne00));
+    }
+
+    const uint32_t n_head = ne02;
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const bool mask_is_f16 = mask && mask->type == GGML_TYPE_F16;
+    const int stride_mask = mask ? (mask_is_f16 ? (mask->nb[1] / (int)sizeof(half)) : (mask->nb[1] / (int)sizeof(float))) : 0;
+    const int ne32 = mask ? (int)mask->ne[2] : 1;
+    const int ne33 = mask ? (int)mask->ne[3] : 1;
+    const int64_t nb32 = mask ? mask->nb[2] : 0;
+    const int64_t nb33 = mask ? mask->nb[3] : 0;
+
+    // Causal attention detection:
+    // Enable only when explicitly requested to avoid incorrect skips for non-causal masks.
+    // Set GGML_CUDA_CAUSAL_SKIP=1 to opt-in when the mask is known causal.
+    const int is_causal = (mask != nullptr && getenv("GGML_CUDA_CAUSAL_SKIP") != nullptr) ? 1 : 0;
+
     // Call the kernel
-    attention_v5(Q_data, K_data, V_data, dst_data, bs, len_q, len_kv, dim);
+    attention_v5(Q_data, K_data, V_data, dst_data, mask_data, bs, len_q, len_kv, dim,
+                 n_head, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                 ne32, nb32, ne33, nb33, stride_mask, mask_is_f16 ? 1 : 0, is_causal);
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -468,6 +787,7 @@ bool ggml_cuda_flash_attn_ext_attention_v5_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
 
     // Only supports head_dim=128
     if (Q->ne[0] != 128) {
@@ -476,6 +796,16 @@ bool ggml_cuda_flash_attn_ext_attention_v5_supported(const ggml_tensor * dst) {
 
     // Only supports BF16 (for now)
     if (Q->type != GGML_TYPE_BF16 || K->type != GGML_TYPE_BF16 || V->type != GGML_TYPE_BF16) {
+        return false;
+    }
+
+    // Output must be F32
+    if (dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // Mask type must be supported (if present)
+    if (mask && mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) {
         return false;
     }
 

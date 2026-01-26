@@ -1,8 +1,12 @@
-# Blackwell Flash Attention V5 - Complete Tensor Processing Chain
+# Blackwell Flash Attention - Complete Tensor Processing Chain
 
 ## Overview
 
-This document traces tensors through the complete Blackwell Flash Attention v5 pipeline, from model layer Q/K/V creation through the optimized CUDA kernel execution. The focus is on critical dimension semantics and transformations at each step.
+This document traces tensors through the complete Blackwell Flash Attention pipeline, from model layer Q/K/V creation through the optimized CUDA kernel execution. The focus is on critical dimension semantics and transformations at each step.
+
+**Blackwell Kernel Variants:**
+- **attention_v5**: BF16-optimized kernel (requires all BF16 inputs)
+- **blackwell_f16**: F16-optimized kernel (requires all F16 inputs) - most commonly used since Q is cast to F16
 
 **Example Configuration (Qwen3):**
 - D (head_dim) = 128
@@ -37,7 +41,7 @@ Shape: [D, n_heads_kv, n_kv, batch]
 
 ---
 
-## Step 2: build_attn_mha - Permute & Contiguous
+## Step 2: build_attn_mha - Permute & Type Cast
 
 **Function:** `llm_graph_context::build_attn_mha()`
 **File:** `src/llama-graph.cpp:1400`
@@ -51,10 +55,25 @@ V: [D, n_heads_kv, seq_kv, batch] = [128, 32, 768, 1]
 
 **Transformation:**
 1. `ggml_permute(ctx0, x, 0, 2, 1, 3)` - Swaps dimensions 1 and 2
-2. `ggml_cont(ctx0, x)` - Makes contiguous in new order
-3. Type cast to BF16/F16 if needed
+2. V transpose if needed: `if (v_trans) v = ggml_transpose(ctx0, v)`
+3. Type cast Q/K/V to F16 if F32 (enables optimized Blackwell kernels)
 
-**Output (after permute + cont):**
+**Type Casting (lines 1432-1445):**
+```cpp
+// Q is typically F32 from computation, cast to F16 for Blackwell kernels
+if (q->type == GGML_TYPE_F32) {
+    q = ggml_cast(ctx0, q, GGML_TYPE_F16);
+}
+// K/V typically already F16 from KV cache, but cast if F32
+if (k->type == GGML_TYPE_F32) {
+    k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+}
+if (v->type == GGML_TYPE_F32) {
+    v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+}
+```
+
+**Output (after permute):**
 ```
 Q: [D, seq_q, n_heads, batch] = [128, 1, 32, 1]
   ne[0] = 128, ne[1] = 1, ne[2] = 32, ne[3] = 1
@@ -65,7 +84,7 @@ K: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1]
 V: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1]
 ```
 
-**Key Insight:** After permute, `ne[1] = seq`, `ne[2] = heads`
+**Key Insight:** After permute, `ne[1] = seq`, `ne[2] = heads`. No `ggml_cont()` needed here.
 
 ---
 
@@ -99,6 +118,23 @@ O: [D, n_heads, seq_q, batch] = [128, 32, 1, 1]
 
 **Critical:** Output layout differs from input layout!
 
+**Post-FA Processing (lines 1452-1472):**
+```cpp
+ggml_flash_attn_ext_add_sinks(cur, sinks);  // Add attention sinks if configured
+ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);  // Set accumulator precision
+
+// MLA (Multi-head Latent Attention) projection if applicable (e.g., DeepSeek)
+if (v_mla) {
+    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+    cur = ggml_mul_mat(ctx0, v_mla, cur);
+    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+    cur = ggml_cont(ctx0, cur);
+}
+
+// Flatten output: [D, n_heads, seq_q, batch] -> [D*n_heads, seq_q*batch]
+cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+```
+
 ---
 
 ## Step 4: CUDA Dispatch
@@ -108,8 +144,28 @@ O: [D, n_heads, seq_q, batch] = [128, 32, 1, 1]
 
 **Transformation:**
 - Checks compute capability (Blackwell = cc >= 1200)
-- Validates head_dim == 128, types match
-- Dispatches to `ggml_cuda_flash_attn_ext_attention_v5()` for Blackwell GPUs
+- For Blackwell GPUs, selects kernel based on tensor types:
+  - **attention_v5**: Requires Q/K/V all BF16, head_dim=128
+  - **blackwell_f16**: Requires Q/K/V all F16, head_dim=64 or 128
+- Falls back to `mma_f16` or `vec` kernels if Blackwell kernels not supported
+
+**Blackwell Kernel Selection (lines 340-350):**
+```cpp
+if (cc >= GGML_CUDA_CC_BLACKWELL) {
+    // BF16 path
+    if (!ggml_cuda_no_attention_v5 && ggml_cuda_flash_attn_ext_attention_v5_supported(dst)) {
+        return BEST_FATTN_KERNEL_ATTENTION_V5;
+    }
+    // F16 path (most common after Q cast to F16)
+    if (!ggml_cuda_no_blackwell_f16 && ggml_cuda_flash_attn_ext_blackwell_f16_supported(dst)) {
+        return BEST_FATTN_KERNEL_BLACKWELL_F16;
+    }
+}
+```
+
+**Environment Variables:**
+- `GGML_CUDA_NO_ATTENTION_V5`: Disable BF16 kernel, fall back to MMA/vec
+- `GGML_CUDA_NO_BLACKWELL_F16`: Disable F16 kernel, fall back to MMA/vec
 
 ---
 
@@ -149,6 +205,50 @@ stride_O_head = dst->nb[1] / sizeof(To)  // heads is dim 1 in output
 ```
 BLOCK_Q = 64, BLOCK_KV = 64, DIM = 128, NUM_WARPS = 4
 num_blocks = n_heads * n_batch * ceil(seq_q / BLOCK_Q) = 32
+```
+
+---
+
+## Step 5b: blackwell_f16 Wrapper (F16 Path)
+
+**Function:** `ggml_cuda_flash_attn_ext_blackwell_f16()`
+**File:** `ggml/src/ggml-cuda/fattn-blackwell-f16.cuh:786`
+
+This is the **most common path** since Q is cast from F32 to F16 in `build_attn_mha()`.
+
+**Input tensors (same as attention_v5):**
+```
+Q: [D, seq_q, n_heads, batch] = [128, 1, 32, 1] (F16)
+K: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1] (F16)
+V: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1] (F16)
+```
+
+**Parameter Extraction:**
+```cpp
+scale = op_params[0]        // Attention scale (default: 1/sqrt(head_dim))
+max_bias = op_params[1]     // ALiBi max bias
+logit_softcap = op_params[2] // Logit softcap (e.g., Gemma2)
+```
+
+**Kernel Launch by Head Dimension:**
+```cpp
+switch (ne00) {  // head_dim
+    case 64:
+        launch_flash_attn_blackwell_f16<64, 64, 1, 1>(...);
+        break;
+    case 128:
+        launch_flash_attn_blackwell_f16<128, 128, 1, 1>(...);
+        break;
+}
+```
+
+**Kernel Configuration (F16):**
+```
+BLOCK_M = 64 (Q rows per block)
+BLOCK_N = 64 (K/V block size)
+NUM_WARPS = 4
+NUM_THREADS = 128
+Uses m16n8k16 MMA tensor core instructions
 ```
 
 ---

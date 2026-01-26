@@ -4613,6 +4613,10 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     const int min_batch_size = 32;
 
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return true;
+    }
+
     return get_op_batch_size(op) >= min_batch_size;
 
     GGML_UNUSED(dev);

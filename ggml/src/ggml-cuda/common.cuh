@@ -5,6 +5,7 @@
 #include "ggml-cuda.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 
 #define GGML_COMMON_DECL_CUDA
@@ -318,30 +319,87 @@ static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
     return 16;
 }
 
+// L2 Cache Persistence Configuration
+// Loaded once from environment variables on first use
+// Environment variables:
+//   GGML_CUDA_L2_PERSIST:            "1" to enable (default OFF for safety)
+//   GGML_CUDA_L2_PERSIST_SIZE:       max size in MB (default 48)
+//   GGML_CUDA_L2_PERSIST_RATIO:      hit ratio 0.0-1.0 (default 1.0)
+//   GGML_CUDA_L2_PERSIST_DECODE_ONLY: "1" to only persist during decode (Q tokens == 1)
+#if CUDART_VERSION >= 11000
+struct ggml_cuda_l2_persist_config {
+    bool enabled;
+    size_t max_size;
+    float hit_ratio;
+    bool decode_only;
+
+    static const ggml_cuda_l2_persist_config & get() {
+        static const ggml_cuda_l2_persist_config instance = []() {
+            ggml_cuda_l2_persist_config cfg;
+
+            // Master enable (default OFF for safety)
+            const char * env_enabled = getenv("GGML_CUDA_L2_PERSIST");
+            cfg.enabled = (env_enabled != nullptr && atoi(env_enabled) == 1);
+
+            // Max size in MB (default 48MB)
+            const char * env_size = getenv("GGML_CUDA_L2_PERSIST_SIZE");
+            cfg.max_size = env_size ? (size_t)atoi(env_size) * 1024 * 1024 : 48 * 1024 * 1024;
+
+            // Hit ratio (default 1.0)
+            const char * env_ratio = getenv("GGML_CUDA_L2_PERSIST_RATIO");
+            if (env_ratio) {
+                cfg.hit_ratio = strtof(env_ratio, nullptr);
+                if (cfg.hit_ratio < 0.0f) cfg.hit_ratio = 0.0f;
+                if (cfg.hit_ratio > 1.0f) cfg.hit_ratio = 1.0f;
+            } else {
+                cfg.hit_ratio = 1.0f;
+            }
+
+            // Decode-only mode (default OFF)
+            const char * env_decode = getenv("GGML_CUDA_L2_PERSIST_DECODE_ONLY");
+            cfg.decode_only = (env_decode != nullptr && atoi(env_decode) == 1);
+
+            return cfg;
+        }();
+        return instance;
+    }
+};
+
 // L2 Cache Persistence Guard for Blackwell (96MB L2 on RTX 5090)
 // Uses cudaStreamSetAttribute with accessPolicyWindow to persist K/V cache in L2 during decode
 // RAII pattern: automatically clears the persistence window on destruction
-#if CUDART_VERSION >= 11000
 struct ggml_cuda_l2_persist_guard {
     cudaStream_t stream;
     bool active = false;
 
-    ggml_cuda_l2_persist_guard(cudaStream_t s, void * ptr, size_t size, int cc) : stream(s) {
+    // n_queries: number of query tokens (Q->ne[1]), used for decode detection
+    ggml_cuda_l2_persist_guard(cudaStream_t s, void * ptr, size_t size, int cc, int64_t n_queries = 0) : stream(s) {
+        const auto & cfg = ggml_cuda_l2_persist_config::get();
+
+        // Master enable check (default OFF)
+        if (!cfg.enabled) {
+            return;
+        }
+
         // Only enable for Blackwell and when we have valid data
         if (cc < GGML_CUDA_CC_BLACKWELL || size == 0 || ptr == nullptr) {
             return;
         }
 
-        // Only persist if K/V cache fits in 50% of 96MB L2 (leave room for other data)
-        constexpr size_t L2_PERSIST_MAX = 48 * 1024 * 1024;
-        if (size > L2_PERSIST_MAX) {
+        // Configurable size threshold
+        if (size > cfg.max_size) {
+            return;
+        }
+
+        // Decode-only mode: skip if n_queries > 1 (prefill)
+        if (cfg.decode_only && n_queries > 1) {
             return;
         }
 
         cudaStreamAttrValue attr = {};
         attr.accessPolicyWindow.base_ptr = ptr;
         attr.accessPolicyWindow.num_bytes = size;
-        attr.accessPolicyWindow.hitRatio = 1.0f;  // Full persistence
+        attr.accessPolicyWindow.hitRatio = cfg.hit_ratio;
         attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
         attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
 
@@ -1213,6 +1271,7 @@ struct ggml_backend_cuda_context {
 
     // Persistent MMQ buffers for CUDA graph compatibility
     // These buffers survive across graph captures/replays, solving the pool allocation lifetime issue
+    // Debug logging: set GGML_CUDA_DEBUG_MMQ_BUFFERS=1 to enable
     struct mmq_persistent_buffers {
         void *  src1_q8_1      = nullptr;  // Main quantized input buffer
         size_t  src1_q8_1_size = 0;
@@ -1222,6 +1281,11 @@ struct ggml_backend_cuda_context {
         size_t  ids_dst_size   = 0;
         void *  expert_bounds  = nullptr;  // MUL_MAT_ID: expert boundary offsets
         size_t  expert_bounds_size = 0;
+
+        static bool debug_enabled() {
+            static const bool enabled = (getenv("GGML_CUDA_DEBUG_MMQ_BUFFERS") != nullptr);
+            return enabled;
+        }
 
         void free_all() {
             if (src1_q8_1)     { cudaFree(src1_q8_1);     src1_q8_1 = nullptr;     src1_q8_1_size = 0; }
@@ -1249,11 +1313,18 @@ struct ggml_backend_cuda_context {
     // Ensure buffer is allocated with at least the required size
     // Returns pointer to the buffer. Reallocates with 2x headroom if too small.
     // IMPORTANT: Invalidates CUDA graph on reallocation since captured pointers become stale
+    // Debug: set GGML_CUDA_DEBUG_MMQ_BUFFERS=1 to log buffer allocations/resizes
     void * mmq_get_src1_q8_1(size_t required_size) {
         if (mmq_buffers.src1_q8_1 == nullptr || mmq_buffers.src1_q8_1_size < required_size) {
             if (mmq_buffers.src1_q8_1) {
+                if (mmq_buffers.debug_enabled()) {
+                    GGML_LOG_DEBUG("mmq_get_src1_q8_1: resize %zu MB -> %zu MB (graph invalidated)\n",
+                        mmq_buffers.src1_q8_1_size / (1024*1024), (required_size * 2) / (1024*1024));
+                }
                 CUDA_CHECK(cudaFree(mmq_buffers.src1_q8_1));
                 mmq_invalidate_cuda_graph();  // Pointer changed, graph must be recaptured
+            } else if (mmq_buffers.debug_enabled()) {
+                GGML_LOG_DEBUG("mmq_get_src1_q8_1: initial alloc %zu MB\n", (required_size * 2) / (1024*1024));
             }
             mmq_buffers.src1_q8_1_size = required_size * 2;  // 2x headroom
             ggml_cuda_set_device(device);
@@ -1265,8 +1336,14 @@ struct ggml_backend_cuda_context {
     void * mmq_get_ids_src1(size_t required_size) {
         if (mmq_buffers.ids_src1 == nullptr || mmq_buffers.ids_src1_size < required_size) {
             if (mmq_buffers.ids_src1) {
+                if (mmq_buffers.debug_enabled()) {
+                    GGML_LOG_DEBUG("mmq_get_ids_src1: resize %zu MB -> %zu MB (graph invalidated)\n",
+                        mmq_buffers.ids_src1_size / (1024*1024), (required_size * 2) / (1024*1024));
+                }
                 CUDA_CHECK(cudaFree(mmq_buffers.ids_src1));
                 mmq_invalidate_cuda_graph();
+            } else if (mmq_buffers.debug_enabled()) {
+                GGML_LOG_DEBUG("mmq_get_ids_src1: initial alloc %zu MB\n", (required_size * 2) / (1024*1024));
             }
             mmq_buffers.ids_src1_size = required_size * 2;
             ggml_cuda_set_device(device);
@@ -1278,8 +1355,14 @@ struct ggml_backend_cuda_context {
     void * mmq_get_ids_dst(size_t required_size) {
         if (mmq_buffers.ids_dst == nullptr || mmq_buffers.ids_dst_size < required_size) {
             if (mmq_buffers.ids_dst) {
+                if (mmq_buffers.debug_enabled()) {
+                    GGML_LOG_DEBUG("mmq_get_ids_dst: resize %zu MB -> %zu MB (graph invalidated)\n",
+                        mmq_buffers.ids_dst_size / (1024*1024), (required_size * 2) / (1024*1024));
+                }
                 CUDA_CHECK(cudaFree(mmq_buffers.ids_dst));
                 mmq_invalidate_cuda_graph();
+            } else if (mmq_buffers.debug_enabled()) {
+                GGML_LOG_DEBUG("mmq_get_ids_dst: initial alloc %zu MB\n", (required_size * 2) / (1024*1024));
             }
             mmq_buffers.ids_dst_size = required_size * 2;
             ggml_cuda_set_device(device);
@@ -1291,8 +1374,14 @@ struct ggml_backend_cuda_context {
     void * mmq_get_expert_bounds(size_t required_size) {
         if (mmq_buffers.expert_bounds == nullptr || mmq_buffers.expert_bounds_size < required_size) {
             if (mmq_buffers.expert_bounds) {
+                if (mmq_buffers.debug_enabled()) {
+                    GGML_LOG_DEBUG("mmq_get_expert_bounds: resize %zu MB -> %zu MB (graph invalidated)\n",
+                        mmq_buffers.expert_bounds_size / (1024*1024), (required_size * 2) / (1024*1024));
+                }
                 CUDA_CHECK(cudaFree(mmq_buffers.expert_bounds));
                 mmq_invalidate_cuda_graph();
+            } else if (mmq_buffers.debug_enabled()) {
+                GGML_LOG_DEBUG("mmq_get_expert_bounds: initial alloc %zu MB\n", (required_size * 2) / (1024*1024));
             }
             mmq_buffers.expert_bounds_size = required_size * 2;
             ggml_cuda_set_device(device);

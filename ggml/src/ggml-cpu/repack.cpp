@@ -1509,11 +1509,11 @@ static block_q4_Kx8 make_block_q4_Kx8(block_q4_K * in, unsigned int blck_size_in
     block_q4_Kx8 out;
     //Delta(scale) and dmin values of the eight Q4_K structures are copied onto the output interleaved structure
     for (int i = 0; i < 8; i++) {
-        out.d[i] = in[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
+        out.d[i] = in[i].GGML_COMMON_AGGR_S.d;
     }
 
     for (int i = 0; i < 8; i++) {
-        out.dmin[i] = in[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
+        out.dmin[i] = in[i].GGML_COMMON_AGGR_S.dmin;
     }
 
     const int end = QK_K * 4 / blck_size_interleave;
@@ -1586,11 +1586,11 @@ static block_q2_Kx8 make_block_q2_Kx8(block_q2_K * in, unsigned int blck_size_in
 
     // Delta(scale) and dmin values of the eight Q2_K structures are copied onto the output interleaved structure
     for (int i = 0; i < 8; i++) {
-        out.d[i] = in[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
+        out.d[i] = in[i].GGML_COMMON_AGGR_S.d;
     }
 
     for (int i = 0; i < 8; i++) {
-        out.dmin[i] = in[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
+        out.dmin[i] = in[i].GGML_COMMON_AGGR_S.dmin;
     }
 
     const int end = QK_K * 2 / blck_size_interleave;

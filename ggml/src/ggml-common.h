@@ -17,7 +17,8 @@ typedef uint16_t ggml_half;
 typedef uint32_t ggml_half2;
 
 // std-c++ allow anonymous unions but some compiler warn on it
-#define GGML_COMMON_AGGR_U data
+// std-c++ allow anonymous unions but some compiler warn on it
+#define GGML_COMMON_AGGR_U
 // std-c++ do not allow it.
 #define GGML_COMMON_AGGR_S data
 
