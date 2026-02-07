@@ -73,10 +73,13 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        cb(ffn_inp, "ffn_inp", il);
+
         // feed-forward network
         cur = build_norm(cur,
                 model.layers[il].ffn_norm, NULL,
-                LLM_NORM_RMS, il, ffn_inp);
+                LLM_NORM_RMS, il, inpSA);
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
