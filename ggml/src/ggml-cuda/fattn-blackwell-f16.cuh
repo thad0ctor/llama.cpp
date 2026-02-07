@@ -222,8 +222,10 @@ __global__ void flash_attn_blackwell_f16(
 
     // Base pointers with proper striding
     const half * Q_ptr = (const half *)(Q + batch_id * nb03 + head_id * nb02 + q_block_id * Config::BLOCK_M * nb01);
-    const half * K_ptr = (const half *)(K + batch_id * nb13 + (head_id % ne12) * nb12);
-    const half * V_ptr = (const half *)(V + batch_id * nb23 + (head_id % ne12) * nb22);
+    const int gqa_ratio = ne02 / ne12;
+    const int kv_head   = head_id / gqa_ratio;
+    const half * K_ptr = (const half *)(K + batch_id * nb13 + kv_head * nb12);
+    const half * V_ptr = (const half *)(V + batch_id * nb23 + kv_head * nb22);
 
     // Shared memory layout
     //
@@ -251,7 +253,7 @@ __global__ void flash_attn_blackwell_f16(
     const uint32_t K_smem = Q_smem;  // K reuses Q's shared memory (see aliasing note above)
     const uint32_t V_smem = K_smem + 2 * Config::BLOCK_N * DKQ * sizeof(half);
     constexpr size_t q_bytes  = Config::BLOCK_M * DKQ * sizeof(half);
-    constexpr size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + Config::BLOCK_N * DV) * sizeof(half);
+    constexpr size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + 2 * Config::BLOCK_N * DV) * sizeof(half);
     constexpr size_t smem_base_bytes = q_bytes > kv_bytes ? q_bytes : kv_bytes;
     uint8_t * const mask_smem_base = reinterpret_cast<uint8_t *>(smem) + smem_base_bytes;
     half  * const mask_smem_h = reinterpret_cast<half *>(mask_smem_base);
@@ -381,17 +383,20 @@ __global__ void flash_attn_blackwell_f16(
         asm volatile("cp.async.commit_group;");
     };
 
-    // Lambda for loading V
+    // Lambda for loading V (double-buffered)
     auto load_V = [&](int kv_id) {
-        const int k_valid = min(Config::BLOCK_N, ne11 - kv_id * Config::BLOCK_N);
-        const uint32_t dst = V_smem;
-        const half *src = V_ptr + kv_id * Config::BLOCK_N * (nb21 / sizeof(half));
-        fattn_global_to_shared_swizzle<Config::BLOCK_N, DV, Config::NUM_THREADS>(dst, src, nb21 / sizeof(half), tid, k_valid);
+        if (kv_id < num_kv_iter) {
+            const int k_valid = min(Config::BLOCK_N, ne11 - kv_id * Config::BLOCK_N);
+            const uint32_t dst = V_smem + (kv_id % 2) * (Config::BLOCK_N * DV * sizeof(half));
+            const half *src = V_ptr + kv_id * Config::BLOCK_N * (nb21 / sizeof(half));
+            fattn_global_to_shared_swizzle<Config::BLOCK_N, DV, Config::NUM_THREADS>(dst, src, nb21 / sizeof(half), tid, k_valid);
+        }
         asm volatile("cp.async.commit_group;");
     };
 
-    // Prefetch first K block
+    // Prefetch first K and V blocks
     load_K(0);
+    load_V(0);
 
     const bool has_mask = (mask != nullptr);
     const char * mask_base = has_mask ?
@@ -403,10 +408,52 @@ __global__ void flash_attn_blackwell_f16(
         // S accumulator for Q @ K^T
         float S_regs[Config::WARP_Q / Config::MMA_M][Config::BLOCK_N / Config::MMA_N][4] = {};
 
-        // Sync to ensure previous V is consumed before loading new one
+        // ============================================================
+        // Wait for K[kv_id] to be in shared memory (conservative for correctness)
+        // ============================================================
+        asm volatile("cp.async.wait_all;");
         __syncthreads();
-        load_V(kv_id);
 
+        #pragma unroll
+        for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+            #pragma unroll
+            // ldmatrix_x4 loads two mma_id_d tiles per call
+            for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d += 2) {
+                uint32_t addr = K_smem_thread + (kv_id % 2) * (Config::BLOCK_N * DKQ * sizeof(half));
+                addr += mma_id_kv * Config::MMA_N * DKQ * sizeof(half);  // Row offset
+                addr ^= mma_id_d * Config::MMA_K * sizeof(half);         // Column offset
+                // ldmatrix.x4 returns 4 registers (two mma_id_d tiles). Split across mma_id_d and mma_id_d+1.
+                uint32_t tmp[4];
+                fattn_ldmatrix_x4(tmp, addr);
+                K_regs[mma_id_kv][mma_id_d + 0][0] = tmp[0];
+                K_regs[mma_id_kv][mma_id_d + 0][1] = tmp[1];
+                K_regs[mma_id_kv][mma_id_d + 1][0] = tmp[2];
+                K_regs[mma_id_kv][mma_id_d + 1][1] = tmp[3];
+            }
+        }
+
+        // ============================================================
+        // GEMM1: S = Q @ K^T  [BLOCK_M, BLOCK_N]
+        // ============================================================
+        #pragma unroll
+        for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
+            #pragma unroll
+            for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
+                #pragma unroll
+                for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d++) {
+                    fattn_mma_m16n8k16_f16_f32(
+                        Q_regs[mma_id_q][mma_id_d],
+                        K_regs[mma_id_kv][mma_id_d],
+                        S_regs[mma_id_q][mma_id_kv]);
+                }
+            }
+        }
+
+        // ============================================================
+        // Load mask tile into shared memory (if present)
+        // Committed BEFORE K[kv_id+1] so that wait_group 1 correctly
+        // keeps K[kv_id+1] in flight and waits for V[kv_id] + mask.
+        // ============================================================
         // Prefetch mask tile into shared memory (if present)
         if (has_mask) {
             const int total = Config::BLOCK_M * Config::BLOCK_N;
@@ -462,40 +509,7 @@ __global__ void flash_attn_blackwell_f16(
             }
         }
 
-        // Wait for K and V to be available before reading from shared memory
-        asm volatile("cp.async.wait_all;");
-        __syncthreads();
-
-        #pragma unroll
-        for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
-            #pragma unroll
-            // ldmatrix_x4 loads two mma_id_d tiles per call
-            for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d += 2) {
-                uint32_t addr = K_smem_thread + (kv_id % 2) * (Config::BLOCK_N * DKQ * sizeof(half));
-                addr += mma_id_kv * Config::MMA_N * DKQ * sizeof(half);  // Row offset
-                addr ^= mma_id_d * Config::MMA_K * sizeof(half);         // Column offset
-                fattn_ldmatrix_x4(K_regs[mma_id_kv][mma_id_d], addr);
-            }
-        }
-
-        // ============================================================
-        // GEMM1: S = Q @ K^T  [BLOCK_M, BLOCK_N]
-        // ============================================================
-        #pragma unroll
-        for (int mma_id_q = 0; mma_id_q < Config::WARP_Q / Config::MMA_M; mma_id_q++) {
-            #pragma unroll
-            for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
-                #pragma unroll
-                for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d++) {
-                    fattn_mma_m16n8k16_f16_f32(
-                        Q_regs[mma_id_q][mma_id_d],
-                        K_regs[mma_id_kv][mma_id_d],
-                        S_regs[mma_id_q][mma_id_kv]);
-                }
-            }
-        }
-
-        // Prefetch next K
+        // Prefetch next K (committed AFTER mask so it's the newest group)
         load_K(kv_id + 1);
 
         // ============================================================
@@ -514,6 +528,12 @@ __global__ void flash_attn_blackwell_f16(
                 }
             }
         }
+
+        // ============================================================
+        // Wait for V[kv_id] and mask (conservative for correctness)
+        // ============================================================
+        asm volatile("cp.async.wait_all;");
+        __syncthreads();
 
         // ============================================================
         // Apply mask / OOB (additive bias)
@@ -637,7 +657,10 @@ __global__ void flash_attn_blackwell_f16(
                     this_rowsumexp[1] += regs[2] + regs[3];
                 }
 
-                // Pack to P registers for GEMM2 (convert m16n8 layout to m16k16)
+                // Pack to P registers for GEMM2 (convert m16n8 C fragment to m16k16 A fragment)
+                // Physical register order from ldmatrix: r0=rowlo/klo, r1=rowhi/klo, r2=rowlo/khi, r3=rowhi/khi
+                // Even S tiles (k_lo): regs[0,1]=rowlo → P[0], regs[2,3]=rowhi → P[1]
+                // Odd S tiles (k_hi):  regs[0,1]=rowlo → P[2], regs[2,3]=rowhi → P[3]
                 half2 *this_P_regs = reinterpret_cast<half2*>(P_regs[mma_id_q][mma_id_kv / 2]);
                 this_P_regs[(mma_id_kv % 2) * 2]     = __float22half2_rn(make_float2(regs[0], regs[1]));
                 this_P_regs[(mma_id_kv % 2) * 2 + 1] = __float22half2_rn(make_float2(regs[2], regs[3]));
@@ -661,22 +684,28 @@ __global__ void flash_attn_blackwell_f16(
         }
 
         // ============================================================
-        // Load V to registers
+        // Load V to registers (V[kv_id] already waited for above)
         // ============================================================
-        asm volatile("cp.async.wait_all;");
-        __syncthreads();
-
         #pragma unroll
         for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_K; mma_id_kv++) {
             #pragma unroll
             // ldmatrix_x4_trans loads two mma_id_d tiles per call
             for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d += 2) {
-                uint32_t addr = V_smem_thread;
+                uint32_t addr = V_smem_thread + (kv_id % 2) * (Config::BLOCK_N * DV * sizeof(half));
                 addr += mma_id_kv * Config::MMA_K * DV * sizeof(half);  // Row offset
                 addr ^= mma_id_d * Config::MMA_N * sizeof(half);        // Column offset
-                fattn_ldmatrix_x4_trans(V_regs[mma_id_kv][mma_id_d], addr);
+                // ldmatrix.x4.trans returns 4 registers (two mma_id_d tiles). Split across mma_id_d and mma_id_d+1.
+                uint32_t tmp[4];
+                fattn_ldmatrix_x4_trans(tmp, addr);
+                V_regs[mma_id_kv][mma_id_d + 0][0] = tmp[0];
+                V_regs[mma_id_kv][mma_id_d + 0][1] = tmp[1];
+                V_regs[mma_id_kv][mma_id_d + 1][0] = tmp[2];
+                V_regs[mma_id_kv][mma_id_d + 1][1] = tmp[3];
             }
         }
+
+        // Prefetch next V into the other double-buffer slot
+        load_V(kv_id + 1);
 
         // ============================================================
         // GEMM2: O += P @ V  [BLOCK_M, DV]
@@ -770,7 +799,7 @@ void launch_flash_attn_blackwell_f16(
 
     // Shared memory: max(Q, K double buffer + V)
     const size_t q_bytes  = Config::BLOCK_M * DKQ * sizeof(half);
-    const size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + Config::BLOCK_N * DV) * sizeof(half);
+    const size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + 2 * Config::BLOCK_N * DV) * sizeof(half);
     const size_t smem_base_bytes = q_bytes > kv_bytes ? q_bytes : kv_bytes;
     const size_t mask_bytes = (mask != nullptr)
         ? (Config::BLOCK_M * Config::BLOCK_N * (mask->type == GGML_TYPE_F16 ? sizeof(half) : sizeof(float)))
@@ -828,6 +857,12 @@ void ggml_cuda_flash_attn_ext_blackwell_f16(ggml_backend_cuda_context & ctx, ggm
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    // Allow disabling mask for testing (set GGML_CUDA_NO_MASK_BLACKWELL=1)
+    const bool no_mask = getenv("GGML_CUDA_NO_MASK_BLACKWELL") != nullptr;
+    if (no_mask) {
+        mask = nullptr;
+    }
 
     const int64_t ne00 = Q->ne[0];  // head_dim
 

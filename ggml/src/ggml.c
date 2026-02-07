@@ -3081,7 +3081,7 @@ struct ggml_tensor * ggml_add_rms_norm(
         float                 eps) {
     GGML_ASSERT(ggml_are_same_shape(a, b));
 
-    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, a->n_dims, a->ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, ggml_n_dims(a), a->ne);
 
     ggml_set_op_params_f32(result, 0, eps);
 

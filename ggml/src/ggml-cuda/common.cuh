@@ -335,6 +335,35 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+// Check if we're on consumer Blackwell (sm_120, RTX 5090) vs datacenter (sm_100, B200/B100)
+static inline bool ggml_cuda_is_consumer_blackwell(int cc) {
+    return cc >= 1200;
+}
+
+// Get max shared memory per block for the architecture
+static inline int ggml_cuda_get_max_shared_memory(int cc) {
+    if (cc >= 1200) {
+        return 99 * 1024;   // sm_120 (RTX 5090): 99 KB
+    } else if (cc >= 1000) {
+        return 227 * 1024;  // sm_100 (B200/B100): 227 KB
+    } else if (cc >= 900) {
+        return 227 * 1024;  // Hopper: 227 KB
+    } else if (cc >= 800) {
+        return 163 * 1024;  // Ampere: 163 KB
+    } else {
+        return 96 * 1024;   // Turing and earlier: 96 KB
+    }
+}
+
+// Device-side check for consumer Blackwell (compile-time)
+static constexpr __device__ bool ggml_cuda_is_consumer_blackwell_device() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    return true;
+#else
+    return false;
+#endif
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
@@ -1562,11 +1591,14 @@ struct ggml_backend_cuda_context {
     // This forces graph recapture on the next compute pass
     void mmq_invalidate_cuda_graph() {
 #ifdef USE_CUDA_GRAPH
-        if (cuda_graph && cuda_graph->instance != nullptr) {
-            // Destroy the executable graph instance to force recapture
-            // The graph itself will be recreated during the next capture
-            CUDA_CHECK(cudaGraphExecDestroy(cuda_graph->instance));
-            cuda_graph->instance = nullptr;
+        for (auto & it : cuda_graphs) {
+            ggml_cuda_graph * graph = it.second.get();
+            if (graph && graph->instance != nullptr) {
+                // Destroy the executable graph instance to force recapture
+                // The graph itself will be recreated during the next capture
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                graph->instance = nullptr;
+            }
         }
 #endif
     }

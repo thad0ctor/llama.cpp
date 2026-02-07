@@ -532,8 +532,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_BLACKWELL_F16: kernel_name = "blackwell_f16"; break;
         default: break;
     }
-    fprintf(stderr, "ggml_cuda_flash_attn_ext: kernel=%s\n", kernel_name);
-    fflush(stderr);
+    if (getenv("GGML_CUDA_DEBUG_FATTN_KERNEL") != nullptr) {
+        fprintf(stderr, "ggml_cuda_flash_attn_ext: kernel=%s\n", kernel_name);
+        fflush(stderr);
+    }
+
     switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

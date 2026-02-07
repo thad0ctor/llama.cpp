@@ -1719,10 +1719,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // Cast Q/K/V to F16 for Flash Attention
-        // K/V: typically already F16 from KV cache, but may be F32 for embedding models
-        // Q: cast to F16 to enable optimized Blackwell kernels (which require all F16)
-        if (q->type == GGML_TYPE_F32) {
+        // Cast K/V to F16 for Flash Attention (KV cache is typically F16 already).
+        // Q is only cast to F16 when Blackwell F16 kernel is allowed; MMA F16 expects Q in F32.
+        const bool allow_blackwell_f16 = (getenv("GGML_CUDA_NO_BLACKWELL_F16") == nullptr);
+        if (allow_blackwell_f16 && q->type == GGML_TYPE_F32) {
             q = ggml_cast(ctx0, q, GGML_TYPE_F16);
         }
 

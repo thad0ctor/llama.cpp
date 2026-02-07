@@ -151,7 +151,9 @@ if (CUDAToolkit_FOUND)
         add_library(ggml-cuda-sm120 OBJECT ${_ggml_cuda_sm120_sources})
         set_target_properties(ggml-cuda-sm120 PROPERTIES CUDA_ARCHITECTURES "120a-real")
         target_compile_options(ggml-cuda-sm120 PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--maxrregcount=${GGML_CUDA_SM120_MAXRREGCOUNT}>")
-        target_link_libraries(ggml-cuda-sm120 PRIVATE ggml-cuda)
+        target_include_directories(ggml-cuda-sm120 PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,INCLUDE_DIRECTORIES>
+        )
         target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-sm120>)
     endif()
 
@@ -299,6 +301,12 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+
+    # Apply the same CUDA flags to the sm_120 object library so it gets
+    # -use_fast_math, -extended-lambda, -compress-mode, etc.
+    if (TARGET ggml-cuda-sm120)
+        target_compile_options(ggml-cuda-sm120 PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
