@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_cparams;
@@ -119,6 +120,7 @@ enum llm_type {
     LLM_TYPE_31B_A3_5B,
     LLM_TYPE_80B_A3B, // Qwen3 Next
     LLM_TYPE_100B_A6B,
+    LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
     LLM_TYPE_230B_A10B, // Minimax M2
     LLM_TYPE_235B_A22B,
@@ -474,6 +476,9 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // for keeping track of associated LoRA adapters
+    std::unordered_set<llama_adapter_lora *> loras;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
