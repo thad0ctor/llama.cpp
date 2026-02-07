@@ -215,6 +215,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 #endif // GGML_CUDA_FORCE_CUBLAS
     GGML_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices:\n", __func__, info.device_count);
 
+    std::vector<std::pair<int, std::string>> turing_devices_without_mma;
     for (int id = 0; id < info.device_count; ++id) {
         int device_vmm = 0;
 
@@ -242,10 +243,44 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
+#if defined(GGML_USE_HIP)
+        info.devices[id].smpbo = prop.sharedMemPerBlock;
+
+        info.devices[id].cc = ggml_cuda_parse_id(prop.gcnArchName);
+        if ((info.devices[id].cc & 0xff00) == 0x0) {
+            GGML_LOG_WARN("invalid architecture ID received for device %d %s: %s  cc %d.%d\n",
+                            id, prop.name, prop.gcnArchName, prop.major, prop.minor);
+
+            // Fallback to prop.major and prop.minor
+            if (prop.major > 0) {
+                info.devices[id].cc = GGML_CUDA_CC_OFFSET_AMD + prop.major * 0x100;
+                info.devices[id].cc += prop.minor * 0x10;
+            }
+        }
+        GGML_LOG_INFO("  Device %d: %s, %s (0x%x), VMM: %s, Wave Size: %d\n",
+                      id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
+                      device_vmm ? "yes" : "no", prop.warpSize);
+#elif defined(GGML_USE_MUSA)
+        // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
+        info.devices[id].warp_size = 32;
+        info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
+        info.devices[id].cc = GGML_CUDA_CC_OFFSET_MTHREADS + prop.major * 0x100;
+        info.devices[id].cc += prop.minor * 0x10;
+        GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n",
+                        id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
+#else
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n",
                         id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
+        std::string device_name(prop.name);
+        if (device_name == "NVIDIA GeForce MX450") {
+            turing_devices_without_mma.push_back({ id, device_name });
+        } else if (device_name == "NVIDIA GeForce MX550") {
+            turing_devices_without_mma.push_back({ id, device_name });
+        } else if (device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
+            turing_devices_without_mma.push_back({ id, device_name });
+        }
 
         // Temporary performance fix:
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
@@ -254,6 +289,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
         if (prop.major == 12 && prop.minor == 1) {
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
         }
+
+#endif  // defined(GGML_USE_HIP)
+    }
+
+    if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
+        GGML_LOG_INFO("The following devices will have suboptimal performance due to a lack of tensor cores:\n");
+        for (size_t device_pos = 0; device_pos < turing_devices_without_mma.size(); device_pos++) {
+            GGML_LOG_INFO(
+                "  Device %d: %s\n", turing_devices_without_mma[device_pos].first, turing_devices_without_mma[device_pos].second.c_str());
+        }
+        GGML_LOG_INFO(
+            "Consider compiling with CMAKE_CUDA_ARCHITECTURES=61-virtual;80-virtual and DGGML_CUDA_FORCE_MMQ to force the use of the Pascal code for Turing.\n");
     }
 
     for (int id = 0; id < info.device_count; ++id) {
@@ -2112,7 +2159,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
-    // we only support fusion for ncols_dst = 1
+    // fusion is not universally faster on Pascal
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (cc <= GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
+    //we only support fusion for ncols_dst = 1
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
     }
@@ -2152,6 +2204,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
+    bool any_gpus_with_slow_fp16 = false;
+
     if (split) {
         ggml_backend_cuda_split_buffer_type_context * buft_ctx = (ggml_backend_cuda_split_buffer_type_context *) src0->buffer->buft->context;
         auto & tensor_split = buft_ctx->tensor_split;
@@ -2166,6 +2220,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+            any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
         }
     } else {
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
@@ -2173,6 +2228,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+        any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
     }
 
     // debug helpers
@@ -2185,8 +2241,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     //TODO update for generic tensor parallelism
     const int cc                 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    // All sm_86+ GPUs have fast FP16, so always allow F16 batched cuBLAS
-    bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16;
+    bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
@@ -3669,10 +3724,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph = true;
     bool cuda_graph_update_required = false;
 
-    // Disable CUDA graphs in presence of env var, use-case which is changing too rapidly,
+    if (cuda_ctx->cuda_graph->graph == nullptr) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
+            cuda_ctx->cuda_graph->disable_due_to_gpu_arch = true;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+#endif
+        }
+    }
+
+    // Disable CUDA graphs in presence of env var, old GPU, use-case which is changing too rapidly,
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
     if (disable_cuda_graphs_due_to_env
+        || cuda_ctx->cuda_graph->disable_due_to_gpu_arch
         || cuda_ctx->cuda_graph->disable_due_to_too_many_updates
         || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture) {
         use_cuda_graph = false;

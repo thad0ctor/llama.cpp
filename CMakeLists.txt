@@ -106,7 +106,7 @@ option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE
 # extra artifacts
 option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES "llama: build examples"       OFF)
+option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 
@@ -149,10 +149,15 @@ function (llama_option_depr TYPE OLD NEW)
     endif()
 endfunction()
 
-# Deprecated option forwarding (CUDA + CPU only build)
 llama_option_depr(FATAL_ERROR LLAMA_CUBLAS              GGML_CUDA)
 llama_option_depr(WARNING     LLAMA_CUDA                GGML_CUDA)
+llama_option_depr(WARNING     LLAMA_METAL               GGML_METAL)
+llama_option_depr(WARNING     LLAMA_METAL_EMBED_LIBRARY GGML_METAL_EMBED_LIBRARY)
 llama_option_depr(WARNING     LLAMA_NATIVE              GGML_NATIVE)
+llama_option_depr(WARNING     LLAMA_RPC                 GGML_RPC)
+llama_option_depr(WARNING     LLAMA_SYCL                GGML_SYCL)
+llama_option_depr(WARNING     LLAMA_SYCL_F16            GGML_SYCL_F16)
+llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
 
 if (NOT MSVC)
     if (LLAMA_SANITIZE_THREAD)
@@ -223,6 +228,7 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
+    add_subdirectory(pocs)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
@@ -266,6 +272,18 @@ write_basic_package_version_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
+
+install(
+    FILES convert_hf_to_gguf.py
+    PERMISSIONS
+        OWNER_READ
+        OWNER_WRITE
+        OWNER_EXECUTE
+        GROUP_READ
+        GROUP_EXECUTE
+        WORLD_READ
+        WORLD_EXECUTE
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
