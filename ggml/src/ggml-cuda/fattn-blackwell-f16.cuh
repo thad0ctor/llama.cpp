@@ -379,8 +379,8 @@ __global__ void flash_attn_blackwell_f16(
             const uint32_t dst = K_smem + (kv_id % 2) * (Config::BLOCK_N * DKQ * sizeof(half));
             const half *src = K_ptr + kv_id * Config::BLOCK_N * (nb11 / sizeof(half));
             fattn_global_to_shared_swizzle<Config::BLOCK_N, DKQ, Config::NUM_THREADS>(dst, src, nb11 / sizeof(half), tid, k_valid);
+            asm volatile("cp.async.commit_group;");
         }
-        asm volatile("cp.async.commit_group;");
     };
 
     // Lambda for loading V (double-buffered)
@@ -390,8 +390,8 @@ __global__ void flash_attn_blackwell_f16(
             const uint32_t dst = V_smem + (kv_id % 2) * (Config::BLOCK_N * DV * sizeof(half));
             const half *src = V_ptr + kv_id * Config::BLOCK_N * (nb21 / sizeof(half));
             fattn_global_to_shared_swizzle<Config::BLOCK_N, DV, Config::NUM_THREADS>(dst, src, nb21 / sizeof(half), tid, k_valid);
+            asm volatile("cp.async.commit_group;");
         }
-        asm volatile("cp.async.commit_group;");
     };
 
     // Prefetch first K and V blocks
@@ -409,9 +409,11 @@ __global__ void flash_attn_blackwell_f16(
         float S_regs[Config::WARP_Q / Config::MMA_M][Config::BLOCK_N / Config::MMA_N][4] = {};
 
         // ============================================================
-        // Wait for K[kv_id] to be in shared memory (conservative for correctness)
+        // Wait for K[kv_id] to be in shared memory
+        // Pending groups: K[kv_id] (older), V[kv_id] (newer)
+        // wait_group 1: keeps V[kv_id] in flight, waits for K[kv_id]
         // ============================================================
-        asm volatile("cp.async.wait_all;");
+        asm volatile("cp.async.wait_group 1;");
         __syncthreads();
 
         #pragma unroll
@@ -530,9 +532,11 @@ __global__ void flash_attn_blackwell_f16(
         }
 
         // ============================================================
-        // Wait for V[kv_id] and mask (conservative for correctness)
+        // Wait for V[kv_id] and mask, keep K[kv_id+1] in flight
+        // Group order: V[kv_id] (oldest), [mask if f16], K[kv_id+1] (newest)
+        // wait_group 1: keeps K[kv_id+1], waits for V and mask
         // ============================================================
-        asm volatile("cp.async.wait_all;");
+        asm volatile("cp.async.wait_group 1;");
         __syncthreads();
 
         // ============================================================
