@@ -752,7 +752,8 @@ struct llm_graph_context {
              ggml_tensor * mw,
              ggml_tensor * mb,
            llm_norm_type   type,
-                     int   il) const;
+                     int   il,
+             ggml_tensor * res = NULL) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,

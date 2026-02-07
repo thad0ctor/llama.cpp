@@ -3072,6 +3072,24 @@ struct ggml_tensor * ggml_rms_norm(
     return ggml_rms_norm_impl(ctx, a, eps, false);
 }
 
+struct ggml_tensor * ggml_add_rms_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, a->n_dims, a->ne);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_ADD_RMS_NORM;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_rms_norm_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,

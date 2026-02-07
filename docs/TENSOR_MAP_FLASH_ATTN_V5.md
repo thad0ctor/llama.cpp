@@ -53,6 +53,25 @@ K: [D, n_heads_kv, seq_kv, batch] = [128, 32, 768, 1]
 V: [D, n_heads_kv, seq_kv, batch] = [128, 32, 768, 1]
 ```
 
+### Stream Splitting
+
+Before the permute operation, `build_attn_mha` may split the batch dimension into streams:
+
+```cpp
+const auto n_stream = k->ne[3];
+q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                 q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+```
+
+When `n_stream > 1`:
+- `ne[3]` becomes `n_stream` (not pure batch count)
+- `ne[2]` becomes `seq / n_stream`
+- `nb[3]` becomes `original_nb[3] / n_stream`
+
+The kernel grid uses `blockIdx.z` to iterate over `ne[3]` (streams), and pointer arithmetic `batch_id * nb[3]` correctly steps through stream chunks.
+
+**Note:** Custom kernels must handle `ne[3]` as potentially representing streams, not just batch size.
+
 **Transformation:**
 1. `ggml_permute(ctx0, x, 0, 2, 1, 3)` - Swaps dimensions 1 and 2
 2. V transpose if needed: `if (v_trans) v = ggml_transpose(ctx0, v)`
@@ -77,8 +96,8 @@ if (v->type == GGML_TYPE_F32) {
 ```
 Q: [D, seq_q, n_heads, batch] = [128, 1, 32, 1]
   ne[0] = 128, ne[1] = 1, ne[2] = 32, ne[3] = 1
-  nb[1] = D * sizeof(T)        (stride to next seq)
-  nb[2] = D * seq * sizeof(T)  (stride to next head)
+  nb[1] = D * heads * sizeof(T)  (stride to next seq - was nb[2])
+  nb[2] = D * sizeof(T)          (stride to next head - was nb[1])
 
 K: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1]
 V: [D, seq_kv, n_heads_kv, batch] = [128, 768, 32, 1]
@@ -230,6 +249,25 @@ max_bias = op_params[1]     // ALiBi max bias
 logit_softcap = op_params[2] // Logit softcap (e.g., Gemma2)
 ```
 
+### Logit Softcap Implementation
+
+When `logit_softcap != 0.0f`, the kernels perform a critical scale adjustment:
+
+```cpp
+if (logit_softcap != 0.0f) {
+    scale /= logit_softcap;  // Adjust scale BEFORE applying softcap
+}
+```
+
+The effective formula becomes:
+```
+score = logit_softcap * tanh(QK_score * scale / logit_softcap)
+```
+
+This ensures attention logits are bounded to `[-logit_softcap, +logit_softcap]` without over-compressing the tanh input.
+
+**Warning:** Applying softcap without this scale adjustment will severely squash logits, causing low-entropy repetitive output.
+
 **Kernel Launch by Head Dimension:**
 ```cpp
 switch (ne00) {  // head_dim
@@ -328,6 +366,19 @@ O[row * stride_O_row + col] = normalized_value
 | O (output) | [D, heads, seq, batch] | **heads** | **seq** | **nb[2]** | **nb[1]** |
 
 **Critical:** Output strides are SWAPPED because output layout differs from input!
+
+---
+
+### Output Type Requirement
+
+Both Blackwell Flash Attention kernels produce **F32 output**:
+
+| Kernel | Validation | Output Type |
+|--------|------------|-------------|
+| `attention_v5` | Runtime assert: `dst->type == GGML_TYPE_F32` | F32 |
+| `blackwell_f16` | Writes to `float*` unconditionally | F32 |
+
+**Important:** Custom kernels must write F32 output. Writing F16/BF16 will cause downstream operations to interpret garbage data.
 
 ---
 

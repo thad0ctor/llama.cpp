@@ -4,7 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
-#include "fattn-blackwell-f16.cuh"
+#include "fattn-blackwell-f16.h"
 #include "fattn.cuh"
 #include "attention_v5.cuh"
 

@@ -230,7 +230,7 @@ void attention_v5_kernel(
   Q += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q * DIM;
   K += bs_id * len_kv * DIM;
   V += bs_id * len_kv * DIM;
-  O += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q * DIM;
+  // O uses layout [batch, seq, head, dim] (i.e. [D, heads, seq, batch] in ggml).
 
   // we overlap Q_smem with (K_smem + V_smem), since we only need to load Q_smem once
   extern __shared__ nv_bfloat16 smem[];
@@ -543,9 +543,17 @@ void attention_v5_kernel(
       this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
 
       // rescale for previous O
+      // On first iteration, rowmax is -FLT_MAX so exp(-FLT_MAX - x) = 0
+      // which would incorrectly zero out the output. Skip rescaling on first iter.
       float rescale[2];
-      rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
-      rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+      if (kv_id == 0) {
+        // First iteration: no previous output to rescale
+        rescale[0] = 1.0f;
+        rescale[1] = 1.0f;
+      } else {
+        rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+        rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+      }
       #pragma unroll
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
         O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
@@ -590,8 +598,14 @@ void attention_v5_kernel(
       this_rowsumexp[1] += __shfl_xor_sync(0xFFFF'FFFF, this_rowsumexp[1], 2);
 
       // accumulate to total rowsumexp
-      rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
-      rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+      // On first iteration, rowsumexp is 0, so just assign this_rowsumexp directly
+      if (kv_id == 0) {
+        rowsumexp[mma_id_q][0] = this_rowsumexp[0];
+        rowsumexp[mma_id_q][1] = this_rowsumexp[1];
+      } else {
+        rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+        rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+      }
     }
 
     // V shared -> registers
@@ -642,12 +656,12 @@ void attention_v5_kernel(
       const int global_row0 = q_block_id * BLOCK_Q + row;
       const int global_row1 = global_row0 + 8;
       if (global_row0 < len_q) {
-        float *dst_row0 = O + (row + 0) * DIM + col;
+        float *dst_row0 = O + ((batch_id * len_q + global_row0) * n_head + head_id) * DIM + col;
         dst_row0[0] = regs[0];
         dst_row0[1] = regs[1];
       }
       if (global_row1 < len_q) {
-        float *dst_row1 = O + (row + 8) * DIM + col;
+        float *dst_row1 = O + ((batch_id * len_q + global_row1) * n_head + head_id) * DIM + col;
         dst_row1[0] = regs[2];
         dst_row1[1] = regs[3];
       }

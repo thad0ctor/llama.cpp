@@ -102,6 +102,19 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+
+    # Blackwell-only kernels compiled as sm_120-only TUs so we can apply
+    # register limits without impacting other architectures.
+    set(_ggml_cuda_sm120_sources
+        ${CMAKE_CURRENT_LIST_DIR}/attention_v5.cu
+        ${CMAKE_CURRENT_LIST_DIR}/fattn-blackwell-f16.cu
+    )
+    foreach(_src IN LISTS _ggml_cuda_sm120_sources)
+        if (EXISTS ${_src})
+            list(REMOVE_ITEM GGML_SOURCES_CUDA ${_src})
+        endif()
+    endforeach()
+
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -124,10 +137,23 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
     endif()
 
+    # sm_120 (Blackwell) register limit for occupancy
+    # 224 regs * 256 threads = 57,344 < 65,536 regs/SM ensures non-zero occupancy
+    # IMPORTANT: Only apply when sm_120 is the sole architecture to avoid
+    # penalizing other architectures (e.g., sm_86) in multi-arch builds.
+    set(GGML_CUDA_SM120_MAXRREGCOUNT 224 CACHE STRING "Max register count for sm_120 Blackwell GPUs")
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (_ggml_cuda_sm120_sources)
+        add_library(ggml-cuda-sm120 OBJECT ${_ggml_cuda_sm120_sources})
+        set_target_properties(ggml-cuda-sm120 PROPERTIES CUDA_ARCHITECTURES "120a-real")
+        target_compile_options(ggml-cuda-sm120 PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--maxrregcount=${GGML_CUDA_SM120_MAXRREGCOUNT}>")
+        target_link_libraries(ggml-cuda-sm120 PRIVATE ggml-cuda)
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-sm120>)
+    endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
@@ -199,12 +225,6 @@ if (CUDAToolkit_FOUND)
         # - size
         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
     endif()
-
-    # sm_120 (Blackwell) register limit for occupancy
-    # 224 regs * 256 threads = 57,344 < 65,536 regs/SM ensures non-zero occupancy
-    # IMPORTANT: Only apply when sm_120 is the sole architecture to avoid
-    # penalizing other architectures (e.g., sm_86) in multi-arch builds.
-    set(GGML_CUDA_SM120_MAXRREGCOUNT 224 CACHE STRING "Max register count for sm_120 Blackwell GPUs")
 
     # Detect if we have sm_120 and count total architectures
     set(_has_sm120 FALSE)

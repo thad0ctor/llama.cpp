@@ -881,12 +881,27 @@ ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * mw,
          ggml_tensor * mb,
        llm_norm_type   type,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * res) const {
     switch (type) {
-        case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
-        case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
+        case LLM_NORM:
+            if (res) {
+                cur = ggml_add(ctx0, cur, res);
+            }
+            cur = ggml_norm(ctx0, cur, hparams.f_norm_eps);
+            break;
+        case LLM_NORM_RMS:
+            if (res) {
+                cur = ggml_add_rms_norm(ctx0, cur, res, hparams.f_norm_rms_eps);
+            } else {
+                cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+            }
+            break;
         case LLM_NORM_GROUP:
             {
+                if (res) {
+                    cur = ggml_add(ctx0, cur, res);
+                }
                 cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, cur->ne[1]);
                 cur = ggml_group_norm(ctx0, cur, hparams.n_norm_groups, hparams.f_norm_group_eps);
                 cur = ggml_reshape_2d(ctx0, cur, cur->ne[0],    cur->ne[2]);

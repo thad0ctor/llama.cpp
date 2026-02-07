@@ -1790,6 +1790,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rms_norm(params, tensor);
             } break;
+        case GGML_OP_ADD_RMS_NORM:
+            {
+                ggml_compute_forward_add_rms_norm(params, tensor);
+            } break;
         case GGML_OP_RMS_NORM_BACK:
             {
                 ggml_compute_forward_rms_norm_back(params, tensor);

@@ -174,6 +174,27 @@ cmake -B build -DCMAKE_CUDA_ARCHITECTURES="86;120"
 
 ---
 
+## Mixed-Arch Multi-GPU Enablement (SM_120 + others)
+
+**Goal:** keep SM_120 kernels at their optimal register limit while letting other GPUs compile with their default register usage.
+
+**Current behavior:** In a single multi-arch build (e.g., `86;120`), the SM_120 register limit is **not** applied because `--maxrregcount` affects *all* architectures in that build.
+
+**Recommended approach (best perf, no cross-arch penalty):**
+1. Build a **Blackwell-only** binary:
+   ```bash
+   cmake -B build-sm120 -DCMAKE_CUDA_ARCHITECTURES=120a-real
+   ```
+2. Build a **multi-arch** (or non-Blackwell) binary for other GPUs:
+   ```bash
+   cmake -B build-multi -DCMAKE_CUDA_ARCHITECTURES="86;120"
+   ```
+3. Run separate processes pinned to the appropriate GPUs (e.g., with `CUDA_VISIBLE_DEVICES`) so SM_120 uses the SM_120-only build, and other GPUs use the multi-arch build.
+
+**If you must ship a single binary:** be aware that enabling `--maxrregcount` globally would penalize non-SM_120 GPUs. At present we do **not** apply it in multi-arch builds for this reason.
+
+---
+
 ## Architecture Guards
 
 The following compile-time guards control Blackwell-specific code:
@@ -184,3 +205,20 @@ The following compile-time guards control Blackwell-specific code:
 | `BLACKWELL_TMA_AVAILABLE` | SM_120+ | TMA primitives in `tma.cuh` |
 | `BLACKWELL_WGMMA_AVAILABLE` | SM_120+ | WGMMA primitives in `mma.cuh` |
 | `CP_ASYNC_AVAILABLE` | SM_80+ | `cp.async` for async memory copies |
+
+---
+
+## Performance Checklist (Multi-GPU Friendly)
+
+1. **Enable L2 cache persistence for decode** (Blackwell-only at runtime):
+   ```bash
+   export GGML_CUDA_L2_PERSIST=1
+   export GGML_CUDA_L2_PERSIST_DECODE_ONLY=1
+   # Optional tuning:
+   export GGML_CUDA_L2_PERSIST_SIZE=48
+   export GGML_CUDA_L2_PERSIST_RATIO=1.0
+   ```
+   This is gated by `cc >= SM_120` in code, so other GPUs are unaffected.
+
+2. **Confirm Blackwell kernels are not disabled**:
+   - `GGML_CUDA_NO_ATTENTION_V5` and `GGML_CUDA_NO_BLACKWELL_F16` should be **unset** (or `0`).

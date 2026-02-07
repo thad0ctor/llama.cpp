@@ -226,10 +226,29 @@ __global__ void flash_attn_blackwell_f16(
     const half * V_ptr = (const half *)(V + batch_id * nb23 + (head_id % ne12) * nb22);
 
     // Shared memory layout
-    // Q_smem overlaps with K_smem since Q is only loaded once
+    //
+    // MEMORY ALIASING NOTE: Q_smem and K_smem intentionally alias to the same
+    // shared memory address. This is a memory reuse optimization that reduces
+    // shared memory requirements by ~50% for the Q/K storage.
+    //
+    // This aliasing is safe due to the following synchronization protocol:
+    //   1. Q is loaded from global memory into shared memory (lines ~307-347)
+    //   2. __syncthreads() ensures all threads complete the Q store (line ~348)
+    //   3. Q is loaded from shared memory into REGISTERS via ldmatrix (lines ~353-362)
+    //   4. __syncthreads() ensures all threads have Q in registers (line ~366)
+    //   5. ONLY AFTER step 4 does K begin loading into the same shared memory
+    //
+    // The __syncthreads() at step 4 is the critical barrier that guarantees all
+    // threads have finished reading Q into registers before K overwrites the
+    // shared memory. If this sync were missing, threads that haven't yet executed
+    // their ldmatrix would read K data instead of Q data, causing incorrect results.
+    //
+    // Q is kept persistent in registers (Q_regs) for the entire K/V iteration loop,
+    // allowing the shared memory to be reused for streaming K blocks.
+    //
     extern __shared__ half smem[];
     const uint32_t Q_smem = __cvta_generic_to_shared(smem);
-    const uint32_t K_smem = Q_smem;  // Double buffer for K
+    const uint32_t K_smem = Q_smem;  // K reuses Q's shared memory (see aliasing note above)
     const uint32_t V_smem = K_smem + 2 * Config::BLOCK_N * DKQ * sizeof(half);
     constexpr size_t q_bytes  = Config::BLOCK_M * DKQ * sizeof(half);
     constexpr size_t kv_bytes = (2 * Config::BLOCK_N * DKQ + Config::BLOCK_N * DV) * sizeof(half);
@@ -241,11 +260,11 @@ __global__ void flash_attn_blackwell_f16(
     // Register storage for MMA operands
     // Q is persistent in registers
     uint32_t Q_regs[Config::WARP_Q / Config::MMA_M][DKQ / Config::MMA_K][4];
-    // K is loaded fresh each iteration
+    // K is loaded fresh each iteration. ldmatrix_x4 populates 2 mma_id_d slots at a time.
     uint32_t K_regs[Config::BLOCK_N / Config::MMA_N][DKQ / Config::MMA_K][2];
     // P (softmax output) for GEMM2
-    uint32_t P_regs[Config::WARP_Q / Config::MMA_M][Config::BLOCK_N / Config::MMA_K][4];
-    // V for GEMM2
+    uint32_t P_regs[Config::WARP_Q / Config::MMA_M][Config::BLOCK_N / Config::MMA_K][4] = {};
+    // V for GEMM2. ldmatrix_x4_trans populates 2 mma_id_d slots at a time.
     uint32_t V_regs[Config::BLOCK_N / Config::MMA_K][DV / Config::MMA_N][2];
     // Output accumulator
     float O_regs[Config::WARP_Q / Config::MMA_M][DV / Config::MMA_N][4] = {};
@@ -341,7 +360,10 @@ __global__ void flash_attn_blackwell_f16(
             fattn_ldmatrix_x4(Q_regs[mma_id_q][mma_id_d], addr);
         }
     }
-    __syncthreads();  // Ensure Q is loaded before reusing smem for K
+    // CRITICAL SYNC: This barrier ensures all threads have finished loading Q into
+    // registers before K begins overwriting the same shared memory. See the
+    // "MEMORY ALIASING NOTE" above for the full synchronization protocol.
+    __syncthreads();
 
     // ============================================================
     // K/V iteration loop
@@ -398,7 +420,7 @@ __global__ void flash_attn_blackwell_f16(
                     const int q = q_block_id * Config::BLOCK_M + q_local;
                     const int k = kv_id * Config::BLOCK_N + k_local;
                     const uint32_t dst_addr = mask_smem_addr + idx * sizeof(half);
-                    if (q < ne01 && k + (num_elems - 1) < ne11) {
+                    if (q < ne01 && k + (num_elems - 1) < ne11 && k_local <= Config::BLOCK_N - num_elems) {
                         const half *src = reinterpret_cast<const half *>(mask_base) + q * stride_mask + k;
                         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
                     } else {
@@ -447,6 +469,7 @@ __global__ void flash_attn_blackwell_f16(
         #pragma unroll
         for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_N; mma_id_kv++) {
             #pragma unroll
+            // ldmatrix_x4 loads two mma_id_d tiles per call
             for (int mma_id_d = 0; mma_id_d < DKQ / Config::MMA_K; mma_id_d += 2) {
                 uint32_t addr = K_smem_thread + (kv_id % 2) * (Config::BLOCK_N * DKQ * sizeof(half));
                 addr += mma_id_kv * Config::MMA_N * DKQ * sizeof(half);  // Row offset
@@ -572,9 +595,17 @@ __global__ void flash_attn_blackwell_f16(
             this_rowmax[1] = fmaxf(this_rowmax[1], rowmax[mma_id_q][1]);
 
             // Rescale previous O accumulators
+            // On first iteration (kv_id == 0), rowmax is -FLT_MAX, so exp(-FLT_MAX - x) = 0
+            // which would incorrectly zero out any accumulated values. Skip rescaling on first iter.
             float rescale[2];
-            rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
-            rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+            if (kv_id == 0) {
+                // First iteration: no previous output to rescale
+                rescale[0] = 1.0f;
+                rescale[1] = 1.0f;
+            } else {
+                rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+                rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+            }
 
             #pragma unroll
             for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d++) {
@@ -619,8 +650,14 @@ __global__ void flash_attn_blackwell_f16(
             this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
 
             // Accumulate to total rowsumexp
-            rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
-            rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+            // On first iteration, don't multiply by rescale (rowsumexp is 0, rescale would be 0)
+            if (kv_id == 0) {
+                rowsumexp[mma_id_q][0] = this_rowsumexp[0];
+                rowsumexp[mma_id_q][1] = this_rowsumexp[1];
+            } else {
+                rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+                rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+            }
         }
 
         // ============================================================
@@ -632,6 +669,7 @@ __global__ void flash_attn_blackwell_f16(
         #pragma unroll
         for (int mma_id_kv = 0; mma_id_kv < Config::BLOCK_N / Config::MMA_K; mma_id_kv++) {
             #pragma unroll
+            // ldmatrix_x4_trans loads two mma_id_d tiles per call
             for (int mma_id_d = 0; mma_id_d < DV / Config::MMA_N; mma_id_d += 2) {
                 uint32_t addr = V_smem_thread;
                 addr += mma_id_kv * Config::MMA_K * DV * sizeof(half);  // Row offset
@@ -678,10 +716,11 @@ __global__ void flash_attn_blackwell_f16(
             regs[3] /= denom1;
 
             // Write to global memory (F32 output)
+            // Output layout: [head_dim, num_heads, seq_len, batch] in row-major
             const int global_row = q_block_id * Config::BLOCK_M + row;
             if (global_row < ne01) {
-                float *dst_row0 = dst + (batch_id * ne02 + head_id) * ne01 * DV + (global_row + 0) * DV + col;
-                float *dst_row8 = dst + (batch_id * ne02 + head_id) * ne01 * DV + (global_row + 8) * DV + col;
+                float *dst_row0 = dst + ((batch_id * ne01 + (global_row + 0)) * ne02 + head_id) * DV + col;
+                float *dst_row8 = dst + ((batch_id * ne01 + (global_row + 8)) * ne02 + head_id) * DV + col;
 
                 dst_row0[0] = regs[0];
                 dst_row0[1] = regs[1];
@@ -783,7 +822,7 @@ void launch_flash_attn_blackwell_f16(
 // External interface
 // ----------------------------------------------------------------------------
 
-static void ggml_cuda_flash_attn_ext_blackwell_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_flash_attn_ext_blackwell_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if defined(CP_ASYNC_AVAILABLE) || !defined(__CUDA_ARCH__)
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -830,7 +869,7 @@ static void ggml_cuda_flash_attn_ext_blackwell_f16(ggml_backend_cuda_context & c
 #endif
 }
 
-static bool ggml_cuda_flash_attn_ext_blackwell_f16_supported(const ggml_tensor * dst) {
+bool ggml_cuda_flash_attn_ext_blackwell_f16_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -848,6 +887,11 @@ static bool ggml_cuda_flash_attn_ext_blackwell_f16_supported(const ggml_tensor *
 
     // Must be F16 inputs
     if (Q->type != GGML_TYPE_F16 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // Output must be F32
+    if (dst->type != GGML_TYPE_F32) {
         return false;
     }
 
