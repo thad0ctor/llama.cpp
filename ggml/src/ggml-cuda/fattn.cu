@@ -426,6 +426,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // Fall through to MMA/vec kernels below when Blackwell kernels are disabled or not applicable
     }
 
+    if (Q->type != GGML_TYPE_F32) {
+        ggml_cuda_log_fattn_skip_once("Q must be F32 for non-Blackwell kernels", dst);
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
@@ -532,10 +537,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_BLACKWELL_F16: kernel_name = "blackwell_f16"; break;
         default: break;
     }
-    if (getenv("GGML_CUDA_DEBUG_FATTN_KERNEL") != nullptr) {
-        fprintf(stderr, "ggml_cuda_flash_attn_ext: kernel=%s\n", kernel_name);
-        fflush(stderr);
-    }
+    (void) kernel_name;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:

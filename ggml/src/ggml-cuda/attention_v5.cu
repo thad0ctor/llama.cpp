@@ -783,10 +783,10 @@ void ggml_cuda_flash_attn_ext_attention_v5(ggml_backend_cuda_context & ctx, ggml
     const int64_t nb32 = mask ? mask->nb[2] : 0;
     const int64_t nb33 = mask ? mask->nb[3] : 0;
 
-    // Causal attention detection:
-    // Enable only when explicitly requested to avoid incorrect skips for non-causal masks.
-    // Set GGML_CUDA_CAUSAL_SKIP=1 to opt-in when the mask is known causal.
-    const int is_causal = (mask != nullptr && getenv("GGML_CUDA_CAUSAL_SKIP") != nullptr) ? 1 : 0;
+    // Causal tile skip only valid when Q and KV are position-aligned (len_q >= len_kv),
+    // i.e. during prefill. During decode (len_q=1, len_kv=context_len), local Q
+    // index 0 maps to the END of the sequence, so all KV positions are valid.
+    const int is_causal = (mask != nullptr && len_q >= len_kv && getenv("GGML_CUDA_CAUSAL_SKIP") != nullptr) ? 1 : 0;
 
     // Call the kernel
     attention_v5(Q_data, K_data, V_data, dst_data, mask_data, bs, len_q, len_kv, dim,
