@@ -144,3 +144,4 @@ a.out.*
 /build_rtx5090_optimized.sh
 results.csv
 learn-cuda/
+/logs
