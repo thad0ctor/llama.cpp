@@ -141,7 +141,7 @@ if (CUDAToolkit_FOUND)
     # 224 regs * 256 threads = 57,344 < 65,536 regs/SM ensures non-zero occupancy
     # IMPORTANT: Only apply when sm_120 is the sole architecture to avoid
     # penalizing other architectures (e.g., sm_86) in multi-arch builds.
-    set(GGML_CUDA_SM120_MAXRREGCOUNT 224 CACHE STRING "Max register count for sm_120 Blackwell GPUs")
+    set(GGML_CUDA_SM120_MAXRREGCOUNT 208 CACHE STRING "Max register count for sm_120 Blackwell GPUs")
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
