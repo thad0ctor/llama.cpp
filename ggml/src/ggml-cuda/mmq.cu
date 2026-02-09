@@ -77,7 +77,9 @@ void ggml_cuda_mul_mat_q(
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -112,8 +114,28 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc);
+    bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                     || GGML_CUDA_CC_IS_CDNA(cc);
+
+    if (use_stream_k) {
+        const int mmq_y = get_mmq_y_host(cc);
+        const int mmq_x_max = get_mmq_x_max_host(cc);
+
+        const int64_t ncols_max = ids ? ne12 : ne1;
+        const int64_t nrows_x = ne01;
+        const int64_t nchannels_y = ids ? ne02 : ne12;
+        const int64_t nsamples_y = ne13;
+
+        const int64_t nty = (nrows_x + mmq_y - 1) / mmq_y;
+        const int64_t ntx_min = (ncols_max + mmq_x_max - 1) / mmq_x_max;
+        const int64_t ntzw = nchannels_y * nsamples_y;
+        const int64_t ntiles_total_min = nty * ntx_min * ntzw;
+
+        // Disable stream-k when the grid is too small; fixup overhead dominates in that case.
+        if (ntiles_total_min < (int64_t) nsm * 2) {
+            use_stream_k = false;
+        }
+    }
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;

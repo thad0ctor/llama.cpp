@@ -15,7 +15,7 @@ using namespace ggml_cuda_mma;
 #define MMQ_ITER_K 256
 #define MMQ_ITER_K_MXFP4_FP4    512
 #define MMQ_ITER_K_Q8_0_BLACKWELL 512  // Datacenter Blackwell (sm_100, B200/B100) uses 2x K iteration for Q8_0 with m16n8k32
-#define MMQ_ITER_K_Q8_0_SM120   256    // Consumer Blackwell (sm_120, RTX 5090) uses standard K iteration due to 99KB shared memory limit
+#define MMQ_ITER_K_Q8_0_SM120   240    // Consumer Blackwell (sm_120, RTX 5090) uses reduced K iteration due to 99KB shared memory limit
 #define MMQ_NWARPS 8
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
@@ -3797,7 +3797,9 @@ template <ggml_type type, int mmq_x, bool need_check>
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
 #else
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#if __CUDA_ARCH__ >= 100
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), (mmq_x <= 96 ? 2 : 1))
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
 #else
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -4358,6 +4360,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
             mmq_x_best = mmq_x;
             ntiles_x_best = ntiles_x;
         }
+    }
+
+    if (ggml_cuda_is_consumer_blackwell(cc) && mmq_x_best > 112) {
+        mmq_x_best = 112;
     }
 
     switch (mmq_x_best) {
