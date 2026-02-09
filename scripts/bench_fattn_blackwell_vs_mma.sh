@@ -32,7 +32,15 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 ENV_FORCE_MMQ="${GGML_CUDA_FORCE_MMQ:-1}"
 ENV_CUDA_F16="${GGML_CUDA_F16:-1}"
 
-# Scenarios
+# Mode: "sweep" (default, threshold tuning) or "scenarios" (original behavior)
+MODE="${MODE:-sweep}"
+
+# Sweep mode: batch sizes to test (space-separated powers of 2)
+SWEEP_BATCH_SIZES="${SWEEP_BATCH_SIZES:-1 2 4 8 16 32 64 128 256 512}"
+# Context lengths to hold fixed while sweeping batch size (decode context)
+SWEEP_CONTEXTS="${SWEEP_CONTEXTS:-4096}"
+
+# Scenarios (used in MODE=scenarios)
 PREFILL_PROMPT="${PREFILL_PROMPT:-4096}"
 PREFILL_GEN="${PREFILL_GEN:-1}"
 DECODE_PROMPT="${DECODE_PROMPT:-1}"
@@ -40,7 +48,7 @@ DECODE_GEN="${DECODE_GEN:-512}"
 LONG_PROMPT="${LONG_PROMPT:-40000}"
 LONG_GEN="${LONG_GEN:-500}"
 COMBINED_PROMPT="${COMBINED_PROMPT:-$PREFILL_PROMPT}"
-COMBINED_GEN="${COMBINED_GEN:-$DECODE_GEN}"
+COMBINED_GEN="${COMBINED_GEN:-$DECODE_PROMPT}"
 COMBINED_LONG_PROMPT="${COMBINED_LONG_PROMPT:-$LONG_PROMPT}"
 COMBINED_LONG_GEN="${COMBINED_LONG_GEN:-$LONG_GEN}"
 
@@ -71,15 +79,21 @@ LOG_FILE="$LOG_DIR/fattn_bench_${RUN_ID}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "Run ID: $RUN_ID"
+echo "Mode: $MODE"
 echo "Model: $MODEL"
 echo "Bench (blackwell): $BENCH_BIN_BLACKWELL"
 echo "Bench (vanilla):  $BENCH_BIN_VANILLA"
 echo "Params: NGL=$NGL THREADS=$THREADS BATCH=$BATCH UBATCH=$UBATCH REPS=$REPS"
-echo "Prefill: prompt=$PREFILL_PROMPT gen=$PREFILL_GEN"
-echo "Decode:  prompt=$DECODE_PROMPT gen=$DECODE_GEN"
-echo "Long:    prompt=$LONG_PROMPT gen=$LONG_GEN"
-echo "Combined:       prompt=$COMBINED_PROMPT gen=$COMBINED_GEN"
-echo "Combined Long:  prompt=$COMBINED_LONG_PROMPT gen=$COMBINED_LONG_GEN"
+if [[ "$MODE" == "sweep" ]]; then
+  echo "Sweep batch sizes: $SWEEP_BATCH_SIZES"
+  echo "Sweep contexts: $SWEEP_CONTEXTS"
+else
+  echo "Prefill: prompt=$PREFILL_PROMPT gen=$PREFILL_GEN"
+  echo "Decode:  prompt=$DECODE_PROMPT gen=$DECODE_GEN"
+  echo "Long:    prompt=$LONG_PROMPT gen=$LONG_GEN"
+  echo "Combined:       prompt=$COMBINED_PROMPT gen=$COMBINED_GEN"
+  echo "Combined Long:  prompt=$COMBINED_LONG_PROMPT gen=$COMBINED_LONG_GEN"
+fi
 echo "Env: CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER"
 echo "Env: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "Env: GGML_CUDA_FORCE_MMQ=$ENV_FORCE_MMQ"
@@ -163,6 +177,8 @@ run_case() {
   local n_gen="$3"
   local kernel_label="$4"
   local no_blackwell="$5"
+  local batch_override="${6:-}"
+  local ubatch_override="${7:-}"
 
   local tmp_csv="$LOG_DIR/tmp_${RUN_ID}_${scenario}_${kernel_label}.csv"
 
@@ -188,8 +204,11 @@ run_case() {
     env_vars+=("GGML_CUDA_DISABLE_GRAPHS=$ENV_DISABLE_GRAPHS")
   fi
 
+  local use_batch="${batch_override:-$BATCH}"
+  local use_ubatch="${ubatch_override:-$UBATCH}"
+
   echo "---"
-  echo "Running: scenario=$scenario kernel=$kernel_label no_blackwell=$no_blackwell"
+  echo "Running: scenario=$scenario kernel=$kernel_label no_blackwell=$no_blackwell b=$use_batch ub=$use_ubatch"
 
   local bench_bin
   if [[ "$no_blackwell" == "1" ]]; then
@@ -206,8 +225,8 @@ run_case() {
     -fa 1
     --no-warmup
     -r "$REPS"
-    -b "$BATCH"
-    -ub "$UBATCH"
+    -b "$use_batch"
+    -ub "$use_ubatch"
     -p "$n_prompt"
     -n "$n_gen"
     -o csv
@@ -281,30 +300,174 @@ run_case() {
   auto_append_csv "$tmp_csv" "$scenario" "$kernel_label" "$no_blackwell" "$ENV_NO_ATTN_V5" "${ENV_DISABLE_GRAPHS:-0}"
 }
 
-run_case "prefill" "$PREFILL_PROMPT" "$PREFILL_GEN" "blackwell_f16" "0"
-run_case "decode"  "$DECODE_PROMPT" "$DECODE_GEN" "blackwell_f16" "0"
-if [[ "$COMBINED_PROMPT" -gt 0 && "$COMBINED_GEN" -gt 0 ]]; then
-  run_case "combined" "$COMBINED_PROMPT" "$COMBINED_GEN" "blackwell_f16" "0"
-fi
-if [[ "$LONG_PROMPT" -gt 0 || "$LONG_GEN" -gt 0 ]]; then
-  run_case "long" "$LONG_PROMPT" "$LONG_GEN" "blackwell_f16" "0"
-fi
-if [[ "$COMBINED_LONG_PROMPT" -gt 0 && "$COMBINED_LONG_GEN" -gt 0 ]]; then
-  run_case "combined_long" "$COMBINED_LONG_PROMPT" "$COMBINED_LONG_GEN" "blackwell_f16" "0"
-fi
+# ============================================================
+# Sweep mode: find blackwell_f16 vs mma_f16 crossover point
+# ============================================================
+#
+# For each batch size N in SWEEP_BATCH_SIZES, run prefill-only
+# (-p N -n 0) with -b N -ub N so the entire prompt is one
+# attention call with Q->ne[1] = N.  Compare tok/s between
+# blackwell_f16 and mma_f16 to find where blackwell starts winning.
+#
+# Usage:
+#   MODE=sweep scripts/bench_fattn_blackwell_vs_mma.sh
+#   MODE=sweep SWEEP_BATCH_SIZES="1 4 16 64 256 1024" scripts/bench_fattn_blackwell_vs_mma.sh
+#   MODE=sweep SWEEP_CONTEXTS="2048 8192" scripts/bench_fattn_blackwell_vs_mma.sh
+# ============================================================
 
-run_case "prefill" "$PREFILL_PROMPT" "$PREFILL_GEN" "mma_f16" "1"
-run_case "decode"  "$DECODE_PROMPT" "$DECODE_GEN" "mma_f16" "1"
-if [[ "$COMBINED_PROMPT" -gt 0 && "$COMBINED_GEN" -gt 0 ]]; then
-  run_case "combined" "$COMBINED_PROMPT" "$COMBINED_GEN" "mma_f16" "1"
-fi
-if [[ "$LONG_PROMPT" -gt 0 || "$LONG_GEN" -gt 0 ]]; then
-  run_case "long" "$LONG_PROMPT" "$LONG_GEN" "mma_f16" "1"
-fi
-if [[ "$COMBINED_LONG_PROMPT" -gt 0 && "$COMBINED_LONG_GEN" -gt 0 ]]; then
-  run_case "combined_long" "$COMBINED_LONG_PROMPT" "$COMBINED_LONG_GEN" "mma_f16" "1"
-fi
+# Extract avg tok/s from llama-bench CSV output.
+# llama-bench CSV header has "avg_ts" for the speed column.
+# With -p N -n 0 there is exactly one data row (prompt processing).
+extract_pp_toks() {
+  local csv_file="$1"
+  awk -F',' '
+    NR==1 {
+      for (i=1; i<=NF; i++) {
+        if ($i == "avg_ts" || $i == "\"avg_ts\"") { ts_col=i }
+      }
+      next
+    }
+    NR==2 {
+      if (ts_col) { gsub(/"/, "", $ts_col); print $ts_col }
+    }
+  ' "$csv_file" 2>/dev/null
+}
 
-echo ""
-echo "Done. Results: $OUT_CSV"
-echo "Log: $LOG_FILE"
+if [[ "$MODE" == "sweep" ]]; then
+  SWEEP_CSV="$LOG_DIR/fattn_sweep_${RUN_ID}.csv"
+  echo "n_queries,context,blackwell_f16_tps,mma_f16_tps,delta_pct,faster" > "$SWEEP_CSV"
+
+  # Collect results for the summary table
+  declare -a SWEEP_RESULTS=()
+
+  for ctx in $SWEEP_CONTEXTS; do
+    echo ""
+    echo "========================================"
+    echo "  Sweep: context=$ctx"
+    echo "========================================"
+
+    for bs in $SWEEP_BATCH_SIZES; do
+      # Prefill-only: -p sets prompt length (= Q->ne[1] per ubatch),
+      # -n 0 means no decode.  -b and -ub match so it's a single batch.
+      local_b="$bs"
+      local_ub="$bs"
+
+      # If bs > ctx, skip (prompt can't exceed context)
+      if [[ "$bs" -gt "$ctx" ]]; then
+        echo "  Skipping n_queries=$bs (exceeds context=$ctx)"
+        continue
+      fi
+
+      echo ""
+      echo "--- n_queries=$bs context=$ctx ---"
+
+      # Run blackwell_f16 (fork binary, no env disable)
+      run_case "sweep_pp${bs}_ctx${ctx}" "$bs" "0" "blackwell_f16" "0" "$local_b" "$local_ub"
+      bw_csv="$LOG_DIR/tmp_${RUN_ID}_sweep_pp${bs}_ctx${ctx}_blackwell_f16.csv"
+      bw_tps=$(extract_pp_toks "$bw_csv")
+
+      # Run mma_f16 (vanilla binary, blackwell disabled)
+      run_case "sweep_pp${bs}_ctx${ctx}" "$bs" "0" "mma_f16" "1" "$local_b" "$local_ub"
+      mma_csv="$LOG_DIR/tmp_${RUN_ID}_sweep_pp${bs}_ctx${ctx}_mma_f16.csv"
+      mma_tps=$(extract_pp_toks "$mma_csv")
+
+      # Compute delta
+      delta_pct="N/A"
+      faster="N/A"
+      if [[ -n "$bw_tps" && -n "$mma_tps" ]] && \
+         (( $(echo "$mma_tps > 0" | bc -l 2>/dev/null || echo 0) )); then
+        delta_pct=$(echo "scale=1; ($bw_tps - $mma_tps) / $mma_tps * 100" | bc -l 2>/dev/null || echo "N/A")
+        if (( $(echo "$bw_tps > $mma_tps" | bc -l 2>/dev/null || echo 0) )); then
+          faster="blackwell"
+        elif (( $(echo "$bw_tps < $mma_tps" | bc -l 2>/dev/null || echo 0) )); then
+          faster="mma"
+        else
+          faster="tie"
+        fi
+      fi
+
+      echo "$bs,$ctx,${bw_tps:-N/A},${mma_tps:-N/A},${delta_pct},${faster}" >> "$SWEEP_CSV"
+      SWEEP_RESULTS+=("$bs|$ctx|${bw_tps:-N/A}|${mma_tps:-N/A}|${delta_pct}|${faster}")
+    done
+  done
+
+  # Print summary table
+  echo ""
+  echo "========================================"
+  echo "  CROSSOVER SUMMARY"
+  echo "========================================"
+  printf "%-12s %-10s %-18s %-18s %-10s %-10s\n" \
+    "n_queries" "context" "blackwell_f16" "mma_f16" "delta%" "faster"
+  printf "%-12s %-10s %-18s %-18s %-10s %-10s\n" \
+    "----------" "--------" "----------------" "----------------" "--------" "--------"
+
+  crossover_found=""
+  prev_faster=""
+  for row in "${SWEEP_RESULTS[@]}"; do
+    IFS='|' read -r bs ctx bw_tps mma_tps delta_pct faster <<< "$row"
+    printf "%-12s %-10s %-18s %-18s %-10s %-10s\n" \
+      "$bs" "$ctx" "$bw_tps" "$mma_tps" "$delta_pct" "$faster"
+
+    # Detect crossover: mma -> blackwell transition
+    if [[ "$prev_faster" == "mma" && "$faster" == "blackwell" && -z "$crossover_found" ]]; then
+      crossover_found="$bs"
+    fi
+    prev_faster="$faster"
+  done
+
+  echo ""
+  if [[ -n "$crossover_found" ]]; then
+    echo ">>> Crossover detected at n_queries=$crossover_found"
+    echo "    Suggested threshold: $crossover_found (blackwell_f16 faster at and above this batch size)"
+    echo "    Current threshold in fattn.cu / llama-graph.cpp: 32"
+    echo ""
+    echo "    To update, change 'Q->ne[1] >= 32' and 'n_queries >= 32' to >= $crossover_found"
+  else
+    if [[ "$prev_faster" == "blackwell" ]]; then
+      echo ">>> blackwell_f16 is faster at all tested batch sizes."
+      echo "    Consider lowering the threshold below $(echo "$SWEEP_BATCH_SIZES" | awk '{print $1}')."
+    elif [[ "$prev_faster" == "mma" ]]; then
+      echo ">>> mma_f16 is faster at all tested batch sizes."
+      echo "    Consider raising the threshold above $(echo "$SWEEP_BATCH_SIZES" | awk '{print $NF}')."
+    else
+      echo ">>> Could not determine crossover (missing data?)."
+    fi
+  fi
+
+  echo ""
+  echo "Sweep CSV: $SWEEP_CSV"
+  echo "Full CSV:  $OUT_CSV"
+  echo "Log:       $LOG_FILE"
+
+# ============================================================
+# Scenarios mode (original behavior)
+# ============================================================
+else
+  run_case "prefill" "$PREFILL_PROMPT" "$PREFILL_GEN" "blackwell_f16" "0"
+  run_case "decode"  "$DECODE_PROMPT" "$DECODE_GEN" "blackwell_f16" "0"
+  if [[ "$COMBINED_PROMPT" -gt 0 && "$COMBINED_GEN" -gt 0 ]]; then
+    run_case "combined" "$COMBINED_PROMPT" "$COMBINED_GEN" "blackwell_f16" "0"
+  fi
+  if [[ "$LONG_PROMPT" -gt 0 || "$LONG_GEN" -gt 0 ]]; then
+    run_case "long" "$LONG_PROMPT" "$LONG_GEN" "blackwell_f16" "0"
+  fi
+  if [[ "$COMBINED_LONG_PROMPT" -gt 0 && "$COMBINED_LONG_GEN" -gt 0 ]]; then
+    run_case "combined_long" "$COMBINED_LONG_PROMPT" "$COMBINED_LONG_GEN" "blackwell_f16" "0"
+  fi
+
+  run_case "prefill" "$PREFILL_PROMPT" "$PREFILL_GEN" "mma_f16" "1"
+  run_case "decode"  "$DECODE_PROMPT" "$DECODE_GEN" "mma_f16" "1"
+  if [[ "$COMBINED_PROMPT" -gt 0 && "$COMBINED_GEN" -gt 0 ]]; then
+    run_case "combined" "$COMBINED_PROMPT" "$COMBINED_GEN" "mma_f16" "1"
+  fi
+  if [[ "$LONG_PROMPT" -gt 0 || "$LONG_GEN" -gt 0 ]]; then
+    run_case "long" "$LONG_PROMPT" "$LONG_GEN" "mma_f16" "1"
+  fi
+  if [[ "$COMBINED_LONG_PROMPT" -gt 0 && "$COMBINED_LONG_GEN" -gt 0 ]]; then
+    run_case "combined_long" "$COMBINED_LONG_PROMPT" "$COMBINED_LONG_GEN" "mma_f16" "1"
+  fi
+
+  echo ""
+  echo "Done. Results: $OUT_CSV"
+  echo "Log: $LOG_FILE"
+fi
