@@ -5,9 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="$ROOT_DIR/logs/bench"
 mkdir -p "$LOG_DIR"
 
-BENCH_BIN="$ROOT_DIR/build/bin/llama-bench"
-if [[ ! -x "$BENCH_BIN" ]]; then
-  echo "ERROR: llama-bench not found or not executable: $BENCH_BIN" >&2
+BENCH_BIN_BLACKWELL_DEFAULT="$ROOT_DIR/build/bin/llama-bench"
+BENCH_BIN_VANILLA_DEFAULT="/home/rgilbreth/Desktop/AI-Software/llama.cpp/build/bin/llama-bench"
+BENCH_BIN_BLACKWELL="${BENCH_BIN_BLACKWELL:-$BENCH_BIN_BLACKWELL_DEFAULT}"
+BENCH_BIN_VANILLA="${BENCH_BIN_VANILLA:-$BENCH_BIN_VANILLA_DEFAULT}"
+if [[ ! -x "$BENCH_BIN_BLACKWELL" ]]; then
+  echo "ERROR: blackwell llama-bench not found or not executable: $BENCH_BIN_BLACKWELL" >&2
+  exit 1
+fi
+if [[ ! -x "$BENCH_BIN_VANILLA" ]]; then
+  echo "ERROR: vanilla llama-bench not found or not executable: $BENCH_BIN_VANILLA" >&2
   exit 1
 fi
 
@@ -16,21 +23,29 @@ MODEL_DEFAULT="/media/rgilbreth/AI-M2-2TB/Models/Qwen3/Coder/30B-A3B/Q8_0/Qwen3-
 MODEL="${MODEL:-$MODEL_DEFAULT}"
 NGL="${NGL:-999}"
 THREADS="${THREADS:-24}"
-BATCH="${BATCH:-128}"
-UBATCH="${UBATCH:-128}"
+BATCH="${BATCH:-1024}"
+UBATCH="${UBATCH:-1024}"
 REPS="${REPS:-3}"
 CUDA_DEVICE_ORDER_DEFAULT="PCI_BUS_ID"
 CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-$CUDA_DEVICE_ORDER_DEFAULT}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+ENV_FORCE_MMQ="${GGML_CUDA_FORCE_MMQ:-1}"
+ENV_CUDA_F16="${GGML_CUDA_F16:-1}"
 
 # Scenarios
 PREFILL_PROMPT="${PREFILL_PROMPT:-4096}"
 PREFILL_GEN="${PREFILL_GEN:-1}"
 DECODE_PROMPT="${DECODE_PROMPT:-1}"
 DECODE_GEN="${DECODE_GEN:-512}"
+LONG_PROMPT="${LONG_PROMPT:-40000}"
+LONG_GEN="${LONG_GEN:-500}"
+COMBINED_PROMPT="${COMBINED_PROMPT:-$PREFILL_PROMPT}"
+COMBINED_GEN="${COMBINED_GEN:-$DECODE_GEN}"
+COMBINED_LONG_PROMPT="${COMBINED_LONG_PROMPT:-$LONG_PROMPT}"
+COMBINED_LONG_GEN="${COMBINED_LONG_GEN:-$LONG_GEN}"
 
 # Kernel selection
-ENV_NO_ATTN_V5="${GGML_CUDA_NO_ATTENTION_V5:-1}"
+ENV_NO_ATTN_V5="${GGML_CUDA_NO_ATTENTION_V5-}"
 ENV_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-}"
 
 # Profiling modes:
@@ -57,13 +72,21 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "Run ID: $RUN_ID"
 echo "Model: $MODEL"
-echo "Bench: $BENCH_BIN"
+echo "Bench (blackwell): $BENCH_BIN_BLACKWELL"
+echo "Bench (vanilla):  $BENCH_BIN_VANILLA"
 echo "Params: NGL=$NGL THREADS=$THREADS BATCH=$BATCH UBATCH=$UBATCH REPS=$REPS"
 echo "Prefill: prompt=$PREFILL_PROMPT gen=$PREFILL_GEN"
 echo "Decode:  prompt=$DECODE_PROMPT gen=$DECODE_GEN"
+echo "Long:    prompt=$LONG_PROMPT gen=$LONG_GEN"
+echo "Combined:       prompt=$COMBINED_PROMPT gen=$COMBINED_GEN"
+echo "Combined Long:  prompt=$COMBINED_LONG_PROMPT gen=$COMBINED_LONG_GEN"
 echo "Env: CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER"
 echo "Env: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-echo "Env: GGML_CUDA_NO_ATTENTION_V5=$ENV_NO_ATTN_V5"
+echo "Env: GGML_CUDA_FORCE_MMQ=$ENV_FORCE_MMQ"
+echo "Env: GGML_CUDA_F16=$ENV_CUDA_F16"
+if [[ -n "$ENV_NO_ATTN_V5" ]]; then
+  echo "Env: GGML_CUDA_NO_ATTENTION_V5=$ENV_NO_ATTN_V5"
+fi
 if [[ -n "$ENV_DISABLE_GRAPHS" ]]; then
   echo "Env: GGML_CUDA_DISABLE_GRAPHS=$ENV_DISABLE_GRAPHS"
 fi
@@ -143,27 +166,40 @@ run_case() {
 
   local tmp_csv="$LOG_DIR/tmp_${RUN_ID}_${scenario}_${kernel_label}.csv"
 
-  local -a env_cmd
+  local -a env_cmd env_opts env_vars
   env_cmd=(env)
 
   if [[ "$no_blackwell" == "1" ]]; then
-    env_cmd+=("GGML_CUDA_NO_BLACKWELL_F16=1")
+    env_vars+=("GGML_CUDA_NO_BLACKWELL_F16=1")
   else
-    env_cmd+=("-u" "GGML_CUDA_NO_BLACKWELL_F16")
+    env_opts+=("-u" "GGML_CUDA_NO_BLACKWELL_F16")
   fi
 
-  env_cmd+=("CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER")
-  env_cmd+=("CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
-  env_cmd+=("GGML_CUDA_NO_ATTENTION_V5=$ENV_NO_ATTN_V5")
+  env_vars+=("CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER")
+  env_vars+=("CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+  env_vars+=("GGML_CUDA_FORCE_MMQ=$ENV_FORCE_MMQ")
+  env_vars+=("GGML_CUDA_F16=$ENV_CUDA_F16")
+  if [[ -n "$ENV_NO_ATTN_V5" ]]; then
+    env_vars+=("GGML_CUDA_NO_ATTENTION_V5=$ENV_NO_ATTN_V5")
+  else
+    env_opts+=("-u" "GGML_CUDA_NO_ATTENTION_V5")
+  fi
   if [[ -n "$ENV_DISABLE_GRAPHS" ]]; then
-    env_cmd+=("GGML_CUDA_DISABLE_GRAPHS=$ENV_DISABLE_GRAPHS")
+    env_vars+=("GGML_CUDA_DISABLE_GRAPHS=$ENV_DISABLE_GRAPHS")
   fi
 
   echo "---"
   echo "Running: scenario=$scenario kernel=$kernel_label no_blackwell=$no_blackwell"
 
+  local bench_bin
+  if [[ "$no_blackwell" == "1" ]]; then
+    bench_bin="$BENCH_BIN_VANILLA"
+  else
+    bench_bin="$BENCH_BIN_BLACKWELL"
+  fi
+
   local -a bench_cmd
-  bench_cmd=( "$BENCH_BIN"
+  bench_cmd=( "$bench_bin"
     -m "$MODEL"
     -ngl "$NGL"
     -t "$THREADS"
@@ -206,7 +242,7 @@ run_case() {
     echo "  Log: $ncu_log"
     # replay-mode=kernel: outputs per-kernel results incrementally as each completes
     # (application mode buffers everything until the end)
-    if ! "${env_cmd[@]}" "$NCU_BIN" \
+    if ! "${env_cmd[@]}" "${env_opts[@]}" "${env_vars[@]}" "$NCU_BIN" \
       --metrics "$ncu_metrics" \
       --replay-mode kernel \
       -k "$ncu_kernel_regex" \
@@ -239,7 +275,7 @@ run_case() {
       echo "WARN: No profile data produced for ${scenario}/${kernel_label}." >&2
     fi
   else
-    "${env_cmd[@]}" "${bench_cmd[@]}" > "$tmp_csv"
+  "${env_cmd[@]}" "${env_opts[@]}" "${env_vars[@]}" "${bench_cmd[@]}" > "$tmp_csv"
   fi
 
   auto_append_csv "$tmp_csv" "$scenario" "$kernel_label" "$no_blackwell" "$ENV_NO_ATTN_V5" "${ENV_DISABLE_GRAPHS:-0}"
@@ -247,9 +283,27 @@ run_case() {
 
 run_case "prefill" "$PREFILL_PROMPT" "$PREFILL_GEN" "blackwell_f16" "0"
 run_case "decode"  "$DECODE_PROMPT" "$DECODE_GEN" "blackwell_f16" "0"
+if [[ "$COMBINED_PROMPT" -gt 0 && "$COMBINED_GEN" -gt 0 ]]; then
+  run_case "combined" "$COMBINED_PROMPT" "$COMBINED_GEN" "blackwell_f16" "0"
+fi
+if [[ "$LONG_PROMPT" -gt 0 || "$LONG_GEN" -gt 0 ]]; then
+  run_case "long" "$LONG_PROMPT" "$LONG_GEN" "blackwell_f16" "0"
+fi
+if [[ "$COMBINED_LONG_PROMPT" -gt 0 && "$COMBINED_LONG_GEN" -gt 0 ]]; then
+  run_case "combined_long" "$COMBINED_LONG_PROMPT" "$COMBINED_LONG_GEN" "blackwell_f16" "0"
+fi
 
 run_case "prefill" "$PREFILL_PROMPT" "$PREFILL_GEN" "mma_f16" "1"
 run_case "decode"  "$DECODE_PROMPT" "$DECODE_GEN" "mma_f16" "1"
+if [[ "$COMBINED_PROMPT" -gt 0 && "$COMBINED_GEN" -gt 0 ]]; then
+  run_case "combined" "$COMBINED_PROMPT" "$COMBINED_GEN" "mma_f16" "1"
+fi
+if [[ "$LONG_PROMPT" -gt 0 || "$LONG_GEN" -gt 0 ]]; then
+  run_case "long" "$LONG_PROMPT" "$LONG_GEN" "mma_f16" "1"
+fi
+if [[ "$COMBINED_LONG_PROMPT" -gt 0 && "$COMBINED_LONG_GEN" -gt 0 ]]; then
+  run_case "combined_long" "$COMBINED_LONG_PROMPT" "$COMBINED_LONG_GEN" "mma_f16" "1"
+fi
 
 echo ""
 echo "Done. Results: $OUT_CSV"
