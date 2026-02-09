@@ -111,11 +111,13 @@ fi
         -m "$MODEL" \
         --threads 24 \
         --threads-batch 48 \
-        --ctx-size 24000 \
+        --ctx-size 52000 \
         --temp 0.6 \
         --min-p 0.01 \
         --n-gpu-layers 999 \
         --flash-attn on \
+        --batch-size 1024 \
+        --ubatch-size 1024 \
         --parallel 1 \
         --port 5001 \
         --no-warmup \
