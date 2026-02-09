@@ -15,7 +15,7 @@ using namespace ggml_cuda_mma;
 #define MMQ_ITER_K 256
 #define MMQ_ITER_K_MXFP4_FP4    512
 #define MMQ_ITER_K_Q8_0_BLACKWELL 512  // Datacenter Blackwell (sm_100, B200/B100) uses 2x K iteration for Q8_0 with m16n8k32
-#define MMQ_ITER_K_Q8_0_SM120   240    // Consumer Blackwell (sm_120, RTX 5090) uses reduced K iteration due to 99KB shared memory limit
+#define MMQ_ITER_K_Q8_0_SM120   224    // Consumer Blackwell (sm_120, RTX 5090) uses reduced K iteration due to 99KB shared memory limit
 #define MMQ_NWARPS 8
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
