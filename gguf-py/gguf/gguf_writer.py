@@ -851,6 +851,15 @@ class GGUFWriter:
     def add_moe_every_n_layers(self, value: int) -> None:
         self.add_uint32(Keys.LLM.MOE_EVERY_N_LAYERS.format(arch=self.arch), value)
 
+    def add_moe_quant_group_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.MOE_QUANT_GROUP_COUNT.format(arch=self.arch), count)
+
+    def add_moe_quant_expert_group_map(self, bid: int, expert_group_map: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.MOE_QUANT_EXPERT_GROUP_MAP.format(arch=self.arch, bid=bid), expert_group_map)
+
+    def add_moe_quant_expert_index_map(self, bid: int, expert_index_map: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.MOE_QUANT_EXPERT_INDEX_MAP.format(arch=self.arch, bid=bid), expert_index_map)
+
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 

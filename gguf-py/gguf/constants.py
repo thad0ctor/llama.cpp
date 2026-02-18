@@ -125,6 +125,9 @@ class Keys:
         EXPERT_GROUP_SCALE                = "{arch}.expert_group_scale"
         EXPERTS_PER_GROUP                 = "{arch}.experts_per_group"
         MOE_EVERY_N_LAYERS                = "{arch}.moe_every_n_layers"
+        MOE_QUANT_GROUP_COUNT             = "{arch}.moe_quant_group_count"
+        MOE_QUANT_EXPERT_GROUP_MAP        = "{arch}.moe_quant_expert_group_map.{bid}"
+        MOE_QUANT_EXPERT_INDEX_MAP        = "{arch}.moe_quant_expert_index_map.{bid}"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         POOLING_TYPE                      = "{arch}.pooling_type"
@@ -536,6 +539,9 @@ class MODEL_TENSOR(IntEnum):
     FFN_DOWN_CHEXP       = auto()
     FFN_UP_CHEXP         = auto()
     FFN_EXP_PROBS_B      = auto()
+    FFN_GATE_EXP_GRP     = auto()  # grouped expert gate (quantization groups)
+    FFN_DOWN_EXP_GRP     = auto()  # grouped expert down
+    FFN_UP_EXP_GRP       = auto()  # grouped expert up
     ATTN_Q_NORM          = auto()
     ATTN_K_NORM          = auto()
     LAYER_OUT_NORM       = auto()
@@ -974,6 +980,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_DOWN_EXP:              "blk.{bid}.ffn_down_exps",
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
+    MODEL_TENSOR.FFN_GATE_EXP_GRP:         "blk.{bid}.ffn_gate_exps.g{gid}",
+    MODEL_TENSOR.FFN_DOWN_EXP_GRP:         "blk.{bid}.ffn_down_exps.g{gid}",
+    MODEL_TENSOR.FFN_UP_EXP_GRP:           "blk.{bid}.ffn_up_exps.g{gid}",
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
     MODEL_TENSOR.PER_LAYER_TOKEN_EMBD:      "per_layer_token_embd",           # gemma3n
     MODEL_TENSOR.PER_LAYER_MODEL_PROJ:      "per_layer_model_proj",           # gemma3n
@@ -3397,6 +3406,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP_GRP,
+        MODEL_TENSOR.FFN_DOWN_EXP_GRP,
+        MODEL_TENSOR.FFN_UP_EXP_GRP,
     ],
     MODEL_ARCH.COGVLM: [
         MODEL_TENSOR.TOKEN_EMBD,

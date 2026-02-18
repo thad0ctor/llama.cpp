@@ -181,6 +181,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EXPERT_GROUP_SCALE,                "%s.expert_group_scale"                },
     { LLM_KV_EXPERTS_PER_GROUP,                 "%s.experts_per_group"                 },
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
+    { LLM_KV_MOE_QUANT_GROUP_COUNT,             "%s.moe_quant_group_count"             },
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_POOLING_TYPE,                      "%s.pooling_type"                      },
@@ -357,6 +358,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_UP_SHEXP,                           "blk.%d.ffn_up_shexp" },
     { LLM_TENSOR_FFN_DOWN_SHEXP,                         "blk.%d.ffn_down_shexp" },
     { LLM_TENSOR_FFN_EXP_PROBS_B,                        "blk.%d.exp_probs_b" },
+    { LLM_TENSOR_FFN_GATE_EXPS_GRP,                      "blk.%d.ffn_gate_exps.g%d" },
+    { LLM_TENSOR_FFN_DOWN_EXPS_GRP,                      "blk.%d.ffn_down_exps.g%d" },
+    { LLM_TENSOR_FFN_UP_EXPS_GRP,                        "blk.%d.ffn_up_exps.g%d" },
     { LLM_TENSOR_ATTN_NORM_2,                            "blk.%d.attn_norm_2" },
     { LLM_TENSOR_ATTN_QKV,                               "blk.%d.attn_qkv" },
     { LLM_TENSOR_LAYER_OUT_NORM,                         "blk.%d.layer_output_norm" },
@@ -2350,6 +2354,9 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_FFN_DOWN_EXPS,
                 LLM_TENSOR_FFN_UP_EXPS,
                 LLM_TENSOR_FFN_EXP_PROBS_B,
+                LLM_TENSOR_FFN_GATE_EXPS_GRP,
+                LLM_TENSOR_FFN_DOWN_EXPS_GRP,
+                LLM_TENSOR_FFN_UP_EXPS_GRP,
             };
         case LLM_ARCH_COGVLM:
             return {

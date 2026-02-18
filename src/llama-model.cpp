@@ -2413,6 +2413,44 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,   hparams.n_ff_exp);
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,           hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_MOE_QUANT_GROUP_COUNT,        hparams.moe_quant_group_count, false);
+
+                if (hparams.moe_quant_group_count > 0) {
+                    const std::string arch_name = llm_arch_name(arch);
+                    moe_quant_expert_group_map.resize(hparams.n_layer);
+                    moe_quant_expert_index_map.resize(hparams.n_layer);
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        const std::string gmap_key = format("%s.moe_quant_expert_group_map.%u", arch_name.c_str(), il);
+                        const std::string imap_key = format("%s.moe_quant_expert_index_map.%u", arch_name.c_str(), il);
+                        ml.get_arr(gmap_key, moe_quant_expert_group_map[il]);
+                        ml.get_arr(imap_key, moe_quant_expert_index_map[il]);
+
+                        GGML_ASSERT(moe_quant_expert_group_map[il].size() == hparams.n_expert);
+                        GGML_ASSERT(moe_quant_expert_index_map[il].size() == hparams.n_expert);
+
+                        // compute per-group sizes and validate group_id range
+                        std::vector<uint32_t> grp_sizes(hparams.moe_quant_group_count, 0);
+                        for (uint32_t eid = 0; eid < hparams.n_expert; ++eid) {
+                            const uint32_t gid = moe_quant_expert_group_map[il][eid];
+                            GGML_ASSERT(gid < hparams.moe_quant_group_count);
+                            grp_sizes[gid]++;
+                        }
+
+                        // validate expert_index_map: each entry must be < its group size,
+                        // and indices within each group must be exactly 0..group_size-1
+                        std::vector<std::vector<bool>> idx_seen(hparams.moe_quant_group_count);
+                        for (uint32_t gid = 0; gid < hparams.moe_quant_group_count; ++gid) {
+                            idx_seen[gid].assign(grp_sizes[gid], false);
+                        }
+                        for (uint32_t eid = 0; eid < hparams.n_expert; ++eid) {
+                            const uint32_t gid = moe_quant_expert_group_map[il][eid];
+                            const uint32_t idx = moe_quant_expert_index_map[il][eid];
+                            GGML_ASSERT(idx < grp_sizes[gid] && "expert_index_map entry out of range for group");
+                            GGML_ASSERT(!idx_seen[gid][idx] && "duplicate expert_index_map entry within group");
+                            idx_seen[gid][idx] = true;
+                        }
+                    }
+                }
 
                 switch (hparams.n_layer) {
                     case 62: type = LLM_TYPE_230B_A10B; break;
@@ -6998,6 +7036,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 } break;
             case LLM_ARCH_MINIMAX_M2:
                 {
+                    const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff;
+                    const uint32_t n_moe_qgrp = hparams.moe_quant_group_count;
+
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
                     // output
@@ -7019,10 +7060,57 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
-                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
                         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+
+                        if (n_moe_qgrp > 0) {
+                            layer.ffn_gate_exps_grp.resize(n_moe_qgrp);
+                            layer.ffn_down_exps_grp.resize(n_moe_qgrp);
+                            layer.ffn_up_exps_grp.resize(n_moe_qgrp);
+
+                            const auto & gmap = moe_quant_expert_group_map[i];
+                            for (uint32_t gid = 0; gid < n_moe_qgrp; ++gid) {
+                                int64_t n_exp_in_grp = 0;
+                                for (uint32_t eid = 0; eid < hparams.n_expert; ++eid) {
+                                    if (gmap[eid] == gid) { n_exp_in_grp++; }
+                                }
+                                if (n_exp_in_grp == 0) { continue; }
+                                layer.ffn_gate_exps_grp[gid] = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_GRP, "weight", i, gid), {n_embd,   n_ff_exp, n_exp_in_grp}, TENSOR_NOT_REQUIRED);
+                                layer.ffn_down_exps_grp[gid] = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_GRP, "weight", i, gid), {n_ff_exp, n_embd,   n_exp_in_grp}, TENSOR_NOT_REQUIRED);
+                                layer.ffn_up_exps_grp[gid]   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_GRP,   "weight", i, gid), {n_embd,   n_ff_exp, n_exp_in_grp}, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const bool has_grouped = std::any_of(
+                                layer.ffn_gate_exps_grp.begin(),
+                                layer.ffn_gate_exps_grp.end(),
+                                [](const ggml_tensor * t) { return t != nullptr; });
+                            if (has_grouped) {
+                                for (uint32_t gid = 0; gid < n_moe_qgrp; ++gid) {
+                                    bool grp_has_experts = false;
+                                    for (uint32_t eid = 0; eid < hparams.n_expert; ++eid) {
+                                        if (gmap[eid] == gid) { grp_has_experts = true; break; }
+                                    }
+                                    if (grp_has_experts) {
+                                        GGML_ASSERT(layer.ffn_gate_exps_grp[gid] != nullptr && "missing gate grouped tensor for non-empty group");
+                                        GGML_ASSERT(layer.ffn_down_exps_grp[gid] != nullptr && "missing down grouped tensor for non-empty group");
+                                        GGML_ASSERT(layer.ffn_up_exps_grp[gid]   != nullptr && "missing up grouped tensor for non-empty group");
+                                    }
+                                }
+                                layer.ffn_gate_exps = nullptr;
+                                layer.ffn_down_exps = nullptr;
+                                layer.ffn_up_exps   = nullptr;
+                            } else {
+                                LLAMA_LOG_WARN("%s: layer %d: grouped MoE metadata present (moe_quant_group_count=%u) "
+                                    "but no grouped tensors found; falling back to merged expert tensors\n",
+                                    __func__, i, n_moe_qgrp);
+                                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+                                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+                                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+                            }
+                        } else {
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+                        }
                     }
                 } break;
             case LLM_ARCH_KIMI_LINEAR:

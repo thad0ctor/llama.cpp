@@ -81,7 +81,8 @@ struct llama_hparams {
     float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
-    uint32_t moe_every_n_layers   = 0;
+    uint32_t moe_every_n_layers       = 0;
+    uint32_t moe_quant_group_count    = 0;
     uint32_t nextn_predict_layers = 0;
 
     float f_norm_eps;

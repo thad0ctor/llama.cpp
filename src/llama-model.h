@@ -299,6 +299,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_chexps     = nullptr;
     struct ggml_tensor * ffn_up_chexps       = nullptr;
 
+    // ff grouped experts for per-group quantization
+    std::vector<struct ggml_tensor *> ffn_gate_exps_grp;
+    std::vector<struct ggml_tensor *> ffn_down_exps_grp;
+    std::vector<struct ggml_tensor *> ffn_up_exps_grp;
+
     // ff bias
     struct ggml_tensor * ffn_gate_b = nullptr;
     struct ggml_tensor * ffn_down_b = nullptr; // b2
@@ -487,6 +492,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     std::vector<llama_layer> layers;
+
+    // per-layer expert remap tables for grouped MoE quantization
+    // indexed by layer id; each inner vector has n_expert entries
+    std::vector<std::vector<uint32_t>> moe_quant_expert_group_map;
+    std::vector<std::vector<uint32_t>> moe_quant_expert_index_map;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

@@ -116,7 +116,9 @@ class ModelBase:
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
                  disable_mistral_community_chat_template: bool = False,
-                 sentence_transformers_dense_modules: bool = False):
+                 sentence_transformers_dense_modules: bool = False,
+                 moe_grouped_experts: bool = False, moe_group_count: int = 3,
+                 moe_group_map: dict[int, dict[int, int]] | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -135,6 +137,9 @@ class ModelBase:
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
+        self.moe_grouped_experts = moe_grouped_experts
+        self.moe_group_count = moe_group_count
+        self.moe_group_map = moe_group_map
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
         self.model_tensors = self.index_tensors(remote_hf_model_id=remote_hf_model_id)
         self.metadata_override = metadata_override
@@ -7936,17 +7941,58 @@ class MiniMaxM2Model(TextModel):
         super().__init__(*args, **kwargs)
         self.hparams["num_experts"] = self.hparams["num_local_experts"]
 
+    def _get_group_assignment(self, bid: int, n_experts: int, n_groups: int) -> list[int]:
+        """Returns expert_id -> group_id mapping for a given layer.
+        Uses explicit map if provided, otherwise round-robin assignment."""
+        if self.moe_group_map is not None and bid in self.moe_group_map:
+            layer_map = self.moe_group_map[bid]
+            covered = set(layer_map.keys())
+            expected = set(range(n_experts))
+            if covered != expected:
+                missing = expected - covered
+                extra = covered - expected
+                raise ValueError(
+                    f"Layer {bid}: moe_group_map must cover all expert IDs exactly once. "
+                    f"Missing: {sorted(missing)}, Extra: {sorted(extra)}")
+            assignment = [layer_map[eid] for eid in range(n_experts)]
+            for eid, gid in enumerate(assignment):
+                if gid < 0 or gid >= n_groups:
+                    raise ValueError(
+                        f"Layer {bid}, expert {eid}: group_id {gid} out of range [0, {n_groups - 1}]")
+            return assignment
+        return [eid % n_groups for eid in range(n_experts)]
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
         self.gguf_writer.add_expert_feed_forward_length(self.find_hparam(["intermediate_size"]))
         self.gguf_writer.add_rope_dimension_count(self.find_hparam(["rotary_dim"]))
 
+        if self.moe_grouped_experts:
+            n_experts = self.hparams["num_experts"]
+            n_groups = self.moe_group_count
+            n_layers = self.block_count
+            if n_groups < 1:
+                raise ValueError(f"--moe-group-count must be >= 1, got {n_groups}")
+            if n_groups > n_experts:
+                raise ValueError(f"--moe-group-count ({n_groups}) exceeds number of experts ({n_experts})")
+            self.gguf_writer.add_moe_quant_group_count(n_groups)
+            for bid in range(n_layers):
+                group_assign = self._get_group_assignment(bid, n_experts, n_groups)
+                self.gguf_writer.add_moe_quant_expert_group_map(bid, group_assign)
+                index_in_group: list[int] = []
+                group_counters: dict[int, int] = {}
+                for eid in range(n_experts):
+                    gid = group_assign[eid]
+                    idx = group_counters.get(gid, 0)
+                    index_in_group.append(idx)
+                    group_counters[gid] = idx + 1
+                self.gguf_writer.add_moe_quant_expert_index_map(bid, index_in_group)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         if name.endswith("e_score_correction_bias"):
             name = name.replace("e_score_correction_bias", "e_score_correction.bias")
 
-        # merge expert weights
         if 'experts' in name:
             n_experts = self.hparams["num_experts"]
             assert bid is not None
@@ -7955,27 +8001,57 @@ class MiniMaxM2Model(TextModel):
             expert_cache[name] = data_torch
             expert_weights = ["w1", "w2", "w3"]
 
-            # not enough expert weights to merge
             if len(expert_cache) < n_experts * len(expert_weights):
                 return
 
-            for w_name in expert_weights:
-                datas: list[Tensor] = []
-
-                for xid in range(n_experts):
-                    ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
-                    datas.append(expert_cache[ename])
-                    del expert_cache[ename]
-
-                data_torch = torch.stack(datas, dim=0)
-                merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
-                new_name = self.map_tensor_name(merged_name)
-                yield from super().modify_tensors(data_torch, new_name, bid)
+            if self.moe_grouped_experts:
+                yield from self._emit_grouped_experts(bid, expert_cache, n_experts, expert_weights)
+            else:
+                yield from self._emit_merged_experts(bid, expert_cache, n_experts, expert_weights)
 
             del self._experts_cache[bid]
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def _emit_merged_experts(self, bid: int, expert_cache: dict[str, Tensor],
+                             n_experts: int, expert_weights: list[str]):
+        """Legacy path: merge all experts into one tensor per projection."""
+        for w_name in expert_weights:
+            datas: list[Tensor] = []
+            for xid in range(n_experts):
+                ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
+                datas.append(expert_cache[ename])
+                del expert_cache[ename]
+            data_torch = torch.stack(datas, dim=0)
+            merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
+            new_name = self.map_tensor_name(merged_name)
+            yield from super().modify_tensors(data_torch, new_name, bid)
+
+    def _emit_grouped_experts(self, bid: int, expert_cache: dict[str, Tensor],
+                              n_experts: int, expert_weights: list[str]):
+        """Grouped path: emit separate tensors per group for each projection."""
+        n_groups = self.moe_group_count
+        group_assign = self._get_group_assignment(bid, n_experts, n_groups)
+
+        w_name_to_gguf = {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"}
+
+        for w_name in expert_weights:
+            groups: dict[int, list[tuple[int, Tensor]]] = {}
+            for xid in range(n_experts):
+                ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
+                gid = group_assign[xid]
+                groups.setdefault(gid, []).append((xid, expert_cache[ename]))
+                del expert_cache[ename]
+
+            for gid in sorted(groups.keys()):
+                experts_in_group = groups[gid]
+                experts_in_group.sort(key=lambda x: x[0])
+                datas = [t for _, t in experts_in_group]
+                data_torch = torch.stack(datas, dim=0)
+                gguf_base = w_name_to_gguf[w_name]
+                tensor_name = f"blk.{bid}.{gguf_base}.g{gid}.weight"
+                yield (tensor_name, data_torch)
 
 
 @ModelBase.register("MiMoV2FlashForCausalLM")
@@ -11711,6 +11787,19 @@ def parse_args() -> argparse.Namespace:
               "Default these modules are not included.")
     )
 
+    parser.add_argument(
+        "--moe-grouped-experts", action="store_true",
+        help="Emit grouped expert tensors per layer instead of merged. Enables per-group quantization for MoE models.",
+    )
+    parser.add_argument(
+        "--moe-group-count", type=int, default=3,
+        help="Number of expert groups when using --moe-grouped-experts (default: 3, for hot/warm/cold).",
+    )
+    parser.add_argument(
+        "--moe-group-map", type=str, default=None,
+        help="Path to a JSON file mapping expert_id -> group_id per layer. Format: {\"layer_id\": {\"expert_id\": group_id, ...}, ...}. If not provided, experts are assigned round-robin.",
+    )
+
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
@@ -11840,6 +11929,12 @@ def main() -> None:
         else:
             model_class = MistralModel
 
+        moe_group_map = None
+        if getattr(args, 'moe_group_map', None):
+            with open(args.moe_group_map, 'r') as f:
+                raw_map = json.load(f)
+            moe_group_map = {int(k): {int(ek): int(ev) for ek, ev in v.items()} for k, v in raw_map.items()}
+
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
                                      eager=args.no_lazy,
@@ -11848,7 +11943,10 @@ def main() -> None:
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
                                      small_first_shard=args.no_tensor_first_split,
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
-                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules
+                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+                                     moe_grouped_experts=getattr(args, 'moe_grouped_experts', False),
+                                     moe_group_count=getattr(args, 'moe_group_count', 3),
+                                     moe_group_map=moe_group_map,
                                      )
 
         if args.vocab_only:

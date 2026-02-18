@@ -686,6 +686,22 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+void llm_graph_input_moe_remap::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (grp_map && grp_map->data) {
+        int32_t * gdata = (int32_t *)grp_map->data;
+        for (size_t e = 0; e < expert_group_map.size(); ++e) {
+            gdata[e] = (int32_t)expert_group_map[e];
+        }
+    }
+    if (idx_map && idx_map->data) {
+        int32_t * idata = (int32_t *)idx_map->data;
+        for (size_t e = 0; e < expert_index_map.size(); ++e) {
+            idata[e] = (int32_t)expert_index_map[e];
+        }
+    }
+}
+
 //
 // llm_graph_result
 //
@@ -1441,6 +1457,203 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cb(moe_out, "ffn_moe_out", il);
 
+    return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_grouped_moe_ffn(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         const std::vector<ggml_tensor *> & up_exps_grp,
+         const std::vector<ggml_tensor *> & gate_exps_grp,
+         const std::vector<ggml_tensor *> & down_exps_grp,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+                bool   scale_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il,
+         const std::vector<uint32_t> & expert_group_map,
+         const std::vector<uint32_t> & expert_index_map) const {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const uint32_t n_groups = hparams.moe_quant_group_count;
+
+    GGML_ASSERT(n_groups > 0);
+    GGML_ASSERT(n_groups == (uint32_t)up_exps_grp.size());
+    GGML_ASSERT((int64_t)expert_group_map.size() == n_expert);
+    GGML_ASSERT((int64_t)expert_index_map.size() == n_expert);
+
+    // --- gating (identical to build_moe_ffn) ---
+    ggml_tensor * logits = build_lora_mm(gate_inp, cur);
+    cb(logits, "ffn_moe_logits", il);
+
+    ggml_tensor * probs = nullptr;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+            probs = ggml_soft_max(ctx0, logits);
+            break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+            probs = ggml_sigmoid(ctx0, logits);
+            break;
+        default:
+            GGML_ABORT("unsupported gating in grouped MoE");
+    }
+    cb(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * selection_probs = probs;
+    if (exp_probs_b != nullptr) {
+        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);
+    cb(selected_experts->src[0], "ffn_moe_argsort", il);
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts);
+    cb(weights, "ffn_moe_weights", il);
+
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        weights = ggml_div(ctx0, weights, weights_sum);
+        cb(weights, "ffn_moe_weights_norm", il);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+    }
+    if (scale_w) {
+        weights = ggml_scale(ctx0, weights, w_scale);
+    }
+
+    ggml_build_forward_expand(gf, weights);
+
+    // --- Build static remap tensors via graph input mechanism ---
+    auto inp_remap = std::make_unique<llm_graph_input_moe_remap>(expert_group_map, expert_index_map);
+
+    ggml_tensor * grp_map_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_expert);
+    ggml_tensor * idx_map_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_expert);
+    ggml_set_name(grp_map_t, "moe_grp_map");
+    ggml_set_name(idx_map_t, "moe_idx_map");
+    ggml_set_input(grp_map_t);
+    ggml_set_input(idx_map_t);
+    inp_remap->grp_map = grp_map_t;
+    inp_remap->idx_map = idx_map_t;
+    res->add_input(std::move(inp_remap));
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // --- Per-group expert computation ---
+    //
+    // For each group g, run ggml_mul_mat_id on the group tensor with remapped
+    // local expert IDs. Non-group experts are clamped to index 0 (dummy) and
+    // their weights zeroed via a mask, so they contribute nothing to the output.
+    //
+    // The backends (CPU, CUDA, etc.) already skip experts with zero references
+    // in their inner loops, so the main overhead is the per-group element-wise
+    // masking ops, not the matmuls themselves.
+    //
+    // Optimization: precompute shared tensors outside the loop and aggregate
+    // expert slots once after all groups are accumulated.
+
+    // Look up group_id and local_index for each selected expert
+    // selected_grp: [1, n_expert_used, n_tokens] (I32)
+    // selected_idx: [1, n_expert_used, n_tokens] (I32)
+    ggml_tensor * selected_grp = ggml_get_rows(ctx0,
+        ggml_reshape_2d(ctx0, grp_map_t, 1, n_expert),
+        selected_experts);
+
+    ggml_tensor * selected_idx = ggml_get_rows(ctx0,
+        ggml_reshape_2d(ctx0, idx_map_t, 1, n_expert),
+        selected_experts);
+
+    // Precompute F32 versions used across all group iterations
+    ggml_tensor * selected_grp_f32 = ggml_cast(ctx0, selected_grp, GGML_TYPE_F32);
+    ggml_tensor * selected_idx_f32 = ggml_cast(ctx0, selected_idx, GGML_TYPE_F32);
+
+    // Accumulator for weighted expert outputs: [n_embd, n_expert_used, n_tokens]
+    // Sum across groups, then aggregate expert slots once at the end.
+    ggml_tensor * experts_accum = nullptr;
+
+    for (uint32_t g = 0; g < n_groups; ++g) {
+        if (up_exps_grp[g] == nullptr) { continue; }
+
+        // mask = step(0.5 - |selected_grp_f32 - g|): 1.0 if match, 0.0 otherwise
+        ggml_tensor * diff = ggml_abs(ctx0, ggml_sub(ctx0, selected_grp_f32,
+            ggml_fill(ctx0, selected_grp_f32, (float)g)));
+        ggml_tensor * mask = ggml_step(ctx0, ggml_sub(ctx0,
+            ggml_fill(ctx0, diff, 0.5f), diff));
+
+        // Safe per-group local indices: zero out non-group entries to prevent OOB.
+        // local_ids_g = (int32_t)(selected_idx_f32 * mask)
+        ggml_tensor * local_ids_g = ggml_cast(ctx0,
+            ggml_mul(ctx0, selected_idx_f32, mask), GGML_TYPE_I32);
+        local_ids_g = ggml_reshape_2d(ctx0, local_ids_g, n_expert_used, n_tokens);
+
+        // Weights masked for this group
+        ggml_tensor * weights_g = ggml_mul(ctx0, weights, mask);
+
+        // FFN: up projection
+        ggml_tensor * up_g = build_lora_mm_id(up_exps_grp[g], cur, local_ids_g);
+
+        // FFN: gate projection + activation
+        ggml_tensor * cur_g = nullptr;
+        if (gate_exps_grp[g]) {
+            cur_g = build_lora_mm_id(gate_exps_grp[g], cur, local_ids_g);
+        } else {
+            cur_g = up_g;
+        }
+
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_exps_grp[g]) {
+                    cur_g = ggml_swiglu_split(ctx0, cur_g, up_g);
+                } else {
+                    cur_g = ggml_silu(ctx0, cur_g);
+                }
+                break;
+            default:
+                GGML_ABORT("unsupported FFN op in grouped MoE");
+        }
+
+        // FFN: down projection, then apply masked weights
+        ggml_tensor * down_g = build_lora_mm_id(down_exps_grp[g], cur_g, local_ids_g);
+        down_g = ggml_mul(ctx0, down_g, weights_g);
+
+        // Accumulate across groups (same shape: [n_embd, n_expert_used, n_tokens])
+        if (experts_accum == nullptr) {
+            experts_accum = down_g;
+        } else {
+            experts_accum = ggml_add(ctx0, experts_accum, down_g);
+        }
+    }
+
+    if (experts_accum == nullptr) {
+        GGML_ABORT("no group tensors found in grouped MoE");
+    }
+
+    // Aggregate expert_used slots into [n_embd, n_tokens] (same as build_moe_ffn)
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+
+    for (uint32_t i = 0; i < (uint32_t) n_expert_used; ++i) {
+        cur_experts[i] = ggml_view_2d(ctx0, experts_accum,
+            n_embd, n_tokens, experts_accum->nb[2], i * experts_accum->nb[1]);
+        ggml_build_forward_expand(gf, cur_experts[i]);
+    }
+
+    ggml_tensor * moe_out = cur_experts[0];
+    for (uint32_t i = 1; i < (uint32_t) n_expert_used; ++i) {
+        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+    }
+
+    if (n_expert_used == 1) {
+        moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    cb(moe_out, "ffn_moe_out", il);
     return moe_out;
 }
 

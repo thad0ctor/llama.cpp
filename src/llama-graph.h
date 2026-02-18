@@ -501,6 +501,24 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+class llm_graph_input_moe_remap : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_remap(
+            const std::vector<uint32_t> & expert_group_map,
+            const std::vector<uint32_t> & expert_index_map)
+        : expert_group_map(expert_group_map), expert_index_map(expert_index_map) {}
+    virtual ~llm_graph_input_moe_remap() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override { GGML_UNUSED(params); return true; }
+
+    ggml_tensor * grp_map = nullptr;
+    ggml_tensor * idx_map = nullptr;
+
+    const std::vector<uint32_t> & expert_group_map;
+    const std::vector<uint32_t> & expert_index_map;
+};
+
 //
 // llm_graph_result
 //
@@ -836,6 +854,24 @@ struct llm_graph_context {
             llama_expert_gating_func_type gating_op,
                      int   il,
              ggml_tensor * probs_in = nullptr) const;
+
+    ggml_tensor * build_grouped_moe_ffn(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             const std::vector<ggml_tensor *> & up_exps_grp,
+             const std::vector<ggml_tensor *> & gate_exps_grp,
+             const std::vector<ggml_tensor *> & down_exps_grp,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                    bool   scale_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             const std::vector<uint32_t> & expert_group_map,
+             const std::vector<uint32_t> & expert_index_map) const;
 
     //
     // inputs
