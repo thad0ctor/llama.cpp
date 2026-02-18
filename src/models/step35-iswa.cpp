@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -122,17 +124,39 @@ llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const ll
             const bool  norm_w  = hparams.expert_weights_norm;
             const float w_scale = hparams.expert_weights_scale;
             const bool  scale_w = w_scale != 0.0f;
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
-                    model.layers[il].ffn_exp_probs_b,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU,
-                    norm_w, scale_w, w_scale,
-                    (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+            const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                                  && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                                 model.layers[il].ffn_gate_exps_grp.end(),
+                                                 [](const ggml_tensor * t) { return t != nullptr; });
+
+            ggml_tensor * moe_out;
+            if (has_grouped) {
+                moe_out = build_grouped_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps_grp,
+                        model.layers[il].ffn_gate_exps_grp,
+                        model.layers[il].ffn_down_exps_grp,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU,
+                        norm_w, scale_w, w_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il,
+                        model.moe_quant_expert_group_map[il],
+                        model.moe_quant_expert_index_map[il]);
+            } else {
+                moe_out = build_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU,
+                        norm_w, scale_w, w_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
             // shared expert MLP (always added on MoE layers in Step35)

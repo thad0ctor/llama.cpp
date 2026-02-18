@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 llm_build_glm4_moe::llm_build_glm4_moe(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
 
@@ -120,17 +122,39 @@ llm_build_glm4_moe::llm_build_glm4_moe(const llama_model & model, const llm_grap
             cb(cur, "ffn_out", il);
         } else {
             // Process routed experts using existing MoE infrastructure
-            ggml_tensor * routed_out = build_moe_ffn(cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
-                    model.layers[il].ffn_exp_probs_b,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, hparams.expert_weights_norm,
-                    true, hparams.expert_weights_scale,
-                    (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+            const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                                  && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                                 model.layers[il].ffn_gate_exps_grp.end(),
+                                                 [](const ggml_tensor * t) { return t != nullptr; });
+
+            ggml_tensor * routed_out;
+            if (has_grouped) {
+                routed_out = build_grouped_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps_grp,
+                        model.layers[il].ffn_gate_exps_grp,
+                        model.layers[il].ffn_down_exps_grp,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, hparams.expert_weights_norm,
+                        true, hparams.expert_weights_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il,
+                        model.moe_quant_expert_group_map[il],
+                        model.moe_quant_expert_index_map[il]);
+            } else {
+                routed_out = build_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, hparams.expert_weights_norm,
+                        true, hparams.expert_weights_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il);
+            }
             cb(routed_out, "ffn_moe_out", il);
 
             // Process shared expert on original input

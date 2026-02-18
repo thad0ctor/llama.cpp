@@ -2,6 +2,8 @@
 
 #include "../llama-memory-hybrid.h"
 
+#include <algorithm>
+
 
 llm_build_lfm2::llm_build_lfm2(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params),
@@ -55,6 +57,20 @@ llm_build_lfm2::llm_build_lfm2(const llama_model & model, const llm_graph_params
 }
 
 ggml_tensor * llm_build_lfm2::build_moe_feed_forward(ggml_tensor * cur, int il) const {
+    const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                          && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                         model.layers[il].ffn_gate_exps_grp.end(),
+                                         [](const ggml_tensor * t) { return t != nullptr; });
+
+    if (has_grouped) {
+        return build_grouped_moe_ffn(cur,
+                            model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps_grp,
+                            model.layers[il].ffn_gate_exps_grp, model.layers[il].ffn_down_exps_grp,
+                            model.layers[il].ffn_exp_probs_b, n_expert, n_expert_used, LLM_FFN_SILU, true, false, 0.0,
+                            static_cast<llama_expert_gating_func_type>(hparams.expert_gating_func), il,
+                            model.moe_quant_expert_group_map[il],
+                            model.moe_quant_expert_index_map[il]);
+    }
     return build_moe_ffn(cur,
                         model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps,
                         model.layers[il].ffn_gate_exps, model.layers[il].ffn_down_exps,

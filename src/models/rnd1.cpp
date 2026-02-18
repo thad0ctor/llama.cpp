@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 // RND1 is a Qwen3Moe AR model converted to diffusion model.
 llm_build_rnd1::llm_build_rnd1(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
@@ -84,8 +86,28 @@ llm_build_rnd1::llm_build_rnd1(const llama_model & model, const llm_graph_params
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * moe_out =
-            build_moe_ffn(cur,
+        const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                              && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                             model.layers[il].ffn_gate_exps_grp.end(),
+                                             [](const ggml_tensor * t) { return t != nullptr; });
+
+        ggml_tensor * moe_out;
+        if (has_grouped) {
+            moe_out = build_grouped_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps_grp,
+                    model.layers[il].ffn_gate_exps_grp,
+                    model.layers[il].ffn_down_exps_grp,
+                    nullptr,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true,
+                    false, 0.0,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                    il,
+                    model.moe_quant_expert_group_map[il],
+                    model.moe_quant_expert_index_map[il]);
+        } else {
+            moe_out = build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
                     model.layers[il].ffn_gate_exps,
@@ -96,6 +118,7 @@ llm_build_rnd1::llm_build_rnd1(const llama_model & model, const llm_graph_params
                     false, 0.0,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il);
+        }
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

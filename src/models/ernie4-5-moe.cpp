@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 
 
 llm_build_ernie4_5_moe::llm_build_ernie4_5_moe(const llama_model & model, const llm_graph_params & params) :
@@ -95,17 +97,39 @@ llm_build_ernie4_5_moe::llm_build_ernie4_5_moe(const llama_model & model, const 
             cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                                        model.layers[il].ffn_gate_inp,
-                                        model.layers[il].ffn_up_exps,
-                                        model.layers[il].ffn_gate_exps,
-                                        model.layers[il].ffn_down_exps,
-                                        model.layers[il].ffn_exp_probs_b,
-                                        n_expert, n_expert_used,
-                                        LLM_FFN_SILU, true,
-                                        false, 0.0,
-                                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                                        il);
+            const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                                  && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                                 model.layers[il].ffn_gate_exps_grp.end(),
+                                                 [](const ggml_tensor * t) { return t != nullptr; });
+
+            ggml_tensor * moe_out;
+            if (has_grouped) {
+                moe_out = build_grouped_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps_grp,
+                        model.layers[il].ffn_gate_exps_grp,
+                        model.layers[il].ffn_down_exps_grp,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        false, 0.0,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il,
+                        model.moe_quant_expert_group_map[il],
+                        model.moe_quant_expert_index_map[il]);
+            } else {
+                moe_out = build_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        false, 0.0,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
             // Shared expert (if present)

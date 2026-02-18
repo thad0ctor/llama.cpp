@@ -84,6 +84,7 @@ llm_build_smallthinker<iswa>::llm_build_smallthinker(const llama_model & model, 
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // TODO: add grouped MoE dispatch for smallthinker - build_grouped_moe_ffn does not support probs_in parameter
         ggml_tensor * ffn_out =
             build_moe_ffn(cur,
                     nullptr,

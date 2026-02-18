@@ -81,6 +81,7 @@ llm_build_grovemoe::llm_build_grovemoe(const llama_model & model, const llm_grap
         ggml_tensor * probs = build_lora_mm(model.layers[il].ffn_gate_inp, cur);  // [n_expert, n_tokens]
         cb(probs, "ffn_moe_logits", il);
 
+        // TODO: add grouped MoE dispatch support for grovemoe (uses probs_in which build_grouped_moe_ffn doesn't support)
         ggml_tensor * moe_out =
             build_moe_ffn(cur,
                 nullptr,
@@ -98,6 +99,7 @@ llm_build_grovemoe::llm_build_grovemoe(const llama_model & model, const llm_grap
         cur = moe_out;
 
         // TODO: Only do the expert selection and weights once
+        // TODO: add grouped MoE dispatch support for grovemoe chunk experts (uses probs_in)
         moe_out = build_moe_ffn(cur,
                     nullptr,
                     model.layers[il].ffn_up_chexps,

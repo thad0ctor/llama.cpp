@@ -1,6 +1,8 @@
 #include "ggml.h"
 #include "models.h"
 
+#include <algorithm>
+
 #define CHUNK_SIZE 64
 
 llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_graph_params & params) :
@@ -826,13 +828,29 @@ ggml_tensor * llm_build_qwen3next::build_layer_ffn(ggml_tensor * cur, const int 
     // Check if this is an MoE layer
     if (model.layers[il].ffn_gate_inp != nullptr) {
         // MoE branch
-        ggml_tensor * moe_out =
-            build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps, model.layers[il].ffn_down_exps,
-                nullptr,
-                n_expert, n_expert_used, LLM_FFN_SILU,
-                true, false, 0.0, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+        const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                              && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                             model.layers[il].ffn_gate_exps_grp.end(),
+                                             [](const ggml_tensor * t) { return t != nullptr; });
+
+        ggml_tensor * moe_out;
+        if (has_grouped) {
+            moe_out = build_grouped_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps_grp,
+                    model.layers[il].ffn_gate_exps_grp, model.layers[il].ffn_down_exps_grp,
+                    nullptr,
+                    n_expert, n_expert_used, LLM_FFN_SILU,
+                    true, false, 0.0, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                    model.moe_quant_expert_group_map[il],
+                    model.moe_quant_expert_index_map[il]);
+        } else {
+            moe_out = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps, model.layers[il].ffn_down_exps,
+                    nullptr,
+                    n_expert, n_expert_used, LLM_FFN_SILU,
+                    true, false, 0.0, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+        }
         cb(moe_out, "ffn_moe_out", il);
 
         // Add shared experts if present - following Qwen3Next reference implementation

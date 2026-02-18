@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 
 
 llm_build_nemotron_h::llm_build_nemotron_h(const llama_model & model, const llm_graph_params & params) :
@@ -117,11 +119,31 @@ ggml_tensor * llm_build_nemotron_h::build_ffn_layer(ggml_tensor * cur, const lla
         cb(cur, "ffn_out", il);
     } else {
         ggml_tensor * ffn_inp = cur;
-        ggml_tensor * moe_out =
-            build_moe_ffn(ffn_inp,
+        const bool has_grouped = !model.layers[il].ffn_up_exps_grp.empty()
+                              && std::any_of(model.layers[il].ffn_up_exps_grp.begin(),
+                                             model.layers[il].ffn_up_exps_grp.end(),
+                                             [](const ggml_tensor * t) { return t != nullptr; });
+
+        ggml_tensor * moe_out;
+        if (has_grouped) {
+            moe_out = build_grouped_moe_ffn(ffn_inp,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps_grp,
+                    {},
+                    model.layers[il].ffn_down_exps_grp,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_RELU_SQR, hparams.expert_weights_norm,
+                    true, hparams.expert_weights_scale,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+                    il,
+                    model.moe_quant_expert_group_map[il],
+                    model.moe_quant_expert_index_map[il]);
+        } else {
+            moe_out = build_moe_ffn(ffn_inp,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
-                    nullptr, // no gate
+                    nullptr,
                     model.layers[il].ffn_down_exps,
                     model.layers[il].ffn_exp_probs_b,
                     n_expert, n_expert_used,
@@ -129,6 +151,7 @@ ggml_tensor * llm_build_nemotron_h::build_ffn_layer(ggml_tensor * cur, const lla
                     true, hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
                     il);
+        }
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(ffn_inp,

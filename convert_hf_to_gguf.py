@@ -795,6 +795,83 @@ class TextModel(ModelBase):
             if "rope_type" not in self.rope_parameters and (rope_type := self.rope_parameters.get("type")) is not None:
                 self.rope_parameters["rope_type"] = rope_type
 
+    def _get_group_assignment(self, bid: int, n_experts: int, n_groups: int) -> list[int]:
+        """Returns expert_id -> group_id mapping for a given layer.
+        Uses explicit map if provided, otherwise round-robin assignment."""
+        if self.moe_group_map is not None and bid in self.moe_group_map:
+            layer_map = self.moe_group_map[bid]
+            covered = set(layer_map.keys())
+            expected = set(range(n_experts))
+            if covered != expected:
+                missing = expected - covered
+                extra = covered - expected
+                raise ValueError(
+                    f"Layer {bid}: moe_group_map must cover all expert IDs exactly once. "
+                    f"Missing: {sorted(missing)}, Extra: {sorted(extra)}")
+            assignment = [layer_map[eid] for eid in range(n_experts)]
+            for eid, gid in enumerate(assignment):
+                if gid < 0 or gid >= n_groups:
+                    raise ValueError(
+                        f"Layer {bid}, expert {eid}: group_id {gid} out of range [0, {n_groups - 1}]")
+            return assignment
+        return [eid % n_groups for eid in range(n_experts)]
+
+    def _write_moe_grouped_metadata(self, n_experts: int, n_layers: int):
+        """Write grouped MoE metadata to GGUF if --moe-grouped-experts is enabled."""
+        if not self.moe_grouped_experts:
+            return
+        n_groups = self.moe_group_count
+        if n_groups < 1:
+            raise ValueError(f"--moe-group-count must be >= 1, got {n_groups}")
+        if n_groups > n_experts:
+            raise ValueError(f"--moe-group-count ({n_groups}) exceeds number of experts ({n_experts})")
+        self.gguf_writer.add_moe_quant_group_count(n_groups)
+        for bid in range(n_layers):
+            group_assign = self._get_group_assignment(bid, n_experts, n_groups)
+            self.gguf_writer.add_moe_quant_expert_group_map(bid, group_assign)
+            index_in_group: list[int] = []
+            group_counters: dict[int, int] = {}
+            for eid in range(n_experts):
+                gid = group_assign[eid]
+                idx = group_counters.get(gid, 0)
+                index_in_group.append(idx)
+                group_counters[gid] = idx + 1
+            self.gguf_writer.add_moe_quant_expert_index_map(bid, index_in_group)
+
+    def _emit_grouped_experts(self, bid: int, expert_cache: dict[str, Tensor],
+                              n_experts: int, expert_weights: list[str],
+                              ename_fmt: str,
+                              w_name_to_gguf: dict[str, str]):
+        """Grouped path: emit separate tensors per group for each projection.
+
+        Args:
+            bid: block/layer id
+            expert_cache: dict of {hf_tensor_name: tensor}
+            n_experts: total number of experts
+            expert_weights: list of weight name identifiers (e.g. ["w1", "w2", "w3"])
+            ename_fmt: format string for HF tensor names, must contain {bid}, {xid}, {w_name}
+            w_name_to_gguf: maps expert weight id to GGUF base name (e.g. {"w1": "ffn_gate_exps"})
+        """
+        n_groups = self.moe_group_count
+        group_assign = self._get_group_assignment(bid, n_experts, n_groups)
+
+        for w_name in expert_weights:
+            groups: dict[int, list[tuple[int, Tensor]]] = {}
+            for xid in range(n_experts):
+                ename = ename_fmt.format(bid=bid, xid=xid, w_name=w_name)
+                gid = group_assign[xid]
+                groups.setdefault(gid, []).append((xid, expert_cache[ename]))
+                del expert_cache[ename]
+
+            for gid in sorted(groups.keys()):
+                experts_in_group = groups[gid]
+                experts_in_group.sort(key=lambda x: x[0])
+                datas = [t for _, t in experts_in_group]
+                data_torch = torch.stack(datas, dim=0)
+                gguf_base = w_name_to_gguf[w_name]
+                tensor_name = f"blk.{bid}.{gguf_base}.g{gid}.weight"
+                yield (tensor_name, data_torch)
+
     @classmethod
     def __init_subclass__(cls):
         # can't use an abstract property, because overriding it without type errors
@@ -2594,6 +2671,10 @@ class LlamaModel(TextModel):
             rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(rope_dim)
 
+        n_experts = hparams.get("num_local_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     @staticmethod
     def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
         if n_head_kv is not None and n_head != n_head_kv:
@@ -2653,20 +2734,26 @@ class LlamaModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for wid in ["w1", "w2", "w3"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["w1", "w2", "w3"],
+                        "model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight",
+                        {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"})
+                else:
+                    for wid in ["w1", "w2", "w3"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"layers.{bid}.feed_forward.experts.{wid}.weight"
+                        merged_name = f"layers.{bid}.feed_forward.experts.{wid}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -2749,6 +2836,10 @@ class AfmoeModel(LlamaModel):
         if (sliding_window := self.hparams.get("sliding_window")) is not None:
             self.gguf_writer.add_sliding_window(sliding_window)
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Handle expert weights - they're already merged in the HF format
         # process the experts separately
@@ -2762,18 +2853,25 @@ class AfmoeModel(LlamaModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["gate_proj", "up_proj", "down_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["gate_proj", "up_proj", "down_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename_to_retrieve = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename_to_retrieve])
-                        del self._experts[bid][ename_to_retrieve]
+                        for xid in range(n_experts):
+                            ename_to_retrieve = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename_to_retrieve])
+                            del self._experts[bid][ename_to_retrieve]
 
-                    data_torch = torch.stack(datas, dim=0)
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
-                    yield from ModelBase.modify_tensors(self, data_torch, merged_name, bid)
+                        data_torch = torch.stack(datas, dim=0)
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        yield from ModelBase.modify_tensors(self, data_torch, merged_name, bid)
 
                 return
             else:
@@ -3789,6 +3887,10 @@ class Ernie4_5MoeModel(Ernie4_5Model):
             if shared_expert_count > 0 and (shared_expert_intermediate_size := self.hparams.get('intermediate_size')) is not None and (num_key_value_heads := self.hparams.get('num_key_value_heads')) is not None:
                 self.gguf_writer.add_expert_shared_feed_forward_length(shared_expert_intermediate_size // num_key_value_heads)
 
+        n_experts = self.hparams.get("moe_num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Modify correction bias name as in DeepseekV2
         if name.endswith("e_score_correction_bias"):
@@ -3823,18 +3925,25 @@ class Ernie4_5MoeModel(Ernie4_5Model):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["gate_proj", "up_proj", "down_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["gate_proj", "up_proj", "down_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename_to_retrieve = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename_to_retrieve])
-                        del self._experts[bid][ename_to_retrieve]
+                        for xid in range(n_experts):
+                            ename_to_retrieve = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename_to_retrieve])
+                            del self._experts[bid][ename_to_retrieve]
 
-                    data_torch = torch.stack(datas, dim=0)
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        data_torch = torch.stack(datas, dim=0)
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
         else:
             yield from ModelBase.modify_tensors(self, data_torch, name, bid)
 
@@ -4129,6 +4238,10 @@ class Qwen2MoeModel(TextModel):
             self.gguf_writer.add_expert_shared_feed_forward_length(shared_expert_intermediate_size)
             logger.info(f"gguf: expert shared feed forward length = {shared_expert_intermediate_size}")
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -4175,20 +4288,27 @@ class Qwen2MoeModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -4920,6 +5040,10 @@ class PhiMoeModel(Phi3MiniModel):
         self.gguf_writer.add_expert_used_count(self.hparams["num_experts_per_tok"])
         self.gguf_writer.add_expert_count(self.hparams["num_local_experts"])
 
+        n_experts = self.hparams.get("num_local_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # process the experts separately
         if name.find("block_sparse_moe.experts") != -1:
@@ -4932,20 +5056,27 @@ class PhiMoeModel(Phi3MiniModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["w1", "w2", "w3"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["w1", "w2", "w3"],
+                        "model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight",
+                        {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["w1", "w2", "w3"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -7184,6 +7315,10 @@ class JambaModel(TextModel):
         self.gguf_writer.add_expert_used_count(self.hparams["num_experts_per_tok"])
         self.gguf_writer.add_file_type(self.ftype)
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -7209,24 +7344,30 @@ class JambaModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.feed_forward.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for wid in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                # merge the experts into a single 3d tensor
-                for wid in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.feed_forward.experts.{xid}.{wid}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.feed_forward.experts.{xid}.{wid}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        data_torch = torch.stack(datas, dim=0)
 
-                    data_torch = torch.stack(datas, dim=0)
+                        # using the same merged name as qwen2moe
+                        merged_name = f"model.layers.{bid}.mlp.experts.{wid}.weight"
 
-                    # using the same merged name as qwen2moe
-                    merged_name = f"model.layers.{bid}.mlp.experts.{wid}.weight"
+                        new_name = self.map_tensor_name(merged_name)
 
-                    new_name = self.map_tensor_name(merged_name)
-
-                    yield new_name, data_torch
+                        yield new_name, data_torch
             return
 
         new_name = self.map_tensor_name(name)
@@ -7350,6 +7491,10 @@ class OlmoeModel(TextModel):
         if (n_experts := self.hparams.get("num_experts")) is not None:
             self.gguf_writer.add_expert_count(n_experts)
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     # Copied from: Qwen2MoeModel
@@ -7365,20 +7510,27 @@ class OlmoeModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -7583,6 +7735,10 @@ class ArcticModel(TextModel):
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
         self.gguf_writer.add_rope_dimension_count(hparams["hidden_size"] // hparams["num_attention_heads"])
 
+        n_experts = self.hparams.get("num_local_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -7606,20 +7762,27 @@ class ArcticModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for wid in ["w1", "w2", "w3"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["w1", "w2", "w3"],
+                        "model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight",
+                        {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for wid in ["w1", "w2", "w3"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"layers.{bid}.feed_forward.experts.{wid}.weight"
+                        merged_name = f"layers.{bid}.feed_forward.experts.{wid}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -7661,6 +7824,10 @@ class DeepseekModel(TextModel):
         self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
         self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
 
+        n_experts = self.hparams.get("n_routed_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     @staticmethod
@@ -7691,20 +7858,27 @@ class DeepseekModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -7844,6 +8018,10 @@ class DeepseekV2Model(TextModel):
             # ref https://github.com/ggml-org/llama.cpp/pull/17945
             self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * rope_mscale_all)
 
+        n_experts = self.hparams.get("n_routed_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -7883,20 +8061,27 @@ class DeepseekV2Model(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -7937,30 +8122,13 @@ class MiniMaxM2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.MINIMAXM2
     _experts_cache: dict[int, dict[str, Tensor]] = {}
 
+    _moe_ename_fmt = "model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
+    _moe_w_names = ["w1", "w2", "w3"]
+    _moe_w_to_gguf = {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.hparams["num_experts"] = self.hparams["num_local_experts"]
-
-    def _get_group_assignment(self, bid: int, n_experts: int, n_groups: int) -> list[int]:
-        """Returns expert_id -> group_id mapping for a given layer.
-        Uses explicit map if provided, otherwise round-robin assignment."""
-        if self.moe_group_map is not None and bid in self.moe_group_map:
-            layer_map = self.moe_group_map[bid]
-            covered = set(layer_map.keys())
-            expected = set(range(n_experts))
-            if covered != expected:
-                missing = expected - covered
-                extra = covered - expected
-                raise ValueError(
-                    f"Layer {bid}: moe_group_map must cover all expert IDs exactly once. "
-                    f"Missing: {sorted(missing)}, Extra: {sorted(extra)}")
-            assignment = [layer_map[eid] for eid in range(n_experts)]
-            for eid, gid in enumerate(assignment):
-                if gid < 0 or gid >= n_groups:
-                    raise ValueError(
-                        f"Layer {bid}, expert {eid}: group_id {gid} out of range [0, {n_groups - 1}]")
-            return assignment
-        return [eid % n_groups for eid in range(n_experts)]
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -7968,26 +8136,7 @@ class MiniMaxM2Model(TextModel):
         self.gguf_writer.add_expert_feed_forward_length(self.find_hparam(["intermediate_size"]))
         self.gguf_writer.add_rope_dimension_count(self.find_hparam(["rotary_dim"]))
 
-        if self.moe_grouped_experts:
-            n_experts = self.hparams["num_experts"]
-            n_groups = self.moe_group_count
-            n_layers = self.block_count
-            if n_groups < 1:
-                raise ValueError(f"--moe-group-count must be >= 1, got {n_groups}")
-            if n_groups > n_experts:
-                raise ValueError(f"--moe-group-count ({n_groups}) exceeds number of experts ({n_experts})")
-            self.gguf_writer.add_moe_quant_group_count(n_groups)
-            for bid in range(n_layers):
-                group_assign = self._get_group_assignment(bid, n_experts, n_groups)
-                self.gguf_writer.add_moe_quant_expert_group_map(bid, group_assign)
-                index_in_group: list[int] = []
-                group_counters: dict[int, int] = {}
-                for eid in range(n_experts):
-                    gid = group_assign[eid]
-                    idx = group_counters.get(gid, 0)
-                    index_in_group.append(idx)
-                    group_counters[gid] = idx + 1
-                self.gguf_writer.add_moe_quant_expert_index_map(bid, index_in_group)
+        self._write_moe_grouped_metadata(self.hparams["num_experts"], self.block_count)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         if name.endswith("e_score_correction_bias"):
@@ -7999,59 +8148,30 @@ class MiniMaxM2Model(TextModel):
 
             expert_cache = self._experts_cache.setdefault(bid, {})
             expert_cache[name] = data_torch
-            expert_weights = ["w1", "w2", "w3"]
 
-            if len(expert_cache) < n_experts * len(expert_weights):
+            if len(expert_cache) < n_experts * len(self._moe_w_names):
                 return
 
             if self.moe_grouped_experts:
-                yield from self._emit_grouped_experts(bid, expert_cache, n_experts, expert_weights)
+                yield from self._emit_grouped_experts(
+                    bid, expert_cache, n_experts, self._moe_w_names,
+                    self._moe_ename_fmt, self._moe_w_to_gguf)
             else:
-                yield from self._emit_merged_experts(bid, expert_cache, n_experts, expert_weights)
+                for w_name in self._moe_w_names:
+                    datas: list[Tensor] = []
+                    for xid in range(n_experts):
+                        ename = self._moe_ename_fmt.format(bid=bid, xid=xid, w_name=w_name)
+                        datas.append(expert_cache[ename])
+                        del expert_cache[ename]
+                    data_torch = torch.stack(datas, dim=0)
+                    merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
+                    new_name = self.map_tensor_name(merged_name)
+                    yield from super().modify_tensors(data_torch, new_name, bid)
 
             del self._experts_cache[bid]
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
-
-    def _emit_merged_experts(self, bid: int, expert_cache: dict[str, Tensor],
-                             n_experts: int, expert_weights: list[str]):
-        """Legacy path: merge all experts into one tensor per projection."""
-        for w_name in expert_weights:
-            datas: list[Tensor] = []
-            for xid in range(n_experts):
-                ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
-                datas.append(expert_cache[ename])
-                del expert_cache[ename]
-            data_torch = torch.stack(datas, dim=0)
-            merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
-            new_name = self.map_tensor_name(merged_name)
-            yield from super().modify_tensors(data_torch, new_name, bid)
-
-    def _emit_grouped_experts(self, bid: int, expert_cache: dict[str, Tensor],
-                              n_experts: int, expert_weights: list[str]):
-        """Grouped path: emit separate tensors per group for each projection."""
-        n_groups = self.moe_group_count
-        group_assign = self._get_group_assignment(bid, n_experts, n_groups)
-
-        w_name_to_gguf = {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"}
-
-        for w_name in expert_weights:
-            groups: dict[int, list[tuple[int, Tensor]]] = {}
-            for xid in range(n_experts):
-                ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
-                gid = group_assign[xid]
-                groups.setdefault(gid, []).append((xid, expert_cache[ename]))
-                del expert_cache[ename]
-
-            for gid in sorted(groups.keys()):
-                experts_in_group = groups[gid]
-                experts_in_group.sort(key=lambda x: x[0])
-                datas = [t for _, t in experts_in_group]
-                data_torch = torch.stack(datas, dim=0)
-                gguf_base = w_name_to_gguf[w_name]
-                tensor_name = f"blk.{bid}.{gguf_base}.g{gid}.weight"
-                yield (tensor_name, data_torch)
 
 
 @ModelBase.register("MiMoV2FlashForCausalLM")
@@ -9715,6 +9835,10 @@ class BailingMoeModel(TextModel):
         self.gguf_writer.add_expert_shared_count(hparams["num_shared_experts"])
         self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     @staticmethod
@@ -9754,22 +9878,29 @@ class BailingMoeModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    new_name = self.map_tensor_name(merged_name)
+                        new_name = self.map_tensor_name(merged_name)
 
-                    yield from super().modify_tensors(data_torch, new_name, bid)
+                        yield from super().modify_tensors(data_torch, new_name, bid)
 
             return
 
@@ -9885,6 +10016,10 @@ class GroveMoeModel(TextModel):
         # FIXME?: Hardcoded https://huggingface.co/inclusionAI/GroveMoE-Inst/blob/c4c69e5970d18907b5e6ddccdfd55176fe292df1/modeling_grove_moe.py#L376
         self.gguf_writer.add_expert_group_scale(0.05)
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
     _chunk_experts: list[dict[str, Tensor]] | None = None
 
@@ -9931,20 +10066,27 @@ class GroveMoeModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -10414,6 +10556,10 @@ class LLaDAMoEModel(TextModel):
         self.gguf_writer.add_causal_attention(False)
         self.gguf_writer.add_diffusion_shift_logits(False)
 
+        n_experts = self.hparams.get("num_experts", 0)
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     # Copied from: Qwen2MoeModel
@@ -10429,20 +10575,27 @@ class LLaDAMoEModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["gate_proj", "up_proj", "down_proj"],
+                        "model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight",
+                        {"gate_proj": "ffn_gate_exps", "down_proj": "ffn_down_exps", "up_proj": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return
@@ -10910,6 +11063,10 @@ class SmallThinkerModel(TextModel):
                         self.gguf_writer.add_sliding_window(sliding_window)
                     break
 
+        n_experts = self.hparams.get("num_experts", self.hparams.get("moe_num_primary_experts", 0))
+        if n_experts > 0:
+            self._write_moe_grouped_metadata(n_experts, self.block_count)
+
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -10924,20 +11081,27 @@ class SmallThinkerModel(TextModel):
             self._experts[bid][name] = data_torch
 
             if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down", "gate", "up"]:
-                    datas: list[Tensor] = []
+                if self.moe_grouped_experts:
+                    yield from self._emit_grouped_experts(
+                        bid, self._experts[bid], n_experts,
+                        ["down", "gate", "up"],
+                        "model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight",
+                        {"gate": "ffn_gate_exps", "down": "ffn_down_exps", "up": "ffn_up_exps"})
+                else:
+                    # merge the experts into a single 3d tensor
+                    for w_name in ["down", "gate", "up"]:
+                        datas: list[Tensor] = []
 
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
+                        for xid in range(n_experts):
+                            ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{w_name}.weight"
+                            datas.append(self._experts[bid][ename])
+                            del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                        data_torch = torch.stack(datas, dim=0)
 
-                    merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
+                        merged_name = f"model.layers.{bid}.block_sparse_moe.experts.{w_name}.weight"
 
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                        yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
             else:
                 return

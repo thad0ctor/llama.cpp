@@ -1,6 +1,8 @@
 #include "models.h"
 #include "ggml.h"
 
+#include <algorithm>
+
 #define CHUNK_SIZE 64
 
 // Causal Conv1d function for Q,K,V
@@ -341,18 +343,41 @@ llm_build_kimi_linear::llm_build_kimi_linear(const llama_model & model, const ll
         } else {
             // MoE layer
             // Kimi uses moe_renormalize=True and routed_scaling_factor (stored as expert_weights_scale) = 2.446
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
-                layer.ffn_exp_probs_b,
-                hparams.n_expert,
-                hparams.n_expert_used,
-                LLM_FFN_SILU, true,
-                true, hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+            const bool has_grouped = !model.layers[il].ffn_gate_exps_grp.empty()
+                                  && std::any_of(model.layers[il].ffn_gate_exps_grp.begin(),
+                                                 model.layers[il].ffn_gate_exps_grp.end(),
+                                                 [](const ggml_tensor * t) { return t != nullptr; });
+
+            ggml_tensor * moe_out;
+            if (has_grouped) {
+                moe_out = build_grouped_moe_ffn(cur,
+                        layer.ffn_gate_inp,
+                        model.layers[il].ffn_up_exps_grp,
+                        model.layers[il].ffn_gate_exps_grp,
+                        model.layers[il].ffn_down_exps_grp,
+                        layer.ffn_exp_probs_b,
+                        hparams.n_expert,
+                        hparams.n_expert_used,
+                        LLM_FFN_SILU, true,
+                        true, hparams.expert_weights_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il,
+                        model.moe_quant_expert_group_map[il],
+                        model.moe_quant_expert_index_map[il]);
+            } else {
+                moe_out = build_moe_ffn(cur,
+                        layer.ffn_gate_inp,
+                        layer.ffn_up_exps,
+                        layer.ffn_gate_exps,
+                        layer.ffn_down_exps,
+                        layer.ffn_exp_probs_b,
+                        hparams.n_expert,
+                        hparams.n_expert_used,
+                        LLM_FFN_SILU, true,
+                        true, hparams.expert_weights_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
             // Shared expert

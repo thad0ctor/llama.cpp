@@ -7,7 +7,10 @@ tensors. Instead of a single merged tensor per projection per layer (where all
 experts share the same quantization type), experts are split into groups that
 can be independently quantized (e.g., hot/warm/cold tiers).
 
-Primary target architecture: **MiniMax M2** (`minimax-m2`).
+Supported across **all MoE architectures** in the repository (42+ architectures
+including Mixtral/Llama, Qwen2MoE, DeepSeek/DeepSeekV2, DBRX, Jamba, OLMoE,
+Arctic, PhiMoE, and more). The feature is architecture-agnostic: the converter,
+loader, and runtime dispatch are shared across all MoE models.
 
 ## Metadata Format
 
@@ -61,10 +64,14 @@ control than uniform quantization.
 
 ## Conversion Examples
 
+The `--moe-grouped-experts` flag works with any MoE model supported by
+`convert_hf_to_gguf.py`.
+
 ### Basic grouped conversion (3 groups, round-robin):
 
 ```bash
-python convert_hf_to_gguf.py /path/to/minimax-m2 \
+# Works with any MoE architecture
+python convert_hf_to_gguf.py /path/to/model \
     --outtype f16 \
     --moe-grouped-experts \
     --moe-group-count 3
@@ -74,6 +81,7 @@ python convert_hf_to_gguf.py /path/to/minimax-m2 \
 
 ```bash
 # Create a group map JSON file
+# Keys are layer IDs, values are {expert_id: group_id} dicts
 cat > group_map.json << 'EOF'
 {
   "0": {"0": 0, "1": 0, "2": 0, "3": 1, "4": 1, "5": 2},
@@ -81,7 +89,7 @@ cat > group_map.json << 'EOF'
 }
 EOF
 
-python convert_hf_to_gguf.py /path/to/minimax-m2 \
+python convert_hf_to_gguf.py /path/to/model \
     --outtype f16 \
     --moe-grouped-experts \
     --moe-group-count 3 \
@@ -105,8 +113,8 @@ EOF
 
 # Quantize with per-group types
 ./llama-quantize \
-    minimax-m2-f16.gguf \
-    minimax-m2-grouped.gguf \
+    model-f16.gguf \
+    model-grouped.gguf \
     q4_k_m \
     --tensor-type-file tensor_types.txt
 ```
@@ -141,15 +149,51 @@ python convert_hf_to_gguf.py model --outtype f16
 | File size | Limited by worst-case expert | Smaller: aggressive on cold, generous on hot |
 | Compatibility | Universal | Requires grouped MoE runtime support |
 
+## Supported Architectures
+
+All MoE architectures that register `FFN_GATE_EXP`/`FFN_DOWN_EXP`/`FFN_UP_EXP`
+tensors automatically support grouped expert quantization. This currently
+includes 42+ architectures.
+
+### Converter support
+
+Grouped export (`_emit_grouped_experts`) is implemented for the following
+converter classes: `LlamaModel` (covers Mixtral), `AfmoeModel`,
+`Ernie4_5MoeModel`, `Qwen2MoeModel`, `PhiMoeModel`, `OlmoeModel`,
+`DeepseekModel`, `DeepseekV2Model`, `BailingMoeModel`, `JambaModel`,
+`ArcticModel`, `SmallThinkerModel`, `LLaDAMoEModel`, `GroveMoeModel`,
+`MiniMaxM2Model`.
+
+**Not yet supported** (require special handling):
+- `GrokModel`: Uses split tensor halves before stacking
+- `DbrxModel`: Pre-merged 3D tensors from HF
+- `GraniteMoeModel`: Fused gate/up projection splitting
+
+### Runtime dispatch limitations
+
+Three model builders have `build_moe_ffn` call sites that use features
+not yet available in `build_grouped_moe_ffn` (e.g., `probs_in` bias
+arguments):
+- `grovemoe.cpp`
+- `smallthinker.cpp`
+- `openai-moe-iswa.cpp`
+
+These have TODO comments marking where grouped dispatch should be added
+once the grouped FFN builder supports those overloads.
+
 ## File Changes
 
-- `gguf-py/gguf/constants.py`: New keys, tensor types, tensor names
+- `gguf-py/gguf/constants.py`: New keys, tensor types, tensor names (all MoE arches)
 - `gguf-py/gguf/gguf_writer.py`: Writer methods for grouped metadata
-- `convert_hf_to_gguf.py`: CLI flags, MiniMaxM2Model grouped export
+- `convert_hf_to_gguf.py`: CLI flags, `TextModel` base class grouped export helpers,
+  per-class grouped emission for all supported MoE converters
 - `src/llama-arch.h`: New KV keys, tensor enum entries
-- `src/llama-arch.cpp`: Tensor/KV name mappings
+- `src/llama-arch.cpp`: Tensor/KV name mappings (all MoE arches)
 - `src/llama-hparams.h`: Remap table storage
 - `src/llama-model.h`: Grouped tensor pointers in layer struct
-- `src/llama-model.cpp`: Loader for grouped tensors + metadata
-- `src/llama-graph.h/cpp`: `build_grouped_moe_ffn` implementation
-- `src/models/minimax-m2.cpp`: Runtime routing dispatch
+- `src/llama-model.cpp`: Generic grouped metadata loading (all arches),
+  `load_moe_expert_tensors` helper for grouped/merged tensor creation
+- `src/llama-graph.h/cpp`: `build_grouped_moe_ffn` with all FFN op types
+  (SILU, GELU, RELU, RELU_SQR, SWIGLU_OAI_MOE)
+- `src/models/*.cpp`: Grouped MoE dispatch in 32+ model builder files
+- `tests/test-moe-grouped-experts.py`: Multi-architecture test coverage

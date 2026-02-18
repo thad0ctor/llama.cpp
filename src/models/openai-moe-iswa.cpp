@@ -86,6 +86,7 @@ llm_build_openai_moe_iswa::llm_build_openai_moe_iswa(const llama_model & model, 
                 LLM_NORM_RMS, il);
         cb(cur, "attn_post_norm", il);
 
+        // TODO: add grouped MoE dispatch support for openai-moe-iswa (uses bias overload which build_grouped_moe_ffn doesn't support)
         // MoE branch
         cur = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,  model.layers[il].ffn_gate_inp_b,

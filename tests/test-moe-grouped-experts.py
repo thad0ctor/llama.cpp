@@ -46,13 +46,21 @@ def test_tensor_names_contain_gid():
     print("PASS: tensor names contain gid")
 
 
-def test_minimax_m2_has_grouped_tensors():
-    """Verify MINIMAXM2 architecture lists grouped tensor types."""
-    tensors = gguf.MODEL_TENSORS[gguf.MODEL_ARCH.MINIMAXM2]
-    assert gguf.MODEL_TENSOR.FFN_GATE_EXP_GRP in tensors
-    assert gguf.MODEL_TENSOR.FFN_DOWN_EXP_GRP in tensors
-    assert gguf.MODEL_TENSOR.FFN_UP_EXP_GRP in tensors
-    print("PASS: minimax-m2 has grouped tensor types")
+def test_moe_archs_have_grouped_tensors():
+    """Verify all MoE architectures that have FFN_GATE_EXP also list grouped tensor types."""
+    moe_archs_checked = 0
+    missing_archs = []
+    for arch, tensors in gguf.MODEL_TENSORS.items():
+        has_moe = (gguf.MODEL_TENSOR.FFN_GATE_EXP in tensors
+                   or gguf.MODEL_TENSOR.FFN_DOWN_EXP in tensors)
+        if not has_moe:
+            continue
+        moe_archs_checked += 1
+        if gguf.MODEL_TENSOR.FFN_UP_EXP_GRP not in tensors:
+            missing_archs.append(gguf.MODEL_ARCH_NAMES.get(arch, str(arch)))
+    assert moe_archs_checked > 10, f"Expected many MoE archs, found only {moe_archs_checked}"
+    assert not missing_archs, f"MoE architectures missing grouped tensor types: {missing_archs}"
+    print(f"PASS: {moe_archs_checked} MoE architectures have grouped tensor types")
 
 
 def test_writer_methods_exist():
@@ -292,9 +300,27 @@ def test_index_map_with_empty_group():
     print("PASS: index map with empty group accepted")
 
 
+def test_gguf_round_trip_multi_arch():
+    """Write grouped MoE GGUFs for multiple architectures and verify round-trip."""
+    test_archs = ["llama", "qwen2moe", "deepseek2", "mixtral"]
+    for arch_name in test_archs:
+        if arch_name not in gguf.MODEL_ARCH_NAMES.values():
+            continue
+        try:
+            _run_gguf_round_trip(arch_name)
+            print(f"PASS: GGUF round-trip for {arch_name}")
+        except Exception as e:
+            print(f"FAIL: GGUF round-trip for {arch_name}: {e}")
+            raise
+
+
 def test_gguf_round_trip():
     """Write a grouped MoE GGUF and read it back, verifying all metadata and tensor names."""
-    ARCH = "minimax-m2"
+    _run_gguf_round_trip("minimax-m2")
+    print("PASS: GGUF round-trip (metadata + tensors)")
+
+
+def _run_gguf_round_trip(ARCH: str):
     N_LAYERS = 2
     N_EXPERTS = 6
     N_GROUPS = 3
@@ -432,16 +458,60 @@ def test_gguf_round_trip():
             assert actual_shape == expected_ggml_shape, \
                 f"Tensor {t.name}: shape {actual_shape} != expected {expected_ggml_shape}"
 
-        print("PASS: GGUF round-trip (metadata + tensors)")
     finally:
         os.unlink(tmp_path)
+
+
+def test_backward_compat_no_grouped_metadata():
+    """Verify GGUF without grouped metadata loads cleanly (no grouped keys present)."""
+    ARCH = "llama"
+    with tempfile.NamedTemporaryFile(suffix='.gguf', delete=False) as f:
+        tmp_path = f.name
+    try:
+        writer = gguf.GGUFWriter(tmp_path, arch=ARCH)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+        reader = GGUFReader(tmp_path)
+        gc_key = gguf.Keys.LLM.MOE_QUANT_GROUP_COUNT.format(arch=ARCH)
+        assert reader.fields.get(gc_key) is None, \
+            "Legacy GGUF should not have moe_quant_group_count"
+        print("PASS: backward compatibility (no grouped metadata)")
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_single_group_round_trip():
+    """Verify single group (n_groups=1) works correctly - degenerates to merged."""
+    N_EXPERTS = 4
+    N_GROUPS = 1
+    assignment = [0] * N_EXPERTS
+    index_in_group = list(range(N_EXPERTS))
+
+    ok, err = _validate_index_map(assignment, index_in_group, N_GROUPS)
+    assert ok, f"Single group should be valid, got: {err}"
+    print("PASS: single group round-trip validation")
+
+
+def test_max_groups_round_trip():
+    """Verify n_groups == n_experts works (each expert its own group)."""
+    N_EXPERTS = 4
+    N_GROUPS = N_EXPERTS
+    assignment = list(range(N_EXPERTS))
+    index_in_group = [0] * N_EXPERTS
+
+    ok, err = _validate_index_map(assignment, index_in_group, N_GROUPS)
+    assert ok, f"Max groups should be valid, got: {err}"
+    print("PASS: max groups (one per expert) validation")
 
 
 if __name__ == '__main__':
     test_constants_defined()
     test_tensor_types_defined()
     test_tensor_names_contain_gid()
-    test_minimax_m2_has_grouped_tensors()
+    test_moe_archs_have_grouped_tensors()
     test_writer_methods_exist()
     test_group_assignment_round_robin()
     test_group_assignment_custom_map()
@@ -457,4 +527,8 @@ if __name__ == '__main__':
     test_index_map_duplicate()
     test_index_map_with_empty_group()
     test_gguf_round_trip()
+    test_gguf_round_trip_multi_arch()
+    test_backward_compat_no_grouped_metadata()
+    test_single_group_round_trip()
+    test_max_groups_round_trip()
     print("\nAll tests passed!")

@@ -1483,6 +1483,8 @@ ggml_tensor * llm_graph_context::build_grouped_moe_ffn(
 
     GGML_ASSERT(n_groups > 0);
     GGML_ASSERT(n_groups == (uint32_t)up_exps_grp.size());
+    GGML_ASSERT(n_groups == (uint32_t)down_exps_grp.size());
+    GGML_ASSERT(gate_exps_grp.empty() || n_groups == (uint32_t)gate_exps_grp.size());
     GGML_ASSERT((int64_t)expert_group_map.size() == n_expert);
     GGML_ASSERT((int64_t)expert_index_map.size() == n_expert);
 
@@ -1600,8 +1602,9 @@ ggml_tensor * llm_graph_context::build_grouped_moe_ffn(
         ggml_tensor * up_g = build_lora_mm_id(up_exps_grp[g], cur, local_ids_g);
 
         // FFN: gate projection + activation
+        const bool has_gate_g = !gate_exps_grp.empty() && gate_exps_grp[g] != nullptr;
         ggml_tensor * cur_g = nullptr;
-        if (gate_exps_grp[g]) {
+        if (has_gate_g) {
             cur_g = build_lora_mm_id(gate_exps_grp[g], cur, local_ids_g);
         } else {
             cur_g = up_g;
@@ -1609,10 +1612,39 @@ ggml_tensor * llm_graph_context::build_grouped_moe_ffn(
 
         switch (type_op) {
             case LLM_FFN_SILU:
-                if (gate_exps_grp[g]) {
+                if (has_gate_g) {
                     cur_g = ggml_swiglu_split(ctx0, cur_g, up_g);
                 } else {
                     cur_g = ggml_silu(ctx0, cur_g);
+                }
+                break;
+            case LLM_FFN_GELU:
+                if (has_gate_g) {
+                    cur_g = ggml_geglu_split(ctx0, cur_g, up_g);
+                } else {
+                    cur_g = ggml_gelu(ctx0, cur_g);
+                }
+                break;
+            case LLM_FFN_RELU:
+                if (has_gate_g) {
+                    cur_g = ggml_reglu_split(ctx0, cur_g, up_g);
+                } else {
+                    cur_g = ggml_relu(ctx0, cur_g);
+                }
+                break;
+            case LLM_FFN_RELU_SQR:
+                if (has_gate_g) {
+                    GGML_ABORT("gated squared relu not implemented for grouped MoE");
+                } else {
+                    cur_g = ggml_relu(ctx0, cur_g);
+                    cur_g = ggml_sqr(ctx0, cur_g);
+                }
+                break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                {
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    cur_g = ggml_swiglu_oai(ctx0, cur_g, up_g, alpha, limit);
                 }
                 break;
             default:

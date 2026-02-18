@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 
 
 llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
@@ -129,9 +131,22 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         // feed-forward network
         if (hparams.moe_every_n_layers > 0 && il % hparams.moe_every_n_layers == 1) {
             // MoE branch
-            cur = build_moe_ffn(cur, model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps, nullptr,
-                                model.layers[il].ffn_down_exps, nullptr, hparams.n_expert, hparams.n_expert_used,
-                                LLM_FFN_GELU, false, false, 0.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+            const bool has_grouped = !model.layers[il].ffn_up_exps_grp.empty()
+                                  && std::any_of(model.layers[il].ffn_up_exps_grp.begin(),
+                                                 model.layers[il].ffn_up_exps_grp.end(),
+                                                 [](const ggml_tensor * t) { return t != nullptr; });
+
+            if (has_grouped) {
+                cur = build_grouped_moe_ffn(cur, model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps_grp, {},
+                                    model.layers[il].ffn_down_exps_grp, nullptr, hparams.n_expert, hparams.n_expert_used,
+                                    LLM_FFN_GELU, false, false, 0.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                                    model.moe_quant_expert_group_map[il],
+                                    model.moe_quant_expert_index_map[il]);
+            } else {
+                cur = build_moe_ffn(cur, model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps, nullptr,
+                                    model.layers[il].ffn_down_exps, nullptr, hparams.n_expert, hparams.n_expert_used,
+                                    LLM_FFN_GELU, false, false, 0.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+            }
             cb(cur, "ffn_moe_out", il);
         } else if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
                    model.arch == LLM_ARCH_JINA_BERT_V3) {
